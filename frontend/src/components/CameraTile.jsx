@@ -1,0 +1,99 @@
+import { useEffect, useRef, useState } from 'react'
+import './CameraTile.css'
+
+const API_HOST = '127.0.0.1:8811'
+
+export default function CameraTile({ camera, showOverlay = true, onClick, large = false }) {
+  const canvasRef = useRef(null)
+  const overlayRef = useRef(null)
+  const [status, setStatus] = useState(camera.live ? 'connecting' : 'offline')
+
+  useEffect(() => {
+    if (!camera.live) {
+      setStatus('offline')
+      return
+    }
+
+    const canvas = canvasRef.current
+    const overlay = overlayRef.current
+    const ctx = canvas.getContext('2d')
+    const overlayCtx = overlay.getContext('2d')
+    const img = new Image()
+    let objectUrl = null
+
+    const videoWs = new WebSocket(`ws://${API_HOST}/ws/live/${camera.id}`)
+    videoWs.binaryType = 'blob'
+    videoWs.onopen = () => setStatus('live')
+    videoWs.onclose = () => setStatus('offline')
+    videoWs.onerror = () => setStatus('offline')
+    videoWs.onmessage = (event) => {
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+      objectUrl = URL.createObjectURL(event.data)
+      img.src = objectUrl
+    }
+    img.onload = () => {
+      if (canvas.width !== img.width || canvas.height !== img.height) {
+        canvas.width = img.width
+        canvas.height = img.height
+        overlay.width = img.width
+        overlay.height = img.height
+      }
+      ctx.drawImage(img, 0, 0)
+    }
+
+    let detectionsWs = null
+    if (showOverlay) {
+      detectionsWs = new WebSocket(`ws://${API_HOST}/ws/detections/${camera.id}`)
+      detectionsWs.onmessage = (event) => {
+        const { faces } = JSON.parse(event.data)
+        overlayCtx.clearRect(0, 0, overlay.width, overlay.height)
+        overlayCtx.lineWidth = 2
+        overlayCtx.font = '14px sans-serif'
+        overlayCtx.textBaseline = 'bottom'
+        for (const face of faces || []) {
+          const [x1, y1, x2, y2] = face.bbox
+          const known = face.name !== 'Unknown'
+          overlayCtx.strokeStyle = known ? '#1a7f4b' : '#c62828'
+          overlayCtx.strokeRect(x1, y1, x2 - x1, y2 - y1)
+          const label = known ? `${face.name}` : 'Unknown'
+          const textWidth = overlayCtx.measureText(label).width
+          overlayCtx.fillStyle = known ? '#1a7f4b' : '#c62828'
+          overlayCtx.fillRect(x1, y1 - 18, textWidth + 8, 18)
+          overlayCtx.fillStyle = 'white'
+          overlayCtx.fillText(label, x1 + 4, y1)
+        }
+      }
+    }
+
+    return () => {
+      videoWs.close()
+      detectionsWs?.close()
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [camera.id, camera.live, showOverlay])
+
+  return (
+    <div
+      className={`camera-tile card${onClick ? ' camera-tile-clickable' : ''}${large ? ' camera-tile-large' : ''}`}
+      onClick={onClick}
+    >
+      <div className="camera-tile-video">
+        <canvas ref={canvasRef} />
+        <canvas ref={overlayRef} className="camera-tile-overlay" />
+        {status !== 'live' && (
+          <div className="camera-tile-offline">
+            {camera.is_configured ? 'Starting live feed...' : 'Not configured'}
+          </div>
+        )}
+        <span className={`pill camera-tile-badge ${status === 'live' ? 'pill-success' : 'pill-neutral'}`}>
+          <span className={`dot ${status === 'live' ? 'dot-success' : 'dot-danger'}`} />
+          {status === 'live' ? 'LIVE' : status === 'connecting' ? 'CONNECTING' : 'OFFLINE'}
+        </span>
+      </div>
+      <div className="camera-tile-label">
+        <span>{camera.name}</span>
+        <span className="camera-tile-site">{camera.site}</span>
+      </div>
+    </div>
+  )
+}

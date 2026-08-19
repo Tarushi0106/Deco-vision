@@ -50,17 +50,39 @@ export default function CameraTile({ camera, showOverlay = true, onClick, large 
         overlayCtx.lineWidth = 2
         overlayCtx.font = '14px sans-serif'
         overlayCtx.textBaseline = 'bottom'
-        for (const face of faces || []) {
+
+        const LABEL_HEIGHT = 18
+        const placedLabels = []
+        const overlaps = (a, b) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y
+
+        // sort left-to-right so labels for adjacent faces are placed in a
+        // stable order — otherwise which face "wins" the preferred spot
+        // above its box flickers frame to frame as detection order changes
+        const sortedFaces = [...(faces || [])].sort((a, b) => a.bbox[0] - b.bbox[0])
+
+        for (const face of sortedFaces) {
           const [x1, y1, x2, y2] = face.bbox
           const known = face.name !== 'Unknown'
-          overlayCtx.strokeStyle = known ? '#1a7f4b' : '#c62828'
+          const color = known ? '#1a7f4b' : '#c62828'
+          overlayCtx.strokeStyle = color
           overlayCtx.strokeRect(x1, y1, x2 - x1, y2 - y1)
-          const label = known ? `${face.name}` : 'Unknown'
-          const textWidth = overlayCtx.measureText(label).width
-          overlayCtx.fillStyle = known ? '#1a7f4b' : '#c62828'
-          overlayCtx.fillRect(x1, y1 - 18, textWidth + 8, 18)
+
+          const label = known ? `${face.name} ${Math.round(face.score * 100)}%` : 'Unknown'
+          const labelWidth = overlayCtx.measureText(label).width + 8
+
+          // default: just above the box. If that collides with a
+          // neighboring face's label (faces close together), place it
+          // inside the top of this box instead rather than overlapping.
+          let candidate = { x: x1, y: y1 - LABEL_HEIGHT, w: labelWidth, h: LABEL_HEIGHT }
+          if (placedLabels.some((r) => overlaps(r, candidate))) {
+            candidate = { x: x1, y: y1, w: labelWidth, h: LABEL_HEIGHT }
+          }
+          placedLabels.push(candidate)
+
+          overlayCtx.fillStyle = color
+          overlayCtx.fillRect(candidate.x, candidate.y, candidate.w, candidate.h)
           overlayCtx.fillStyle = 'white'
-          overlayCtx.fillText(label, x1 + 4, y1)
+          overlayCtx.fillText(label, candidate.x + 4, candidate.y + LABEL_HEIGHT - 4)
         }
       }
     }

@@ -101,6 +101,32 @@ class CameraClient:
             },
         )
 
+    def list_added_faces(self) -> list[dict]:
+        """The camera's own enrolled Allow List (distinct from SnapedFaces,
+        which is the historical detection log) — [{"Id", "GrpId", "Name"}, ...].
+        Requires Search immediately before GetByIndex in the same session;
+        the device holds server-side query state from Search that GetByIndex
+        reads, and returns an empty list without it."""
+        search_result = self._post("/API/AI/AddedFaces/Search", {"MsgId": "", "FaceInfo": [{"GrpId": ALLOW_LIST_GROUP_ID}]})
+        total = search_result["data"]["Count"]
+        if total == 0:
+            return []
+        result = self._post(
+            "/API/AI/AddedFaces/GetByIndex",
+            {"MsgId": "", "StartIndex": 0, "Count": total, "SimpleInfo": 1, "WithImage": 0, "WithFeature": 0},
+        )
+        return result["data"].get("FaceInfo", [])
+
+    def get_added_face_photo(self, face_id: int) -> bytes | None:
+        result = self._post(
+            "/API/AI/AddedFaces/GetById",
+            {"MsgId": "", "FacesId": [face_id], "SimpleInfo": 0, "WithImage": 1, "WithFeature": 0},
+        )
+        faces = result["data"].get("FaceInfo", [])
+        if not faces or not faces[0].get("Image1"):
+            return None
+        return base64.b64decode(faces[0]["Image1"])
+
     def add_face(self, name: str, jpeg_bytes: bytes) -> dict:
         image_b64 = base64.b64encode(jpeg_bytes).decode("ascii")
         return self._post(

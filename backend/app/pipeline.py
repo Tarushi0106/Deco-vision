@@ -14,11 +14,25 @@ waits on inference, so video stays live regardless of detection load.
 """
 
 import logging
+import os
 import threading
 import time
 from datetime import datetime
 
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "4")
+
 import cv2
+import torch
+
+# InsightFace (onnxruntime) and YOLO (torch) both default to spinning up a
+# thread per CPU core for every single inference call. On this 8-core box
+# that meant each pose/face inference burst briefly saturated every core,
+# starving the video capture thread and causing the live feed to drift
+# further and further behind (observed: an 8-10s and growing lag). Capping
+# both leaves headroom for capture + the asyncio event loop.
+cv2.setNumThreads(4)
+torch.set_num_threads(4)
 
 from . import alerts_db, camera_db, face_db
 from .person_tracker import PersonTracker
@@ -29,7 +43,13 @@ from .video_source import RtspSource, WebcamSource
 logger = logging.getLogger("dashboard.pipeline")
 
 JPEG_QUALITY = 80
-DETECTION_INTERVAL_SECONDS = 0.3  # per camera, in the shared round-robin
+STALE_SOURCE_TIMEOUT_SECONDS = 5  # force-reconnect a capture source that's stopped delivering frames
+DETECTION_INTERVAL_SECONDS = 0.2  # per camera, in the shared round-robin
+# 0.1 previously caused an 8-10s and growing video lag by pegging 4+ CPU
+# cores continuously and starving the capture thread — that was BEFORE
+# cv2/torch thread caps were added above. 0.2 is a smaller, monitored step
+# back toward tighter overlay-box tracking during fast motion, not a return
+# to the same unsafe value.
 # pose detection (YOLO) is meaningfully heavier per-frame than InsightFace
 # on CPU, so it runs on its own slower per-camera cadence within the same loop
 PERSON_ANALYSIS_INTERVAL_SECONDS = 1.5
@@ -109,17 +129,29 @@ class CameraPipeline:
         """Capture-only loop — reads frames as fast as the camera delivers
         them and never blocks on inference."""
         source = None
+        last_frame_at = time.time()
         while self._running:
             try:
                 if source is None:
                     source = self._create_source()
                     logger.info("Camera %s: video source opened", self.camera_id)
+                    last_frame_at = time.time()
 
                 frame = source.get_frame()
                 if frame is None:
+                    # RTSP over a dropped/stale TCP connection can return
+                    # None forever without OpenCV ever raising — nothing
+                    # here would otherwise trigger a reconnect, so the feed
+                    # just freezes silently. Force one after a timeout.
+                    if time.time() - last_frame_at > STALE_SOURCE_TIMEOUT_SECONDS:
+                        logger.error("Camera %s: no frame for %ds, forcing reconnect",
+                                     self.camera_id, STALE_SOURCE_TIMEOUT_SECONDS)
+                        source.release()
+                        source = None
                     time.sleep(0.05)
                     continue
 
+                last_frame_at = time.time()
                 ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
                 with self._lock:
                     self._latest_frame = frame

@@ -89,6 +89,8 @@ export default function People() {
   const [showModal, setShowModal] = useState(false)
   const [viewingPerson, setViewingPerson] = useState(null)
   const [deleteNote, setDeleteNote] = useState(null)
+  const [syncing, setSyncing] = useState(false)
+  const [syncResult, setSyncResult] = useState(null)
 
   const load = () => {
     api.listFaces().then(setFaces).catch(() => {})
@@ -105,6 +107,20 @@ export default function People() {
     load()
   }
 
+  const handleSyncFromCamera = async () => {
+    setSyncing(true)
+    setSyncResult(null)
+    try {
+      const result = await api.syncPeopleFromCamera()
+      setSyncResult(result)
+      load()
+    } catch (err) {
+      setSyncResult({ error: err.message })
+    } finally {
+      setSyncing(false)
+    }
+  }
+
   return (
     <div>
       <div className="page-toolbar">
@@ -112,10 +128,32 @@ export default function People() {
           <h2>People</h2>
           <div className="page-toolbar-sub">{faces.length} enrolled in the Allow List</div>
         </div>
-        <button className="btn btn-primary" onClick={() => setShowModal(true)}>
-          + Add Person
-        </button>
+        <div style={{ display: 'flex', gap: '0.5rem' }}>
+          <button className="btn btn-outline" onClick={handleSyncFromCamera} disabled={syncing}>
+            {syncing ? 'Syncing...' : 'Sync from Camera'}
+          </button>
+          <button className="btn btn-primary" onClick={() => setShowModal(true)}>
+            + Add Person
+          </button>
+        </div>
       </div>
+
+      {syncResult && !syncResult.error && (
+        <div className="form-message" style={{ marginBottom: '0.75rem' }}>
+          Synced {syncResult.synced}, already up to date {syncResult.skipped}
+          {syncResult.failed.length > 0 && `, ${syncResult.failed.length} failed`}.
+          {syncResult.failed.length > 0 && (
+            <ul>
+              {syncResult.failed.map((f, i) => (
+                <li key={i}>{f.name || '(unknown)'}: {f.error}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+      {syncResult?.error && (
+        <div className="form-message error" style={{ marginBottom: '0.75rem' }}>{syncResult.error}</div>
+      )}
 
       {deleteNote && <div className="form-message" style={{ marginBottom: '0.75rem' }}>{deleteNote}</div>}
 

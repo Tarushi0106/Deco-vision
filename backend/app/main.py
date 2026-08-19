@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import alerts_db, camera_db, face_db, user_db
-from .camera_client import camera_client, sync_face_to_all_devices
+from .camera_client import camera_client, get_camera_client, sync_face_to_all_devices
 from .pipeline import pipeline_manager
 
 ENROLLMENT_PHOTOS_DIR = Path(__file__).resolve().parent.parent / "data" / "enrollment_photos"
@@ -289,6 +289,71 @@ def remove_person(name: str):
         "note": "Removed from this dashboard's recognition only — not from any camera's onboard Allow List "
         "(no verified API for that in this codebase; remove manually via the camera's admin UI if needed).",
     }
+
+
+def _sync_people_from_camera() -> dict:
+    synced, skipped = 0, 0
+    failed = []
+    already_synced = face_db.get_synced_camera_face_ids()
+
+    for device in camera_db.list_active_devices():
+        host = device["host"]
+        if not device.get("user") or not device.get("password"):
+            continue
+        client = get_camera_client(host, device["user"], device["password"], device.get("admin_port", 443))
+
+        try:
+            faces = client.list_added_faces()
+        except Exception as e:
+            failed.append({"host": host, "name": None, "error": f"could not list Allow List: {e}"})
+            continue
+
+        for face in faces:
+            camera_face_id = f"{host}:{face['Id']}"
+            if camera_face_id in already_synced:
+                skipped += 1
+                continue
+
+            try:
+                photo_bytes = client.get_added_face_photo(face["Id"])
+                if not photo_bytes:
+                    failed.append({"host": host, "name": face["Name"], "error": "camera has no photo for this entry"})
+                    continue
+
+                frame = cv2.imdecode(np.frombuffer(photo_bytes, np.uint8), cv2.IMREAD_COLOR)
+                if frame is None:
+                    failed.append({"host": host, "name": face["Name"], "error": "camera's photo is unreadable"})
+                    continue
+
+                embedding = pipeline_manager.compute_embedding(frame)
+                if embedding is None:
+                    failed.append({"host": host, "name": face["Name"], "error": "no face detected in camera's photo"})
+                    continue
+
+                safe_name = re.sub(r"[^a-zA-Z0-9 ()_-]", "", face["Name"]).strip().replace(" ", "_")
+                saved_filename = f"{safe_name}_camera{face['Id']}_{uuid.uuid4().hex[:6]}.jpg"
+                (ENROLLMENT_PHOTOS_DIR / saved_filename).write_bytes(photo_bytes)
+
+                face_db.add_face(face["Name"], saved_filename, embedding, camera_face_id=camera_face_id)
+                already_synced.add(camera_face_id)
+                synced += 1
+            except Exception as e:
+                failed.append({"host": host, "name": face.get("Name"), "error": str(e)})
+
+            # the camera's admin API is fragile under rapid repeated calls —
+            # pace requests rather than hammering it back-to-back
+            time.sleep(0.3)
+
+    if synced:
+        pipeline_manager.reload_faces()
+        logger.info("Synced %d people from camera Allow List(s)", synced)
+
+    return {"synced": synced, "skipped": skipped, "failed": failed}
+
+
+@app.post("/api/people/sync-from-camera")
+async def sync_people_from_camera():
+    return await asyncio.to_thread(_sync_people_from_camera)
 
 
 @app.websocket("/ws/live/{camera_id}")

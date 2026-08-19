@@ -3,7 +3,7 @@ from insightface.app import FaceAnalysis
 
 from . import face_db
 
-SIMILARITY_THRESHOLD = 0.45
+SIMILARITY_THRESHOLD = 0.35
 
 
 class FaceRecognizer:
@@ -13,7 +13,7 @@ class FaceRecognizer:
 
     def __init__(self):
         self._app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
-        self._app.prepare(ctx_id=-1, det_size=(640, 640), det_thresh=0.3)
+        self._app.prepare(ctx_id=-1, det_size=(640, 640), det_thresh=0.5)
         self._reload_enrolled()
 
     def _reload_enrolled(self) -> None:

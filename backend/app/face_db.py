@@ -25,6 +25,12 @@ def init_db() -> None:
             )
             """
         )
+        existing_face_cols = {row[1] for row in conn.execute("PRAGMA table_info(enrolled_faces)")}
+        if "camera_face_id" not in existing_face_cols:
+            # tracks which camera Allow List entry (device host + its Id) this
+            # row was pulled from, so re-running the camera sync doesn't
+            # re-import the same person every time
+            conn.execute("ALTER TABLE enrolled_faces ADD COLUMN camera_face_id TEXT")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS detection_events (
@@ -60,12 +66,20 @@ def clear_faces() -> None:
         conn.execute("DELETE FROM enrolled_faces")
 
 
-def add_face(name: str, source_photo: str, embedding: np.ndarray) -> None:
+def add_face(name: str, source_photo: str, embedding: np.ndarray, camera_face_id: str | None = None) -> None:
     with get_connection() as conn:
         conn.execute(
-            "INSERT INTO enrolled_faces (name, source_photo, embedding) VALUES (?, ?, ?)",
-            (name, source_photo, embedding.astype(np.float32).tobytes()),
+            "INSERT INTO enrolled_faces (name, source_photo, embedding, camera_face_id) VALUES (?, ?, ?, ?)",
+            (name, source_photo, embedding.astype(np.float32).tobytes(), camera_face_id),
         )
+
+
+def get_synced_camera_face_ids() -> set[str]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT camera_face_id FROM enrolled_faces WHERE camera_face_id IS NOT NULL"
+        ).fetchall()
+    return {r[0] for r in rows}
 
 
 def load_all_faces() -> list[tuple[str, np.ndarray]]:

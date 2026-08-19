@@ -24,6 +24,7 @@ export const api = {
   updateSite: (id, data) => req(`/api/sites/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteSite: (id) => req(`/api/sites/${id}`, { method: 'DELETE' }),
   deletePerson: (name) => req(`/api/people/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  syncPeopleFromCamera: () => req('/api/people/sync-from-camera', { method: 'POST' }),
   login: (email) => req('/api/auth/login', { method: 'POST', body: JSON.stringify({ email }) }),
   listUsers: () => req('/api/users'),
   listAlerts: ({ resolved } = {}) =>

@@ -21,7 +21,15 @@ export const api = {
   getStats: () => req('/api/stats'),
   listSites: () => req('/api/sites'),
   createSite: (data) => req('/api/sites', { method: 'POST', body: JSON.stringify(data) }),
+  updateSite: (id, data) => req(`/api/sites/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteSite: (id) => req(`/api/sites/${id}`, { method: 'DELETE' }),
+  deletePerson: (name) => req(`/api/people/${encodeURIComponent(name)}`, { method: 'DELETE' }),
   login: (email) => req('/api/auth/login', { method: 'POST', body: JSON.stringify({ email }) }),
   listUsers: () => req('/api/users'),
+  listAlerts: ({ resolved } = {}) =>
+    req(`/api/alerts${resolved === undefined ? '' : `?resolved=${resolved}`}`),
+  resolveAlert: (id) => req(`/api/alerts/${id}/resolve`, { method: 'POST' }),
+  getSettings: () => req('/api/settings'),
+  updateSettings: (data) => req('/api/settings', { method: 'PUT', body: JSON.stringify(data) }),
+  getAttendance: (date) => req(`/api/attendance${date ? `?date=${date}` : ''}`),
 }

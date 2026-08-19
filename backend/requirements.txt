@@ -8,6 +8,4 @@ insightface
 onnxruntime
 requests
 python-multipart
-
-# added in M3 (objects):
-# ultralytics
+ultralytics

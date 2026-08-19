@@ -50,6 +50,9 @@ def init_db() -> None:
             )
             """
         )
+        existing_footfall_cols = {row[1] for row in conn.execute("PRAGMA table_info(footfall_counts)")}
+        if "camera_id" not in existing_footfall_cols:
+            conn.execute("ALTER TABLE footfall_counts ADD COLUMN camera_id INTEGER")
 
 
 def clear_faces() -> None:
@@ -69,6 +72,15 @@ def load_all_faces() -> list[tuple[str, np.ndarray]]:
     with get_connection() as conn:
         rows = conn.execute("SELECT name, embedding FROM enrolled_faces").fetchall()
     return [(name, np.frombuffer(blob, dtype=np.float32)) for name, blob in rows]
+
+
+def delete_face(name: str) -> list[str]:
+    """Removes every enrolled sample for this person locally. Returns the
+    source_photo filenames so the caller can also unlink the photo files."""
+    with get_connection() as conn:
+        rows = conn.execute("SELECT source_photo FROM enrolled_faces WHERE name = ?", (name,)).fetchall()
+        conn.execute("DELETE FROM enrolled_faces WHERE name = ?", (name,))
+    return [r[0] for r in rows]
 
 
 def load_faces_with_photos() -> list[dict]:
@@ -96,3 +108,45 @@ def count_detections_today() -> int:
             "SELECT COUNT(*) FROM detection_events WHERE ts >= ?", (midnight,)
         ).fetchone()
     return row[0]
+
+
+def get_attendance(date: str | None = None) -> list[dict]:
+    """First/last-seen per recognized person for the given day (default
+    today), built purely from the existing detection_events log — no
+    separate capture logic needed."""
+    if date is None:
+        date = datetime.now().strftime("%Y-%m-%d")
+    day_start = datetime.strptime(date, "%Y-%m-%d").timestamp()
+    day_end = day_start + 86400
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """SELECT name, MIN(ts) AS first_seen, MAX(ts) AS last_seen,
+                      GROUP_CONCAT(DISTINCT camera_id) AS cameras
+               FROM detection_events
+               WHERE ts >= ? AND ts < ? AND name != 'Unknown'
+               GROUP BY name ORDER BY name""",
+            (day_start, day_end),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def log_footfall(camera_id: int, direction: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO footfall_counts (ts, camera_id, direction) VALUES (?, ?, ?)",
+            (time.time(), camera_id, direction),
+        )
+
+
+def count_footfall_today() -> dict:
+    now = datetime.now()
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT direction, COUNT(*) FROM footfall_counts WHERE ts >= ? GROUP BY direction", (midnight,)
+        ).fetchall()
+    counts = {"in": 0, "out": 0}
+    for direction, count in rows:
+        counts[direction] = count
+    return counts

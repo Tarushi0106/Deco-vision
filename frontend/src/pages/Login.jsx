@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api } from '../api'
+import { setCurrentUser } from '../auth'
 import BrandLogo from '../components/BrandLogo'
 import './login.css'
 
@@ -18,10 +19,18 @@ export default function Login() {
     api.getStats().then(setStats).catch(() => {})
   }, [])
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault()
-    // UI-only for now — any input proceeds to the dashboard. Real
-    // authentication is a planned follow-up, not built yet.
+    // Password isn't verified against anything yet (no real auth backend) —
+    // but the login IS now recorded for real via /api/auth/login, so the
+    // topbar and /api/users reflect who actually signed in.
+    try {
+      const user = await api.login(email)
+      setCurrentUser(user)
+    } catch {
+      // backend hiccup shouldn't lock the user out of the UI — just proceed
+      // without a stored identity, topbar falls back to a placeholder
+    }
     navigate('/dashboard')
   }
 

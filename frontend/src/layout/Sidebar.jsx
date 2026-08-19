@@ -22,6 +22,7 @@ const NAV_GROUPS = [
       { to: '/attendance', label: 'Attendance' },
       { to: '/cameras', label: 'Camera Management' },
       { to: '/sites', label: 'Site Management' },
+      { to: '/attendance', label: 'Attendance' },
     ],
   },
   {

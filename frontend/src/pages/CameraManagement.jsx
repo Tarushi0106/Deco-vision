@@ -12,6 +12,7 @@ const BLANK = {
   user: '',
   password: '',
   stream_path: '/h264/ch1/sub/av_stream',
+  live_feed_enabled: true,
 }
 
 function CameraModal({ initial, onClose, onSaved }) {
@@ -83,6 +84,14 @@ function CameraModal({ initial, onClose, onSaved }) {
         <div className="form-row">
           <label>Stream Path</label>
           <input value={form.stream_path} onChange={set('stream_path')} />
+        </div>
+        <div className="form-row">
+          <label>Live Feed Enabled</label>
+          <input
+            type="checkbox"
+            checked={Boolean(form.live_feed_enabled)}
+            onChange={(e) => setForm({ ...form, live_feed_enabled: e.target.checked })}
+          />
         </div>
         {status?.error && <div className="form-message error">{status.error}</div>}
         <div className="modal-actions">

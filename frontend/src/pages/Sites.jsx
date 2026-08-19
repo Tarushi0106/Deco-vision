@@ -2,16 +2,21 @@ import { Fragment, useEffect, useState } from 'react'
 import { api } from '../api'
 import './pages.css'
 
-function AddSiteModal({ onClose, onSaved }) {
-  const [name, setName] = useState('')
-  const [description, setDescription] = useState('')
+function SiteModal({ initial, onClose, onSaved }) {
+  const [name, setName] = useState(initial?.name || '')
+  const [description, setDescription] = useState(initial?.description || '')
   const [status, setStatus] = useState(null)
+  const isEdit = Boolean(initial?.id)
 
   const handleSubmit = async (e) => {
     e.preventDefault()
     setStatus({ loading: true })
     try {
-      await api.createSite({ name, description })
+      if (isEdit) {
+        await api.updateSite(initial.id, { name, description })
+      } else {
+        await api.createSite({ name, description })
+      }
       onSaved()
       onClose()
     } catch (err) {
@@ -22,7 +27,7 @@ function AddSiteModal({ onClose, onSaved }) {
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <form className="card modal" onClick={(e) => e.stopPropagation()} onSubmit={handleSubmit}>
-        <h3>Add Site</h3>
+        <h3>{isEdit ? 'Edit Site' : 'Add Site'}</h3>
         <div className="form-row">
           <label>Name</label>
           <input value={name} onChange={(e) => setName(e.target.value)} required />
@@ -49,6 +54,7 @@ export default function Sites() {
   const [sites, setSites] = useState([])
   const [expanded, setExpanded] = useState(null)
   const [showModal, setShowModal] = useState(false)
+  const [editing, setEditing] = useState(null)
 
   const load = () => {
     api.listSites().then(setSites).catch(() => {})
@@ -57,6 +63,13 @@ export default function Sites() {
 
   const toggle = (id) => setExpanded(expanded === id ? null : id)
 
+  const handleDelete = async (e, id) => {
+    e.stopPropagation()
+    if (!confirm('Delete this site? Cameras assigned to it are not deleted, just unassigned.')) return
+    await api.deleteSite(id)
+    load()
+  }
+
   return (
     <div>
       <div className="page-toolbar">
@@ -64,7 +77,13 @@ export default function Sites() {
           <h2>Sites</h2>
           <div className="page-toolbar-sub">Manage sites for realtime monitoring</div>
         </div>
-        <button className="btn btn-primary" onClick={() => setShowModal(true)}>
+        <button
+          className="btn btn-primary"
+          onClick={() => {
+            setEditing(null)
+            setShowModal(true)
+          }}
+        >
           + Add Site
         </button>
       </div>
@@ -78,6 +97,7 @@ export default function Sites() {
               <th>Cameras</th>
               <th>Active</th>
               <th>Status</th>
+              <th>Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -94,10 +114,26 @@ export default function Sites() {
                   <td>
                     <span className="pill pill-success">Active</span>
                   </td>
+                  <td>
+                    <button
+                      className="btn btn-outline"
+                      style={{ marginRight: '0.4rem' }}
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        setEditing(site)
+                        setShowModal(true)
+                      }}
+                    >
+                      Edit
+                    </button>
+                    <button className="btn btn-outline" onClick={(e) => handleDelete(e, site.id)}>
+                      Delete
+                    </button>
+                  </td>
                 </tr>
                 {expanded === site.id && (
                   <tr>
-                    <td colSpan={5} className="site-cameras-cell">
+                    <td colSpan={6} className="site-cameras-cell">
                       {site.cameras.length === 0 ? (
                         <div className="empty-state">No cameras assigned to this site yet.</div>
                       ) : (
@@ -135,7 +171,9 @@ export default function Sites() {
         </table>
       </div>
 
-      {showModal && <AddSiteModal onClose={() => setShowModal(false)} onSaved={load} />}
+      {showModal && (
+        <SiteModal initial={editing} onClose={() => setShowModal(false)} onSaved={load} />
+      )}
     </div>
   )
 }

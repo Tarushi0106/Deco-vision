@@ -1,6 +1,15 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
+import { clearCurrentUser, getCurrentUser } from '../auth'
 import './layout.css'
+
+function initialsFor(name) {
+  const parts = name.trim().split(/\s+/)
+  return parts
+    .slice(0, 2)
+    .map((p) => p[0]?.toUpperCase())
+    .join('')
+}
 
 function MoonIcon() {
   return (
@@ -53,8 +62,14 @@ export default function Topbar({ title, breadcrumb }) {
     return () => document.removeEventListener('mousedown', handleClickOutside)
   }, [menuOpen])
 
+  const user = getCurrentUser()
+  const displayName = user?.name || 'Guest User'
+  const displayEmail = user?.email || 'not signed in'
+  const avatarInitials = user?.name ? initialsFor(user.name) : '?'
+
   const handleLogout = () => {
     setMenuOpen(false)
+    clearCurrentUser()
     navigate('/login')
   }
 
@@ -82,12 +97,12 @@ export default function Topbar({ title, breadcrumb }) {
         </button>
         <div className="topbar-avatar-menu" ref={menuRef}>
           <button className="topbar-avatar" onClick={() => setMenuOpen((v) => !v)}>
-            KG
+            {avatarInitials}
           </button>
           {menuOpen && (
             <div className="topbar-dropdown">
-              <div className="topbar-dropdown-name">Kanishka Gangwar</div>
-              <div className="topbar-dropdown-email">kanishka.gangwar@dewin.in</div>
+              <div className="topbar-dropdown-name">{displayName}</div>
+              <div className="topbar-dropdown-email">{displayEmail}</div>
               <button className="topbar-dropdown-logout" onClick={handleLogout}>
                 Log out
               </button>

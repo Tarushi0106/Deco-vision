@@ -16,10 +16,13 @@ waits on inference, so video stays live regardless of detection load.
 import logging
 import threading
 import time
+from datetime import datetime
 
 import cv2
 
-from . import camera_db, face_db
+from . import alerts_db, camera_db, face_db
+from .person_tracker import PersonTracker
+from .pose_detector import PoseDetector
 from .recognizer import FaceRecognizer
 from .video_source import RtspSource, WebcamSource
 
@@ -27,6 +30,12 @@ logger = logging.getLogger("dashboard.pipeline")
 
 JPEG_QUALITY = 80
 DETECTION_INTERVAL_SECONDS = 0.3  # per camera, in the shared round-robin
+# pose detection (YOLO) is meaningfully heavier per-frame than InsightFace
+# on CPU, so it runs on its own slower per-camera cadence within the same loop
+PERSON_ANALYSIS_INTERVAL_SECONDS = 1.5
+# how long an after-hours intrusion alert stays "fresh" before it's allowed
+# to fire again for the same camera — otherwise it would refire every sample
+INTRUSION_ALERT_COOLDOWN_SECONDS = 300
 # don't log a new detection_event for the same person on the same camera
 # more often than this - avoids flooding the table while someone stands in frame
 DETECTION_LOG_COOLDOWN_SECONDS = 30
@@ -144,16 +153,24 @@ class PipelineManager:
     def __init__(self):
         self._recognizer: FaceRecognizer | None = None
         self._recognizer_lock = threading.Lock()
+        self._pose_detector: PoseDetector | None = None
+        self._person_trackers: dict[int, PersonTracker] = {}
+        self._last_person_analysis: dict[int, float] = {}
         self._pipelines: dict[int, CameraPipeline] = {}
+        self._conn_keys: dict[int, tuple] = {}
         self._detection_thread: threading.Thread | None = None
         self._detection_running = False
+
+    @staticmethod
+    def _should_be_live(cam: dict) -> bool:
+        return bool(cam["is_configured"] and cam["status"] == "active" and cam["live_feed_enabled"])
 
     def start(self) -> None:
         self._recognizer = FaceRecognizer()
         logger.info("Shared face recognizer loaded")
 
         for cam in camera_db.list_cameras():
-            if cam["is_configured"] and cam["status"] == "active":
+            if self._should_be_live(cam):
                 self._start_camera(cam["id"])
 
         self._detection_running = True
@@ -167,6 +184,15 @@ class PipelineManager:
         for pipeline in self._pipelines.values():
             pipeline.stop()
         self._pipelines.clear()
+        self._conn_keys.clear()
+        self._person_trackers.clear()
+        self._last_person_analysis.clear()
+
+    def _connection_key(self, camera_id: int) -> tuple | None:
+        cam = camera_db.get_camera_connection(camera_id)
+        if cam is None:
+            return None
+        return (cam["host"], cam["port"], cam["user"], cam["password"], cam["stream_path"])
 
     def _start_camera(self, camera_id: int) -> None:
         if camera_id in self._pipelines:
@@ -174,18 +200,34 @@ class PipelineManager:
         pipeline = CameraPipeline(camera_id)
         pipeline.start()
         self._pipelines[camera_id] = pipeline
+        self._conn_keys[camera_id] = self._connection_key(camera_id)
 
     def refresh_cameras(self) -> None:
-        """Call after camera CRUD changes to start/stop pipelines accordingly."""
+        """Call after camera CRUD changes to start/stop pipelines accordingly.
+
+        Also reconnects any already-active camera whose connection details
+        (host/port/user/password/stream_path) changed — otherwise editing
+        just the password would leave the pipeline running on its already
+        -open, old-credentials connection until that connection happened to
+        drop on its own."""
         cameras = {c["id"]: c for c in camera_db.list_cameras()}
 
         for camera_id in list(self._pipelines):
             cam = cameras.get(camera_id)
-            if cam is None or not cam["is_configured"] or cam["status"] != "active":
+            if cam is None or not self._should_be_live(cam):
                 self._pipelines.pop(camera_id).stop()
+                self._conn_keys.pop(camera_id, None)
+                self._person_trackers.pop(camera_id, None)
+                self._last_person_analysis.pop(camera_id, None)
+            elif self._connection_key(camera_id) != self._conn_keys.get(camera_id):
+                logger.info("Camera %s: connection details changed, reconnecting", camera_id)
+                self._pipelines.pop(camera_id).stop()
+                self._conn_keys.pop(camera_id, None)
+                self._person_trackers.pop(camera_id, None)
+                self._last_person_analysis.pop(camera_id, None)
 
         for cam in cameras.values():
-            if cam["is_configured"] and cam["status"] == "active":
+            if self._should_be_live(cam):
                 self._start_camera(cam["id"])
 
     def _detection_loop(self) -> None:
@@ -207,7 +249,55 @@ class PipelineManager:
                 with self._recognizer_lock:
                     detections = self._recognizer.detect_and_recognize(frame)
                 pipeline.set_detections(detections)
+
+                self._maybe_run_person_analysis(pipeline, frame)
+
                 time.sleep(DETECTION_INTERVAL_SECONDS)
+
+    def _maybe_run_person_analysis(self, pipeline: "CameraPipeline", frame) -> None:
+        """Runs on PERSON_ANALYSIS_INTERVAL_SECONDS, not every face-detection
+        cycle — pose estimation is heavier than InsightFace on CPU. Drives
+        footfall, fall detection, and after-hours intrusion off one shared
+        PoseDetector pass, so this costs no extra inference per feature."""
+        camera_id = pipeline.camera_id
+        now = time.time()
+        if now - self._last_person_analysis.get(camera_id, 0) < PERSON_ANALYSIS_INTERVAL_SECONDS:
+            return
+        self._last_person_analysis[camera_id] = now
+
+        if self._pose_detector is None:
+            self._pose_detector = PoseDetector()
+            logger.info("Shared pose detector loaded")
+
+        people = self._pose_detector.detect(frame)
+
+        tracker = self._person_trackers.setdefault(camera_id, PersonTracker())
+        events = tracker.update(people, frame.shape[0])
+
+        for direction in events["footfall_events"]:
+            face_db.log_footfall(camera_id, direction)
+
+        for _track_id in events["fall_events"]:
+            alerts_db.log_alert(camera_id, "fall", "Person down detected")
+            logger.warning("Camera %s: fall detected", camera_id)
+
+        if people and self._is_within_restricted_window():
+            if not alerts_db.recent_open_alert(camera_id, "intrusion", INTRUSION_ALERT_COOLDOWN_SECONDS):
+                alerts_db.log_alert(camera_id, "intrusion", "Person present during restricted hours")
+                logger.warning("Camera %s: intrusion during restricted hours", camera_id)
+
+    @staticmethod
+    def _is_within_restricted_window() -> bool:
+        start_str = alerts_db.get_setting("restricted_start")
+        end_str = alerts_db.get_setting("restricted_end")
+        if not start_str or not end_str:
+            return False
+        now = datetime.now().time()
+        start = datetime.strptime(start_str, "%H:%M").time()
+        end = datetime.strptime(end_str, "%H:%M").time()
+        if start <= end:
+            return start <= now <= end
+        return now >= start or now <= end
 
     def compute_embedding(self, frame_bgr):
         with self._recognizer_lock:

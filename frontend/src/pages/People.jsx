@@ -88,6 +88,7 @@ export default function People() {
   const [faces, setFaces] = useState([])
   const [showModal, setShowModal] = useState(false)
   const [viewingPerson, setViewingPerson] = useState(null)
+  const [deleteNote, setDeleteNote] = useState(null)
 
   const load = () => {
     api.listFaces().then(setFaces).catch(() => {})
@@ -96,6 +97,13 @@ export default function People() {
   useEffect(() => {
     load()
   }, [])
+
+  const handleDelete = async (name) => {
+    if (!confirm(`Remove ${name} from local face recognition?`)) return
+    const result = await api.deletePerson(name)
+    setDeleteNote(result.note)
+    load()
+  }
 
   return (
     <div>
@@ -109,6 +117,8 @@ export default function People() {
         </button>
       </div>
 
+      {deleteNote && <div className="form-message" style={{ marginBottom: '0.75rem' }}>{deleteNote}</div>}
+
       <div className="card">
         <table>
           <thead>
@@ -117,6 +127,7 @@ export default function People() {
               <th>Name</th>
               <th>Face Enrollment</th>
               <th>Samples</th>
+              <th>Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -137,6 +148,11 @@ export default function People() {
                   <span className="pill pill-success">COMPLETED</span>
                 </td>
                 <td>{f.sample_count}</td>
+                <td>
+                  <button className="btn btn-outline" onClick={() => handleDelete(f.name)}>
+                    Delete
+                  </button>
+                </td>
               </tr>
             ))}
           </tbody>

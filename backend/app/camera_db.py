@@ -125,6 +125,19 @@ def add_site(name: str, description: str = "") -> int:
         return cur.lastrowid
 
 
+def update_site(site_id: int, name: str | None = None, description: str | None = None) -> None:
+    with get_connection() as conn:
+        if name is not None:
+            old_name = conn.execute("SELECT name FROM sites WHERE id = ?", (site_id,)).fetchone()
+            if old_name and old_name[0] != name:
+                # site is a free-text label on cameras, not a foreign key —
+                # cascade the rename so cameras don't silently orphan from it
+                conn.execute("UPDATE cameras SET site = ? WHERE site = ?", (name, old_name[0]))
+            conn.execute("UPDATE sites SET name = ? WHERE id = ?", (name, site_id))
+        if description is not None:
+            conn.execute("UPDATE sites SET description = ? WHERE id = ?", (description, site_id))
+
+
 def delete_site(site_id: int) -> None:
     with get_connection() as conn:
         conn.execute("DELETE FROM sites WHERE id = ?", (site_id,))

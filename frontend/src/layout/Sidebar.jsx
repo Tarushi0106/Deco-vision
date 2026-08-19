@@ -19,6 +19,7 @@ const NAV_GROUPS = [
     label: 'Core',
     items: [
       { to: '/people', label: 'People' },
+      { to: '/attendance', label: 'Attendance' },
       { to: '/cameras', label: 'Camera Management' },
       { to: '/sites', label: 'Site Management' },
     ],
@@ -26,7 +27,6 @@ const NAV_GROUPS = [
   {
     label: 'Coming soon',
     items: [
-      { label: 'Attendance', tag: 'P2' },
       { label: 'Crowd Analytics', tag: 'P2' },
       { label: 'Threat Detection', tag: 'P3' },
       { label: 'Vehicle Detection', tag: 'P3' },

@@ -81,6 +81,20 @@ class CameraPipeline:
                 continue
             self._last_logged[name] = now
             face_db.log_detection_event(self.camera_id, name, det["bbox"])
+            
+            # --- Naya Attendance Saving Logic ---
+            try:
+                from .database import SessionLocal
+                from .attendance import AttendanceRecord
+                from datetime import datetime
+                
+                db = SessionLocal()
+                new_attendance = AttendanceRecord(visitor_name=name, status="Present", entry_time=datetime.utcnow())
+                db.add(new_attendance)
+                db.commit()
+                db.close()
+            except Exception as e:
+                print("Error saving attendance:", e)
 
     def _create_source(self):
         cam = camera_db.get_camera_connection(self.camera_id)

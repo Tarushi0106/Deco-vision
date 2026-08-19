@@ -4,6 +4,7 @@ import re
 import time
 import uuid
 from pathlib import Path
+from .attendence import router as attendance_router
 
 import cv2
 import numpy as np
@@ -11,6 +12,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, W
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
 
 from . import camera_db, face_db, user_db
 from .camera_client import camera_client, sync_face_to_all_devices
@@ -22,6 +24,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dashboard")
 
 app = FastAPI()
+app.include_router(attendance_router)
 START_TIME = time.time()
 
 app.add_middleware(

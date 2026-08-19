@@ -15,7 +15,7 @@ const BLANK = {
   live_feed_enabled: true,
 }
 
-function CameraModal({ initial, onClose, onSaved }) {
+function CameraFormModal({ initial, onClose, onSaved }) {
   const [form, setForm] = useState(initial ? { ...BLANK, ...initial, password: '' } : BLANK)
   const [status, setStatus] = useState(null)
   const isEdit = Boolean(initial?.id)
@@ -190,7 +190,7 @@ export default function CameraManagement() {
       </div>
 
       {showModal && (
-        <CameraModal initial={editing} onClose={() => setShowModal(false)} onSaved={load} />
+        <CameraFormModal initial={editing} onClose={() => setShowModal(false)} onSaved={load} />
       )}
     </div>
   )

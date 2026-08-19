@@ -3,6 +3,7 @@ import logging
 import re
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -85,6 +86,7 @@ class LoginIn(BaseModel):
 class SettingsIn(BaseModel):
     restricted_start: str | None = None  # "HH:MM"; empty/omitted disables intrusion detection
     restricted_end: str | None = None
+    detection_fps: float | None = None  # how often frames are sent for face recognition
 
 
 @app.on_event("startup")
@@ -220,6 +222,7 @@ def get_settings():
     return {
         "restricted_start": alerts_db.get_setting("restricted_start", ""),
         "restricted_end": alerts_db.get_setting("restricted_end", ""),
+        "detection_fps": float(alerts_db.get_setting("detection_fps", "1")),
     }
 
 
@@ -227,6 +230,8 @@ def get_settings():
 def update_settings(settings: SettingsIn):
     alerts_db.set_setting("restricted_start", settings.restricted_start or "")
     alerts_db.set_setting("restricted_end", settings.restricted_end or "")
+    if settings.detection_fps is not None:
+        alerts_db.set_setting("detection_fps", str(settings.detection_fps))
     return {"ok": True}
 
 
@@ -235,10 +240,17 @@ def get_attendance(date: str | None = None):
     return face_db.get_attendance(date)
 
 
+@app.get("/api/analytics/people")
+def get_people_analytics(days: int = 7):
+    cameras_by_id = {c["id"]: c["name"] for c in camera_db.list_cameras()}
+    analytics = face_db.get_person_analytics(days)
+    for row in analytics:
+        row["top_camera_name"] = cameras_by_id.get(row["top_camera_id"], "—")
+    return analytics
+
+
 @app.get("/api/debug/snaped-faces")
 def debug_snaped_faces():
-    from datetime import datetime
-
     today = datetime.now().strftime("%Y-%m-%d")
     result = camera_client.search_snaped_faces(f"{today} 00:00:00", f"{today} 23:59:59")
     return result

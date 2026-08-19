@@ -1,8 +1,7 @@
 import { useEffect, useState } from 'react'
-import { api } from '../api'
+import { api, API_BASE } from '../api'
 import './pages.css'
 
-const API_BASE = 'http://127.0.0.1:8811'
 const ADD_PERSON_URL = `${API_BASE}/api/people`
 
 function AddPersonModal({ onClose, onAdded }) {

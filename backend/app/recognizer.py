@@ -12,6 +12,14 @@ class FaceRecognizer:
     """
 
     def __init__(self):
+        # Tried capping intra_op_num_threads here to reduce peak CPU% per
+        # call — measurement showed it backfired: the real problem is each
+        # call blocking the GIL/event loop for its full wall-clock duration,
+        # and fewer threads means each call takes LONGER to finish (more
+        # blocked time), not less. Left at onnxruntime's default (use
+        # available cores, finish fast) and controlling total impact via
+        # DETECTION_INTERVAL_SECONDS/PERSON_ANALYSIS_INTERVAL_SECONDS
+        # (how often it's called) instead, in pipeline.py.
         self._app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
         self._app.prepare(ctx_id=-1, det_size=(640, 640), det_thresh=0.5)
         self._reload_enrolled()

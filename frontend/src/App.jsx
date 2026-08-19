@@ -7,6 +7,7 @@ import People from './pages/People'
 import CameraManagement from './pages/CameraManagement'
 import Sites from './pages/Sites'
 import Attendance from './pages/Attendance'
+import Analytics from './pages/Analytics'
 import './theme.css'
 
 const PAGES = [
@@ -16,6 +17,7 @@ const PAGES = [
   { path: '/cameras', title: 'Cameras', breadcrumb: 'Deco Vision / Cameras', element: <CameraManagement /> },
   { path: '/sites', title: 'Sites', breadcrumb: 'Deco Vision / Sites', element: <Sites /> },
   { path: '/attendance', title: 'Attendance', breadcrumb: 'Deco Vision / Attendance', element: <Attendance /> },
+  { path: '/analytics', title: 'Analytics', breadcrumb: 'Deco Vision / Analytics', element: <Analytics /> },
 ]
 
 function App() {

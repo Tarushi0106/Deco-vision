@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
+import { WS_HOST } from '../api'
 import './CameraTile.css'
-
-const API_HOST = '127.0.0.1:8811'
 
 export default function CameraTile({ camera, showOverlay = true, onClick, large = false }) {
   const canvasRef = useRef(null)
@@ -21,7 +20,7 @@ export default function CameraTile({ camera, showOverlay = true, onClick, large 
     const img = new Image()
     let objectUrl = null
 
-    const videoWs = new WebSocket(`ws://${API_HOST}/ws/live/${camera.id}`)
+    const videoWs = new WebSocket(`ws://${WS_HOST}/ws/live/${camera.id}`)
     videoWs.binaryType = 'blob'
     videoWs.onopen = () => setStatus('live')
     videoWs.onclose = () => setStatus('offline')
@@ -43,7 +42,7 @@ export default function CameraTile({ camera, showOverlay = true, onClick, large 
 
     let detectionsWs = null
     if (showOverlay) {
-      detectionsWs = new WebSocket(`ws://${API_HOST}/ws/detections/${camera.id}`)
+      detectionsWs = new WebSocket(`ws://${WS_HOST}/ws/detections/${camera.id}`)
       detectionsWs.onmessage = (event) => {
         const { faces } = JSON.parse(event.data)
         overlayCtx.clearRect(0, 0, overlay.width, overlay.height)

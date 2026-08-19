@@ -1,7 +1,8 @@
-const BASE = 'http://127.0.0.1:8811'
+export const API_BASE = 'http://127.0.0.1:8811'
+export const WS_HOST = API_BASE.replace(/^https?:\/\//, '')
 
 async function req(path, options) {
-  const res = await fetch(`${BASE}${path}`, {
+  const res = await fetch(`${API_BASE}${path}`, {
     headers: { 'Content-Type': 'application/json' },
     ...options,
   })
@@ -33,4 +34,5 @@ export const api = {
   getSettings: () => req('/api/settings'),
   updateSettings: (data) => req('/api/settings', { method: 'PUT', body: JSON.stringify(data) }),
   getAttendance: (date) => req(`/api/attendance${date ? `?date=${date}` : ''}`),
+  getPeopleAnalytics: (days = 7) => req(`/api/analytics/people?days=${days}`),
 }

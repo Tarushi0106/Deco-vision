@@ -68,6 +68,55 @@ function IntrusionWindowCard() {
   )
 }
 
+function DetectionRateCard() {
+  const [fps, setFps] = useState(1)
+  const [status, setStatus] = useState(null)
+
+  useEffect(() => {
+    api.getSettings().then((s) => setFps(s.detection_fps ?? 1)).catch(() => {})
+  }, [])
+
+  const handleSave = async (e) => {
+    e.preventDefault()
+    setStatus({ loading: true })
+    try {
+      await api.updateSettings({ detection_fps: fps })
+      setStatus({ loading: false, saved: true })
+    } catch (err) {
+      setStatus({ loading: false, error: err.message })
+    }
+  }
+
+  return (
+    <div className="card panel">
+      <div className="panel-header">
+        <h3>Detection Rate</h3>
+      </div>
+      <form onSubmit={handleSave} className="form-row" style={{ alignItems: 'center', gap: '0.5rem' }}>
+        <label style={{ marginRight: '0.5rem' }}>Frames/sec</label>
+        <input
+          type="number"
+          min="0.2"
+          max="15"
+          step="0.2"
+          value={fps}
+          onChange={(e) => setFps(Number(e.target.value))}
+          style={{ width: '5rem' }}
+        />
+        <button type="submit" className="btn btn-primary" style={{ marginLeft: '0.75rem' }} disabled={status?.loading}>
+          Save
+        </button>
+      </form>
+      <div className="stat-tile-sub" style={{ marginTop: '0.5rem' }}>
+        How often face recognition runs per camera. Lower is easier on the machine, higher is more responsive.
+        Video playback is unaffected either way — recognition runs in its own process.
+        {status?.saved && ' Saved.'}
+        {status?.error && ` ${status.error}`}
+      </div>
+    </div>
+  )
+}
+
 export default function Dashboard() {
   const [cameras, setCameras] = useState([])
   const [stats, setStats] = useState(null)
@@ -171,6 +220,7 @@ export default function Dashboard() {
         </div>
 
         <IntrusionWindowCard />
+        <DetectionRateCard />
       </div>
 
       {expanded && <CameraModal camera={expanded} onClose={() => setExpanded(null)} />}

@@ -145,6 +145,49 @@ def get_attendance(date: str | None = None) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def get_person_analytics(days: int = 7) -> list[dict]:
+    """Per-person visit patterns over the last N days, built from
+    detection_events (already deduped 30s per person/camera) — no new
+    capture logic, just aggregation over data already being logged."""
+    cutoff = time.time() - days * 86400
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT name, camera_id, ts FROM detection_events WHERE ts >= ? AND name != 'Unknown'",
+            (cutoff,),
+        ).fetchall()
+
+    people: dict[str, dict] = {}
+    for row in rows:
+        p = people.setdefault(
+            row["name"],
+            {"cameras": {}, "hourly": [0] * 24, "days_seen": set(), "first_seen": row["ts"], "last_seen": row["ts"]},
+        )
+        p["cameras"][row["camera_id"]] = p["cameras"].get(row["camera_id"], 0) + 1
+        dt = datetime.fromtimestamp(row["ts"])
+        p["hourly"][dt.hour] += 1
+        p["days_seen"].add(dt.date().isoformat())
+        p["first_seen"] = min(p["first_seen"], row["ts"])
+        p["last_seen"] = max(p["last_seen"], row["ts"])
+
+    results = []
+    for name, p in people.items():
+        top_camera_id = max(p["cameras"], key=p["cameras"].get) if p["cameras"] else None
+        results.append(
+            {
+                "name": name,
+                "total_detections": sum(p["cameras"].values()),
+                "days_seen": len(p["days_seen"]),
+                "top_camera_id": top_camera_id,
+                "first_seen": p["first_seen"],
+                "last_seen": p["last_seen"],
+                "hourly": p["hourly"],
+            }
+        )
+    results.sort(key=lambda r: r["total_detections"], reverse=True)
+    return results
+
+
 def log_footfall(camera_id: int, direction: str) -> None:
     with get_connection() as conn:
         conn.execute(

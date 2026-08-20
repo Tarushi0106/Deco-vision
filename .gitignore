@@ -17,3 +17,4 @@ backend/.env
 
 # auto-downloaded YOLO model weights (ultralytics re-downloads these on demand)
 backend/*.pt
+*.pem

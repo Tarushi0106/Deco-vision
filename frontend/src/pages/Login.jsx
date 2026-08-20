@@ -2,11 +2,9 @@ import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { api } from '../api'
 import { setCurrentUser } from '../auth'
+import { DEWIN_LOGO_PATH, MASCOT_PATH } from '../branding'
 import BrandLogo from '../components/BrandLogo'
 import './login.css'
-
-const DEWIN_LOGO_PATH = '/src/assets/branding/dewin-logo.png'
-const MASCOT_PATH = '/src/assets/branding/deco-vision-mascot.png'
 
 export default function Login() {
   const navigate = useNavigate()

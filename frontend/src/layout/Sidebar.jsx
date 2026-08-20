@@ -1,11 +1,9 @@
 import { useEffect, useState } from 'react'
 import { NavLink } from 'react-router-dom'
 import { api } from '../api'
+import { DEWIN_LOGO_PATH, MASCOT_PATH } from '../branding'
 import BrandLogo from '../components/BrandLogo'
 import './layout.css'
-
-const DEWIN_LOGO_PATH = '/src/assets/branding/dewin-logo.png'
-const MASCOT_PATH = '/src/assets/branding/deco-vision-mascot.png'
 
 const NAV_GROUPS = [
   {
@@ -23,6 +21,7 @@ const NAV_GROUPS = [
       { to: '/cameras', label: 'Camera Management' },
       { to: '/sites', label: 'Site Management' },
       { to: '/attendance', label: 'Attendance' },
+      { to: '/analytics', label: 'Analytics' },
     ],
   },
   {

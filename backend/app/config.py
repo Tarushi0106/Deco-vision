@@ -4,8 +4,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VIDEO_SOURCE = os.getenv("VIDEO_SOURCE", "webcam")
-
 CAMERA_HOST = os.getenv("CAMERA_HOST", "")
 CAMERA_RTSP_PORT = int(os.getenv("CAMERA_RTSP_PORT", "554"))
 CAMERA_USER = os.getenv("CAMERA_USER", "")

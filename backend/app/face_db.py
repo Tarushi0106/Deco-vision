@@ -25,6 +25,12 @@ def init_db() -> None:
             )
             """
         )
+        existing_face_cols = {row[1] for row in conn.execute("PRAGMA table_info(enrolled_faces)")}
+        if "camera_face_id" not in existing_face_cols:
+            # tracks which camera Allow List entry (device host + its Id) this
+            # row was pulled from, so re-running the camera sync doesn't
+            # re-import the same person every time
+            conn.execute("ALTER TABLE enrolled_faces ADD COLUMN camera_face_id TEXT")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS detection_events (
@@ -60,12 +66,20 @@ def clear_faces() -> None:
         conn.execute("DELETE FROM enrolled_faces")
 
 
-def add_face(name: str, source_photo: str, embedding: np.ndarray) -> None:
+def add_face(name: str, source_photo: str, embedding: np.ndarray, camera_face_id: str | None = None) -> None:
     with get_connection() as conn:
         conn.execute(
-            "INSERT INTO enrolled_faces (name, source_photo, embedding) VALUES (?, ?, ?)",
-            (name, source_photo, embedding.astype(np.float32).tobytes()),
+            "INSERT INTO enrolled_faces (name, source_photo, embedding, camera_face_id) VALUES (?, ?, ?, ?)",
+            (name, source_photo, embedding.astype(np.float32).tobytes(), camera_face_id),
         )
+
+
+def get_synced_camera_face_ids() -> set[str]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT camera_face_id FROM enrolled_faces WHERE camera_face_id IS NOT NULL"
+        ).fetchall()
+    return {r[0] for r in rows}
 
 
 def load_all_faces() -> list[tuple[str, np.ndarray]]:
@@ -129,6 +143,49 @@ def get_attendance(date: str | None = None) -> list[dict]:
             (day_start, day_end),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_person_analytics(days: int = 7) -> list[dict]:
+    """Per-person visit patterns over the last N days, built from
+    detection_events (already deduped 30s per person/camera) — no new
+    capture logic, just aggregation over data already being logged."""
+    cutoff = time.time() - days * 86400
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT name, camera_id, ts FROM detection_events WHERE ts >= ? AND name != 'Unknown'",
+            (cutoff,),
+        ).fetchall()
+
+    people: dict[str, dict] = {}
+    for row in rows:
+        p = people.setdefault(
+            row["name"],
+            {"cameras": {}, "hourly": [0] * 24, "days_seen": set(), "first_seen": row["ts"], "last_seen": row["ts"]},
+        )
+        p["cameras"][row["camera_id"]] = p["cameras"].get(row["camera_id"], 0) + 1
+        dt = datetime.fromtimestamp(row["ts"])
+        p["hourly"][dt.hour] += 1
+        p["days_seen"].add(dt.date().isoformat())
+        p["first_seen"] = min(p["first_seen"], row["ts"])
+        p["last_seen"] = max(p["last_seen"], row["ts"])
+
+    results = []
+    for name, p in people.items():
+        top_camera_id = max(p["cameras"], key=p["cameras"].get) if p["cameras"] else None
+        results.append(
+            {
+                "name": name,
+                "total_detections": sum(p["cameras"].values()),
+                "days_seen": len(p["days_seen"]),
+                "top_camera_id": top_camera_id,
+                "first_seen": p["first_seen"],
+                "last_seen": p["last_seen"],
+                "hourly": p["hourly"],
+            }
+        )
+    results.sort(key=lambda r: r["total_detections"], reverse=True)
+    return results
 
 
 def log_footfall(camera_id: int, direction: str) -> None:

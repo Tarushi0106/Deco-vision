@@ -1,7 +1,8 @@
-const BASE = 'http://127.0.0.1:8811'
+export const API_BASE = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8811'
+export const WS_HOST = API_BASE.replace(/^https?:\/\//, '')
 
 async function req(path, options) {
-  const res = await fetch(`${BASE}${path}`, {
+  const res = await fetch(`${API_BASE}${path}`, {
     headers: { 'Content-Type': 'application/json' },
     ...options,
   })
@@ -24,6 +25,7 @@ export const api = {
   updateSite: (id, data) => req(`/api/sites/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteSite: (id) => req(`/api/sites/${id}`, { method: 'DELETE' }),
   deletePerson: (name) => req(`/api/people/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  syncPeopleFromCamera: () => req('/api/people/sync-from-camera', { method: 'POST' }),
   login: (email) => req('/api/auth/login', { method: 'POST', body: JSON.stringify({ email }) }),
   listUsers: () => req('/api/users'),
   listAlerts: ({ resolved } = {}) =>
@@ -32,4 +34,5 @@ export const api = {
   getSettings: () => req('/api/settings'),
   updateSettings: (data) => req('/api/settings', { method: 'PUT', body: JSON.stringify(data) }),
   getAttendance: (date) => req(`/api/attendance${date ? `?date=${date}` : ''}`),
+  getPeopleAnalytics: (days = 7) => req(`/api/analytics/people?days=${days}`),
 }

@@ -4,7 +4,9 @@ import re
 import time
 import uuid
 from pathlib import Path
-from .attendence import router as attendance_router
+from app.attendence import router as attendance_router
+from app.database import Base, engine
+from app.models import AttendanceRecord
 
 import cv2
 import numpy as np
@@ -14,9 +16,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 
-from . import camera_db, face_db, user_db
-from .camera_client import camera_client, sync_face_to_all_devices
-from .pipeline import pipeline_manager
+from app import camera_db, face_db, user_db
+from app.camera_client import camera_client, sync_face_to_all_devices
+from app.pipeline import pipeline_manager
 
 ENROLLMENT_PHOTOS_DIR = Path(__file__).resolve().parent.parent / "data" / "enrollment_photos"
 
@@ -24,6 +26,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dashboard")
 
 app = FastAPI()
+Base.metadata.create_all(bind=engine)
 app.include_router(attendance_router)
 START_TIME = time.time()
 

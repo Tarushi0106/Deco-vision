@@ -17,6 +17,7 @@ const NAV_GROUPS = [
     label: 'Core',
     items: [
       { to: '/people', label: 'People' },
+      { to: '/attendance', label: 'Attendance' },
       { to: '/cameras', label: 'Camera Management' },
       { to: '/sites', label: 'Site Management' },
       { to: '/attendance', label: 'Attendance' },

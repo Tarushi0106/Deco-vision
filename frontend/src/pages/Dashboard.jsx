@@ -142,6 +142,19 @@ export default function Dashboard() {
 
   return (
     <div>
+      {/* --- CEO Cabin / Security Alert Banner --- */}
+      {alerts.length > 0 && (
+        <div className="card" style={{ backgroundColor: '#fee2e2', border: '1px solid #ef4444', marginBottom: '1.5rem', padding: '1rem' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+              <span className="pill pill-danger">🚨 SECURITY ALERT</span>
+              <strong style={{ color: '#991b1b' }}>Unauthorized entry or restricted zone intrusion detected in CEO Cabin!</strong>
+            </div>
+            <span style={{ fontSize: '0.875rem', color: '#b91c1c' }}>{alerts.length} active alert(s) requiring attention</span>
+          </div>
+        </div>
+      )}
+
       <div className="stat-grid">
         <StatTile
           label="Active Cameras"
@@ -199,7 +212,7 @@ export default function Dashboard() {
           ) : (
             <table>
               <tbody>
-                {alerts.map((alert) => (
+                {alerts.loadAlerts ? null : alerts.map((alert) => (
                   <tr key={alert.id}>
                     <td>
                       <span className="pill pill-danger">{alert.type === 'fall' ? 'FALL' : 'INTRUSION'}</span>

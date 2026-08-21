@@ -79,13 +79,43 @@ class CameraPipeline:
         now = time.time()
         for det in detections:
             name = det["name"]
+            
+            # --- Restricted Room Security Check (Only CEO Mahesh Choudhary allowed) ---
             if name == "Unknown":
+                last_alert = self._last_logged.get("alert_unknown", 0)
+                if now - last_alert >= DETECTION_LOG_COOLDOWN_SECONDS:
+                    self._last_logged["alert_unknown"] = now
+                    alerts_db.log_alert(self.camera_id, "unauthorized", "Unknown person entered the restricted room!")
+                    logger.warning("Camera %s: Unknown person tried entering the restricted room!", self.camera_id)
                 continue
+            
+            if name != "Mahesh Choudhary":
+                last_alert = self._last_logged.get(f"alert_{name}", 0)
+                if now - last_alert >= DETECTION_LOG_COOLDOWN_SECONDS:
+                    self._last_logged[f"alert_{name}"] = now
+                    alerts_db.log_alert(self.camera_id, "unauthorized", f"Unauthorized entry attempt by {name}!")
+                    logger.warning("Camera %s: Unauthorized person %s tried entering the restricted room!", self.camera_id, name)
+                continue  # Baaki log jo allowed nahi hain unka attendance record nahi banega
+
             last = self._last_logged.get(name, 0)
             if now - last < DETECTION_LOG_COOLDOWN_SECONDS:
                 continue
             self._last_logged[name] = now
             face_db.log_detection_event(self.camera_id, name, det["bbox"])
+            
+            # --- Attendance Saving Logic (Only for CEO Mahesh Choudhary) ---
+            try:
+                from .database import SessionLocal
+                from .attendance import AttendanceRecord
+                from datetime import datetime
+                
+                db = SessionLocal()
+                new_attendance = AttendanceRecord(visitor_name=name, status="Present", entry_time=datetime.utcnow())
+                db.add(new_attendance)
+                db.commit()
+                db.close()
+            except Exception as e:
+                print("Error saving attendance:", e)
 
     def _create_source(self):
         cam = camera_db.get_camera_connection(self.camera_id)

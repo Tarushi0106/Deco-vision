@@ -3,8 +3,10 @@ import logging
 import re
 import time
 import uuid
-from datetime import datetime
 from pathlib import Path
+from app.attendence import router as attendance_router
+from app.database import Base, engine
+from app.models import AttendanceRecord
 
 import cv2
 import numpy as np
@@ -13,9 +15,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import alerts_db, camera_db, face_db, user_db
-from .camera_client import camera_client, get_camera_client, sync_face_to_all_devices
-from .pipeline import pipeline_manager
+
+from app import camera_db, face_db, user_db
+from app.camera_client import camera_client, sync_face_to_all_devices
+from app.pipeline import pipeline_manager
 
 ENROLLMENT_PHOTOS_DIR = Path(__file__).resolve().parent.parent / "data" / "enrollment_photos"
 
@@ -23,6 +26,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dashboard")
 
 app = FastAPI()
+Base.metadata.create_all(bind=engine)
+app.include_router(attendance_router)
 START_TIME = time.time()
 
 app.add_middleware(
@@ -74,19 +79,8 @@ class SiteIn(BaseModel):
     description: str | None = ""
 
 
-class SiteUpdate(BaseModel):
-    name: str | None = None
-    description: str | None = None
-
-
 class LoginIn(BaseModel):
     email: str
-
-
-class SettingsIn(BaseModel):
-    restricted_start: str | None = None  # "HH:MM"; empty/omitted disables intrusion detection
-    restricted_end: str | None = None
-    detection_fps: float | None = None  # how often frames are sent for face recognition
 
 
 @app.on_event("startup")
@@ -94,7 +88,6 @@ def startup():
     face_db.init_db()
     camera_db.init_db()
     user_db.init_db()
-    alerts_db.init_db()
     pipeline_manager.start()
 
 
@@ -157,12 +150,6 @@ def create_site(site: SiteIn):
     return {"id": site_id}
 
 
-@app.put("/api/sites/{site_id}")
-def edit_site(site_id: int, site: SiteUpdate):
-    camera_db.update_site(site_id, name=site.name, description=site.description)
-    return {"ok": True}
-
-
 @app.delete("/api/sites/{site_id}")
 def remove_site(site_id: int):
     camera_db.delete_site(site_id)
@@ -187,70 +174,22 @@ def get_stats():
     degraded = live_count < len(active_configured)
 
     uptime_seconds = int(time.time() - START_TIME)
-    footfall = face_db.count_footfall_today()
 
     return {
         "active_cameras": live_count,
         "total_cameras": len(cameras),
         "faces_enrolled": len({name for name, _ in face_db.load_all_faces()}),
         "detections_today": face_db.count_detections_today(),
-        "active_alerts": alerts_db.count_open_alerts(),
+        "active_alerts": 0,  # no alerting system built yet — honestly zero, not a placeholder
         "system_status": "degraded" if degraded else "nominal",
         "uptime_seconds": uptime_seconds,
-        "footfall_in_today": footfall["in"],
-        "footfall_out_today": footfall["out"],
     }
-
-
-@app.get("/api/alerts")
-def list_alerts(resolved: bool | None = None, limit: int = 50):
-    cameras_by_id = {c["id"]: c["name"] for c in camera_db.list_cameras()}
-    alerts = alerts_db.list_alerts(resolved=resolved, limit=limit)
-    for alert in alerts:
-        alert["camera_name"] = cameras_by_id.get(alert["camera_id"], "Unknown camera")
-    return alerts
-
-
-@app.post("/api/alerts/{alert_id}/resolve")
-def resolve_alert(alert_id: int):
-    alerts_db.resolve_alert(alert_id)
-    return {"ok": True}
-
-
-@app.get("/api/settings")
-def get_settings():
-    return {
-        "restricted_start": alerts_db.get_setting("restricted_start", ""),
-        "restricted_end": alerts_db.get_setting("restricted_end", ""),
-        "detection_fps": float(alerts_db.get_setting("detection_fps", "1")),
-    }
-
-
-@app.put("/api/settings")
-def update_settings(settings: SettingsIn):
-    alerts_db.set_setting("restricted_start", settings.restricted_start or "")
-    alerts_db.set_setting("restricted_end", settings.restricted_end or "")
-    if settings.detection_fps is not None:
-        alerts_db.set_setting("detection_fps", str(settings.detection_fps))
-    return {"ok": True}
-
-
-@app.get("/api/attendance")
-def get_attendance(date: str | None = None):
-    return face_db.get_attendance(date)
-
-
-@app.get("/api/analytics/people")
-def get_people_analytics(days: int = 7):
-    cameras_by_id = {c["id"]: c["name"] for c in camera_db.list_cameras()}
-    analytics = face_db.get_person_analytics(days)
-    for row in analytics:
-        row["top_camera_name"] = cameras_by_id.get(row["top_camera_id"], "—")
-    return analytics
 
 
 @app.get("/api/debug/snaped-faces")
 def debug_snaped_faces():
+    from datetime import datetime
+
     today = datetime.now().strftime("%Y-%m-%d")
     result = camera_client.search_snaped_faces(f"{today} 00:00:00", f"{today} 23:59:59")
     return result
@@ -286,86 +225,6 @@ async def add_person(name: str = Form(...), photo: UploadFile = File(...)):
     device_results = await asyncio.to_thread(sync_face_to_all_devices, name, photo_bytes)
 
     return {"name": name, "local_enrolled": True, "devices": device_results}
-
-
-@app.delete("/api/people/{name}")
-def remove_person(name: str):
-    photos = face_db.delete_face(name)
-    for photo in photos:
-        (ENROLLMENT_PHOTOS_DIR / photo).unlink(missing_ok=True)
-    pipeline_manager.reload_faces()
-    logger.info("Removed %s from local recognition (%d photo(s))", name, len(photos))
-    return {
-        "name": name,
-        "removed_locally": True,
-        "note": "Removed from this dashboard's recognition only — not from any camera's onboard Allow List "
-        "(no verified API for that in this codebase; remove manually via the camera's admin UI if needed).",
-    }
-
-
-def _sync_people_from_camera() -> dict:
-    synced, skipped = 0, 0
-    failed = []
-    already_synced = face_db.get_synced_camera_face_ids()
-
-    for device in camera_db.list_active_devices():
-        host = device["host"]
-        if not device.get("user") or not device.get("password"):
-            continue
-        client = get_camera_client(host, device["user"], device["password"], device.get("admin_port", 443))
-
-        try:
-            faces = client.list_added_faces()
-        except Exception as e:
-            failed.append({"host": host, "name": None, "error": f"could not list Allow List: {e}"})
-            continue
-
-        for face in faces:
-            camera_face_id = f"{host}:{face['Id']}"
-            if camera_face_id in already_synced:
-                skipped += 1
-                continue
-
-            try:
-                photo_bytes = client.get_added_face_photo(face["Id"])
-                if not photo_bytes:
-                    failed.append({"host": host, "name": face["Name"], "error": "camera has no photo for this entry"})
-                    continue
-
-                frame = cv2.imdecode(np.frombuffer(photo_bytes, np.uint8), cv2.IMREAD_COLOR)
-                if frame is None:
-                    failed.append({"host": host, "name": face["Name"], "error": "camera's photo is unreadable"})
-                    continue
-
-                embedding = pipeline_manager.compute_embedding(frame)
-                if embedding is None:
-                    failed.append({"host": host, "name": face["Name"], "error": "no face detected in camera's photo"})
-                    continue
-
-                safe_name = re.sub(r"[^a-zA-Z0-9 ()_-]", "", face["Name"]).strip().replace(" ", "_")
-                saved_filename = f"{safe_name}_camera{face['Id']}_{uuid.uuid4().hex[:6]}.jpg"
-                (ENROLLMENT_PHOTOS_DIR / saved_filename).write_bytes(photo_bytes)
-
-                face_db.add_face(face["Name"], saved_filename, embedding, camera_face_id=camera_face_id)
-                already_synced.add(camera_face_id)
-                synced += 1
-            except Exception as e:
-                failed.append({"host": host, "name": face.get("Name"), "error": str(e)})
-
-            # the camera's admin API is fragile under rapid repeated calls —
-            # pace requests rather than hammering it back-to-back
-            time.sleep(0.3)
-
-    if synced:
-        pipeline_manager.reload_faces()
-        logger.info("Synced %d people from camera Allow List(s)", synced)
-
-    return {"synced": synced, "skipped": skipped, "failed": failed}
-
-
-@app.post("/api/people/sync-from-camera")
-async def sync_people_from_camera():
-    return await asyncio.to_thread(_sync_people_from_camera)
 
 
 @app.websocket("/ws/live/{camera_id}")

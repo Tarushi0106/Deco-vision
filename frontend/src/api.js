@@ -1,5 +1,6 @@
-export const API_BASE = import.meta.env.VITE_API_BASE
+export const API_BASE = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8811'
 export const WS_HOST = API_BASE.replace(/^https?:\/\//, '')
+export const WS_PROTOCOL = API_BASE.startsWith('https') ? 'wss' : 'ws'
 
 async function req(path, options) {
   const res = await fetch(`${API_BASE}${path}`, {
@@ -35,5 +36,14 @@ export const api = {
   getSettings: () => req('/api/settings'),
   updateSettings: (data) => req('/api/settings', { method: 'PUT', body: JSON.stringify(data) }),
   getAttendance: (date) => req(`/api/attendance${date ? `?date=${date}` : ''}`),
+  getAttendanceReport: (name, start, end) =>
+    req(`/api/attendance/report?name=${encodeURIComponent(name)}&start=${start}&end=${end}`),
+  attendanceReportCsvUrl: (name, start, end) =>
+    `${API_BASE}/api/attendance/report/csv?name=${encodeURIComponent(name)}&start=${start}&end=${end}`,
+  attendanceReportPdfUrl: (name, start, end) =>
+    `${API_BASE}/api/attendance/report/pdf?name=${encodeURIComponent(name)}&start=${start}&end=${end}`,
   getPeopleAnalytics: (days = 7) => req(`/api/analytics/people?days=${days}`),
+  getClips: (personName) => req(`/api/clips?person=${encodeURIComponent(personName)}`),
+  clipVideoUrl: (clipId) => `${API_BASE}/api/clips/${clipId}/video`,
+  getActiveClips: () => req('/api/clips/active'),
 }

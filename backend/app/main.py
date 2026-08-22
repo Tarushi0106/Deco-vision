@@ -1,4 +1,6 @@
 import asyncio
+import csv
+import io
 import logging
 import re
 import time
@@ -8,12 +10,18 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import cm
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
-from . import alerts_db, camera_db, config, face_db, user_db
+from . import alerts_db, camera_db, clips_db, config, face_db, user_db
 from .camera_client import camera_client, get_camera_client, sync_face_to_all_devices
 from .pipeline import pipeline_manager
 
@@ -99,6 +107,7 @@ def startup():
     camera_db.init_db()
     user_db.init_db()
     alerts_db.init_db()
+    clips_db.init_db()
     pipeline_manager.start()
 
 
@@ -244,6 +253,106 @@ def get_attendance(date: str | None = None):
     return face_db.get_attendance(date)
 
 
+@app.get("/api/attendance/report")
+def get_attendance_report(name: str, start: str, end: str):
+    cameras_by_id = {c["id"]: c["name"] for c in camera_db.list_cameras()}
+    rows = face_db.get_attendance_report(name, start, end)
+    for r in rows:
+        r["camera_names"] = [cameras_by_id.get(cid, "—") for cid in r["camera_ids"]]
+    return rows
+
+
+@app.get("/api/attendance/report/csv")
+def get_attendance_report_csv(name: str, start: str, end: str):
+    cameras_by_id = {c["id"]: c["name"] for c in camera_db.list_cameras()}
+    rows = face_db.get_attendance_report(name, start, end)
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Date", "First Seen", "Last Seen", "Total Detections", "Cameras"])
+    for r in rows:
+        camera_names = ", ".join(cameras_by_id.get(cid, "—") for cid in r["camera_ids"])
+        writer.writerow([
+            r["date"],
+            datetime.fromtimestamp(r["first_seen"]).strftime("%H:%M:%S"),
+            datetime.fromtimestamp(r["last_seen"]).strftime("%H:%M:%S"),
+            r["total_detections"],
+            camera_names,
+        ])
+
+    safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+    filename = f"attendance_{safe_name}_{start}_to_{end}.csv"
+    return Response(
+        content=output.getvalue().encode("utf-8"),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/attendance/report/pdf")
+def get_attendance_report_pdf(name: str, start: str, end: str):
+    cameras_by_id = {c["id"]: c["name"] for c in camera_db.list_cameras()}
+    rows = face_db.get_attendance_report(name, start, end)
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer, pagesize=A4,
+        topMargin=1.6 * cm, bottomMargin=1.6 * cm, leftMargin=1.6 * cm, rightMargin=1.6 * cm,
+    )
+    styles = getSampleStyleSheet()
+    elements = [
+        Paragraph("Deco Vision — Attendance Report", styles["Title"]),
+        Paragraph(f"{name}", styles["Heading2"]),
+        Paragraph(f"{start} to {end} &nbsp;&nbsp;·&nbsp;&nbsp; generated {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                   styles["Normal"]),
+        Spacer(1, 0.6 * cm),
+    ]
+
+    total_days = len(rows)
+    total_detections = sum(r["total_detections"] for r in rows)
+    elements.append(Paragraph(f"Days present: {total_days} &nbsp;&nbsp;·&nbsp;&nbsp; Total detections: {total_detections}",
+                               styles["Normal"]))
+    elements.append(Spacer(1, 0.5 * cm))
+
+    table_data = [["Date", "First Seen", "Last Seen", "Detections", "Cameras"]]
+    for r in rows:
+        camera_names = ", ".join(cameras_by_id.get(cid, "—") for cid in r["camera_ids"])
+        table_data.append([
+            r["date"],
+            datetime.fromtimestamp(r["first_seen"]).strftime("%H:%M:%S"),
+            datetime.fromtimestamp(r["last_seen"]).strftime("%H:%M:%S"),
+            str(r["total_detections"]),
+            camera_names,
+        ])
+    if len(table_data) == 1:
+        table_data.append(["—", "—", "—", "—", f"No sightings for {name} in this date range"])
+
+    table = Table(table_data, colWidths=[2.4 * cm, 2.4 * cm, 2.4 * cm, 2.2 * cm, 7.6 * cm])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1a2b4c")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#dddddd")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f6f7fb")]),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    elements.append(table)
+
+    doc.build(elements)
+    pdf_bytes = buffer.getvalue()
+
+    safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+    filename = f"attendance_{safe_name}_{start}_to_{end}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @app.get("/api/analytics/people")
 def get_people_analytics(days: int = 7):
     cameras_by_id = {c["id"]: c["name"] for c in camera_db.list_cameras()}
@@ -251,6 +360,28 @@ def get_people_analytics(days: int = 7):
     for row in analytics:
         row["top_camera_name"] = cameras_by_id.get(row["top_camera_id"], "—")
     return analytics
+
+
+@app.get("/api/clips/active")
+def list_active_clips():
+    return pipeline_manager.get_active_clip_people()
+
+
+@app.get("/api/clips")
+def list_clips(person: str, limit: int = 50):
+    cameras_by_id = {c["id"]: c["name"] for c in camera_db.list_cameras()}
+    clips = clips_db.list_clips_for_person(person, limit)
+    for c in clips:
+        c["camera_name"] = cameras_by_id.get(c["camera_id"], "—")
+    return clips
+
+
+@app.get("/api/clips/{clip_id}/video")
+def get_clip_video(clip_id: int):
+    clip = clips_db.get_clip(clip_id)
+    if clip is None or not Path(clip["file_path"]).exists():
+        raise HTTPException(404, "Clip not found")
+    return FileResponse(clip["file_path"], media_type="video/mp4")
 
 
 @app.get("/api/debug/snaped-faces")
@@ -300,6 +431,7 @@ def rename_person(name: str, payload: PersonRename):
     rows_changed = face_db.rename_face(name, new_name)
     if rows_changed == 0:
         raise HTTPException(404, f"No enrolled person named {name!r}")
+    clips_db.rename_person_clips(name, new_name)
     pipeline_manager.reload_faces()
     logger.info("Renamed %s to %s (%d sample(s))", name, new_name, rows_changed)
     return {"old_name": name, "new_name": new_name, "samples_renamed": rows_changed}

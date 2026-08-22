@@ -10,3 +10,5 @@ requests
 python-multipart
 ultralytics
 psutil
+imageio-ffmpeg
+reportlab

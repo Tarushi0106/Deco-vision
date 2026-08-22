@@ -194,3 +194,32 @@
   border-radius: 8px;
   border: 1px solid var(--border);
 }
+
+.clips-list {
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.clips-list-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+  border-bottom: 1px solid var(--border);
+}
+
+.clips-list-row:last-child {
+  border-bottom: none;
+}
+
+.clips-list-row:hover {
+  background: var(--brand-bg);
+}
+
+.clips-list-row-active {
+  background: var(--brand-bg);
+  font-weight: 600;
+}

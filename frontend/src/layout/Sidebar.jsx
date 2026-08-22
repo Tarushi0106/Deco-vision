@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { NavLink } from 'react-router-dom'
+import { NavLink, useLocation } from 'react-router-dom'
 import { api } from '../api'
 import { DEWIN_LOGO_PATH, MASCOT_PATH } from '../branding'
 import BrandLogo from '../components/BrandLogo'
@@ -19,7 +19,11 @@ const NAV_GROUPS = [
       { to: '/people', label: 'People' },
       { to: '/cameras', label: 'Camera Management' },
       { to: '/sites', label: 'Site Management' },
-      { to: '/attendance', label: 'Attendance' },
+      {
+        to: '/attendance',
+        label: 'Attendance',
+        children: [{ to: '/attendance-report', label: 'Attendance Report' }],
+      },
       { to: '/analytics', label: 'Analytics' },
     ],
   },
@@ -43,6 +47,12 @@ function formatUptime(seconds) {
 
 export default function Sidebar() {
   const [stats, setStats] = useState(null)
+  const location = useLocation()
+  const [openItem, setOpenItem] = useState(() =>
+    NAV_GROUPS.flatMap((g) => g.items).find(
+      (item) => item.children?.some((c) => c.to === location.pathname)
+    )?.label ?? null
+  )
 
   useEffect(() => {
     const load = () => {
@@ -78,8 +88,48 @@ export default function Sidebar() {
         {NAV_GROUPS.map((group) => (
           <div className="sidebar-group" key={group.label}>
             <div className="sidebar-group-label">{group.label}</div>
-            {group.items.map((item) =>
-              item.to ? (
+            {group.items.map((item) => {
+              if (item.children) {
+                const isOpen = openItem === item.label
+                return (
+                  <div key={item.label}>
+                    <div className="sidebar-item sidebar-item-parent">
+                      <NavLink
+                        to={item.to}
+                        className={({ isActive }) =>
+                          'sidebar-item-label' + (isActive ? ' sidebar-item-active' : '')
+                        }
+                      >
+                        {item.label}
+                      </NavLink>
+                      <button
+                        type="button"
+                        className="sidebar-expand-btn"
+                        aria-label={isOpen ? 'Collapse submenu' : 'Expand submenu'}
+                        onClick={() => setOpenItem(isOpen ? null : item.label)}
+                      >
+                        <span className={`sidebar-chevron${isOpen ? ' sidebar-chevron-open' : ''}`}>▾</span>
+                      </button>
+                    </div>
+                    {isOpen && (
+                      <div className="sidebar-submenu">
+                        {item.children.map((child) => (
+                          <NavLink
+                            key={child.to}
+                            to={child.to}
+                            className={({ isActive }) =>
+                              'sidebar-subitem' + (isActive ? ' sidebar-item-active' : '')
+                            }
+                          >
+                            {child.label}
+                          </NavLink>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )
+              }
+              return item.to ? (
                 <NavLink
                   key={item.label}
                   to={item.to}
@@ -95,7 +145,7 @@ export default function Sidebar() {
                   {item.tag && <span className="sidebar-tag">{item.tag}</span>}
                 </div>
               )
-            )}
+            })}
           </div>
         ))}
       </nav>

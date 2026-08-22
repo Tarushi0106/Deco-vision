@@ -15,19 +15,25 @@ camera + into the DB.
 import logging
 import multiprocessing
 import queue
+import re
+import subprocess
 import threading
 import time
 import uuid
+from collections import deque
 from datetime import datetime
+from pathlib import Path
 
 import cv2
+import imageio_ffmpeg
+import numpy as np
 
 try:
     import psutil
 except ImportError:
     psutil = None
 
-from . import alerts_db, camera_db, face_db
+from . import alerts_db, camera_db, clips_db, face_db
 from .detection_worker import run_worker
 from .video_source import RtspSource, WebcamSource
 
@@ -64,6 +70,32 @@ INTRUSION_ALERT_COOLDOWN_SECONDS = 300
 # don't log a new detection_event for the same person on the same camera
 # more often than this - avoids flooding the table while someone stands in frame
 DETECTION_LOG_COOLDOWN_SECONDS = 30
+# recognition clips (Analytics "Clips" column): one continuous clip per
+# presence — recording starts the moment a person is first recognized and
+# keeps going, at full capture rate, for as long as they keep showing up in
+# recognition results, not a fixed-length snippet per event.
+CLIP_PRE_SECONDS = 4  # how much buffered video to prepend from just before the person was first seen
+CLIP_BUFFER_SECONDS = CLIP_PRE_SECONDS + 2  # rolling buffer used only to seed that pre-roll; margin vs. read races
+# Measured live on the "Technical section" camera (multi-person, wide-angle — the one with known
+# recognition flakiness): a person sitting continuously in frame still only gets a confident NAME match
+# sporadically, with real observed gaps of 60-114s between hits (nothing tracks face identity across
+# frames when the name match drops, so there's no cheaper way to bridge the gap than a generous grace
+# window). Too short a grace period fragments one visit into many disconnected mini-clips instead of the
+# single continuous "they were here" clip that's the point of this feature.
+PRESENCE_GRACE_SECONDS = 60  # how long to keep a clip open after the person's last recognition hit
+MAX_CLIP_DURATION_SECONDS = 300  # cap a single clip (e.g. someone sitting for an hour) — chapters into new clips past this
+MIN_CLIP_DURATION_SECONDS = 1.5  # discard clips shorter than this — a single flickered detection, not a real visit
+MAX_CLIPS_PER_PERSON = 30  # retention cap — older clips (file + row) are deleted past this
+# Measured this session: 3 clips finalizing around the same time each spawned their own
+# ffmpeg transcode with no thread cap, pegging all 12 logical cores to 100% on top of the
+# already-pinned recognition worker — the exact "everything is slow" oversubscription
+# pattern seen earlier with onnxruntime. Clips are for human playback only (recognition
+# already happened on the full-res frame before this ever runs), so downscaling here has
+# zero accuracy cost — unlike the recognition pipeline, where downscaling wrecked matching.
+CLIP_MAX_DIM = 960  # cap the longer side of saved clip video — free CPU/disk win, no accuracy impact
+TRANSCODE_THREADS = 2  # ffmpeg's own thread cap per transcode job
+MAX_CONCURRENT_TRANSCODES = 2  # system-wide — bounds worst case to MAX_CONCURRENT_TRANSCODES * TRANSCODE_THREADS cores
+_transcode_semaphore = threading.Semaphore(MAX_CONCURRENT_TRANSCODES)
 
 
 class CameraPipeline:
@@ -75,16 +107,45 @@ class CameraPipeline:
         self._running = False
         self._thread: threading.Thread | None = None
         self._last_logged: dict[str, float] = {}
+        self._clip_buffer: deque[tuple[float, bytes]] = deque()
+        self._clip_buffer_lock = threading.Lock()
+        # Resizing+encoding clip video is real per-frame CPU work — measured this session:
+        # running it inline in the capture loop (below) directly stole time from reading/
+        # encoding the next camera frame, which showed up as live-feed lag even though
+        # recognition itself (a separate process) was unaffected. Moved to its own thread,
+        # fed by this small drop-if-full queue, so clip encoding can NEVER block capture —
+        # worst case a clip frame is skipped, never the live view stuttering.
+        self._clip_frame_queue: "queue.Queue" = queue.Queue(maxsize=2)
+        self._clip_thread: threading.Thread | None = None
+        # last time each name was seen in a recognition result — written by
+        # set_detections() (called from PipelineManager's receiver thread),
+        # read by _update_clip_sessions() (called from this camera's OWN dedicated
+        # _clip_writer_loop thread, never the capture thread). _active_clip_sessions
+        # itself is touched ONLY from that one thread, so opening/writing/closing
+        # cv2.VideoWriters never has to be synchronized against another thread.
+        self._presence_lock = threading.Lock()
+        self._last_detection: dict[str, float] = {}
+        self._active_clip_sessions: dict[str, dict] = {}
+        # snapshot of _active_clip_sessions.keys(), refreshed by the capture thread
+        # every time a session opens/closes — lets other threads (the /api/clips/active
+        # endpoint) read "who's being recorded right now" without a lock or racing an
+        # in-progress dict mutation (a plain frozenset reassignment is an atomic pointer
+        # swap under the GIL)
+        self._active_names: frozenset = frozenset()
 
     def start(self) -> None:
         self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+        self._clip_thread = threading.Thread(target=self._clip_writer_loop, daemon=True)
+        self._clip_thread.start()
 
     def stop(self) -> None:
         self._running = False
         if self._thread:
             self._thread.join(timeout=5)
+        if self._clip_thread:
+            self._clip_thread.join(timeout=5)
 
     def get_latest_jpeg(self) -> bytes | None:
         with self._lock:
@@ -97,10 +158,16 @@ class CameraPipeline:
     def set_detections(self, detections: list[dict]) -> None:
         with self._lock:
             self._latest_detections = detections
-        self._log_new_detections(detections)
-
-    def _log_new_detections(self, detections: list[dict]) -> None:
         now = time.time()
+        with self._presence_lock:
+            for det in detections:
+                name = det["name"]
+                if name == "Unknown":
+                    continue
+                self._last_detection[name] = now
+        self._log_new_detections(detections, now)
+
+    def _log_new_detections(self, detections: list[dict], now: float) -> None:
         for det in detections:
             name = det["name"]
             if name == "Unknown":
@@ -110,6 +177,133 @@ class CameraPipeline:
                 continue
             self._last_logged[name] = now
             face_db.log_detection_event(self.camera_id, name, det["bbox"])
+
+    def _update_clip_sessions(self, frame, now: float) -> None:
+        """Called once per encoded frame from the capture loop (never from
+        another thread — see the comment on _active_clip_sessions in
+        __init__). Opens a clip the moment a person is first recognized,
+        keeps writing frames to it every tick they're still within
+        PRESENCE_GRACE_SECONDS of their last recognition hit, and finalizes
+        it once they've been gone that long (or the clip hits the max
+        duration cap, in which case it chapters into a fresh one)."""
+        with self._presence_lock:
+            last_detection_snapshot = dict(self._last_detection)
+
+        for name, last_seen in last_detection_snapshot.items():
+            if now - last_seen > PRESENCE_GRACE_SECONDS:
+                continue
+            session = self._active_clip_sessions.get(name)
+            if session is None:
+                session = self._open_clip_session(name, now, frame)
+                if session is None:
+                    continue
+                self._active_clip_sessions[name] = session
+                self._active_names = frozenset(self._active_clip_sessions)
+            try:
+                out_w, out_h = session["out_size"]
+                session["writer"].write(cv2.resize(frame, (out_w, out_h)) if frame.shape[1::-1] != (out_w, out_h) else frame)
+            except Exception:
+                logger.exception("Camera %s: failed writing clip frame for %s", self.camera_id, name)
+            session["last_written_ts"] = now
+            if now - session["start_ts"] >= MAX_CLIP_DURATION_SECONDS:
+                self._finalize_clip_session(name, session)
+                del self._active_clip_sessions[name]
+                self._active_names = frozenset(self._active_clip_sessions)
+
+        for name in list(self._active_clip_sessions):
+            last_seen = last_detection_snapshot.get(name, 0)
+            if now - last_seen > PRESENCE_GRACE_SECONDS:
+                self._finalize_clip_session(name, self._active_clip_sessions.pop(name))
+                self._active_names = frozenset(self._active_clip_sessions)
+
+    def _open_clip_session(self, name: str, now: float, frame) -> dict | None:
+        try:
+            camera_dir = clips_db.CLIPS_DIR / str(self.camera_id)
+            camera_dir.mkdir(parents=True, exist_ok=True)
+            safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+            base_name = f"{safe_name}_{int(now)}_{uuid.uuid4().hex[:8]}"
+            # Written first as a RAW intermediate, then transcoded to real H.264 on
+            # finalize (see _transcode_and_log_clip) — cv2.VideoWriter's own "avc1"/
+            # H.264 path depends on either the Cisco openh264 DLL (unreliable to load
+            # from a background thread on this machine — confirmed via direct testing:
+            # "Unable to create encoder" mid-session) or Windows Media Foundation (which
+            # needs COM initialized on the calling thread, which this capture thread
+            # doesn't do). "mp4v" has no such dependency and reliably opens/writes here.
+            raw_path = camera_dir / f"{base_name}.raw.mp4"
+            file_path = camera_dir / f"{base_name}.mp4"
+
+            height, width = frame.shape[:2]
+            scale = min(1.0, CLIP_MAX_DIM / max(height, width))
+            out_width, out_height = max(2, round(width * scale) // 2 * 2), max(2, round(height * scale) // 2 * 2)
+            fps = round(1 / VIDEO_ENCODE_INTERVAL_SECONDS)
+            writer = cv2.VideoWriter(str(raw_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (out_width, out_height))
+
+            with self._clip_buffer_lock:
+                pre_roll = [(ts, jpeg) for ts, jpeg in self._clip_buffer if ts < now]
+            start_ts = pre_roll[0][0] if pre_roll else now
+            for _ts, jpeg in pre_roll:
+                pre_frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+                if pre_frame is None:
+                    continue
+                if pre_frame.shape[1::-1] != (out_width, out_height):
+                    pre_frame = cv2.resize(pre_frame, (out_width, out_height))
+                writer.write(pre_frame)
+
+            return {
+                "writer": writer, "raw_path": raw_path, "file_path": file_path,
+                "start_ts": start_ts, "last_written_ts": now, "out_size": (out_width, out_height),
+            }
+        except Exception:
+            logger.exception("Camera %s: failed to open clip for %s", self.camera_id, name)
+            return None
+
+    def _finalize_clip_session(self, name: str, session: dict) -> None:
+        """Releases the raw writer (cheap) synchronously, then hands the slow
+        part — transcoding to real H.264 + the DB write — to a background
+        thread so a multi-minute clip can't stall this camera's live capture
+        loop. Safe to run off-thread: by the time this is called, `session`
+        has already been removed from _active_clip_sessions by the caller."""
+        try:
+            session["writer"].release()
+        except Exception:
+            logger.exception("Camera %s: failed to release writer for %s", self.camera_id, name)
+            return
+        duration = session["last_written_ts"] - session["start_ts"]
+        if duration < MIN_CLIP_DURATION_SECONDS:
+            Path(session["raw_path"]).unlink(missing_ok=True)
+            return
+        threading.Thread(
+            target=self._transcode_and_log_clip, args=(name, session, duration), daemon=True,
+        ).start()
+
+    def _transcode_and_log_clip(self, name: str, session: dict, duration: float) -> None:
+        raw_path = session["raw_path"]
+        file_path = session["file_path"]
+        try:
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+            # -threads caps ffmpeg's OWN encoder thread pool per job; the semaphore caps
+            # how many of these run at once — together they bound the worst case to
+            # MAX_CONCURRENT_TRANSCODES * TRANSCODE_THREADS cores instead of every
+            # camera's finalize spawning an uncapped encoder and pegging all 12 at once.
+            with _transcode_semaphore:
+                result = subprocess.run(
+                    [ffmpeg_exe, "-y", "-i", str(raw_path),
+                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-threads", str(TRANSCODE_THREADS),
+                     "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(file_path)],
+                    capture_output=True, timeout=max(60.0, duration * 2),
+                )
+            if result.returncode != 0 or not file_path.exists():
+                logger.error(
+                    "Camera %s: ffmpeg transcode failed for %s: %s",
+                    self.camera_id, name, result.stderr.decode(errors="replace")[-2000:],
+                )
+                return
+            clips_db.log_clip(name, self.camera_id, session["start_ts"], duration, str(file_path))
+            clips_db.prune_old_clips(name, MAX_CLIPS_PER_PERSON)
+        except Exception:
+            logger.exception("Camera %s: failed to transcode/log clip for %s", self.camera_id, name)
+        finally:
+            Path(raw_path).unlink(missing_ok=True)
 
     def _create_source(self):
         cam = camera_db.get_camera_connection(self.camera_id)
@@ -164,8 +358,18 @@ class CameraPipeline:
                     last_encode_at = now
                     ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
                     if ok:
+                        jpeg = buf.tobytes()
                         with self._lock:
-                            self._latest_jpeg = buf.tobytes()
+                            self._latest_jpeg = jpeg
+                        with self._clip_buffer_lock:
+                            self._clip_buffer.append((now, jpeg))
+                            cutoff = now - CLIP_BUFFER_SECONDS
+                            while self._clip_buffer and self._clip_buffer[0][0] < cutoff:
+                                self._clip_buffer.popleft()
+                    try:
+                        self._clip_frame_queue.put_nowait((frame, now))
+                    except queue.Full:
+                        pass  # clip writer thread is behind — drop this tick's frame rather than block capture
 
             except RuntimeError as e:
                 logger.error("Camera %s: video source error: %s — retrying in 3s", self.camera_id, e)
@@ -174,6 +378,24 @@ class CameraPipeline:
 
         if source is not None:
             source.release()
+
+    def _clip_writer_loop(self) -> None:
+        """Owns all per-person clip VideoWriters end to end (open/write/
+        finalize) in its own thread, fed by _run()'s drop-if-full queue —
+        see the comment on _clip_frame_queue in __init__ for why this is
+        split out from the capture loop."""
+        while self._running:
+            try:
+                frame, now = self._clip_frame_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            self._update_clip_sessions(frame, now)
+        for name in list(self._active_clip_sessions):
+            self._finalize_clip_session(name, self._active_clip_sessions.pop(name))
+        self._active_names = frozenset()
+
+    def get_active_names(self) -> frozenset:
+        return self._active_names
 
 
 class PipelineManager:
@@ -403,6 +625,21 @@ class PipelineManager:
 
     def is_live(self, camera_id: int) -> bool:
         return camera_id in self._pipelines
+
+    def get_active_clip_people(self) -> list[dict]:
+        """Who's currently being recorded (session open, not yet finalized/
+        playable) — lets the Analytics UI show "recording now" for someone
+        still in frame instead of a misleading "No clips yet"."""
+        cameras_by_id = {c["id"]: c["name"] for c in camera_db.list_cameras()}
+        result = []
+        for camera_id, pipeline in self._pipelines.items():
+            for name in pipeline.get_active_names():
+                result.append({
+                    "person_name": name,
+                    "camera_id": camera_id,
+                    "camera_name": cameras_by_id.get(camera_id, "—"),
+                })
+        return result
 
 
 pipeline_manager = PipelineManager()

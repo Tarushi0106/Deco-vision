@@ -2,40 +2,6 @@ import { useEffect, useState } from 'react'
 import { api } from '../api'
 import './pages.css'
 
-const SPARKLINE_WIDTH = 168
-const SPARKLINE_HEIGHT = 28
-const BAR_GAP = 2
-const BAR_COUNT = 24
-
-function HourlySparkline({ hourly }) {
-  const max = Math.max(...hourly, 1)
-  const barWidth = (SPARKLINE_WIDTH - BAR_GAP * (BAR_COUNT - 1)) / BAR_COUNT
-
-  return (
-    <svg width={SPARKLINE_WIDTH} height={SPARKLINE_HEIGHT} role="img" aria-label="Detections by hour of day">
-      {hourly.map((count, hour) => {
-        const barHeight = Math.max((count / max) * (SPARKLINE_HEIGHT - 2), count > 0 ? 2 : 0.5)
-        const x = hour * (barWidth + BAR_GAP)
-        const y = SPARKLINE_HEIGHT - barHeight
-        return (
-          <rect
-            key={hour}
-            x={x}
-            y={y}
-            width={barWidth}
-            height={barHeight}
-            rx={1.5}
-            fill="var(--brand)"
-            opacity={count > 0 ? 0.85 : 0.15}
-          >
-            <title>{`${hour}:00 - ${count} detection${count === 1 ? '' : 's'}`}</title>
-          </rect>
-        )
-      })}
-    </svg>
-  )
-}
-
 function formatTimestamp(ts) {
   return new Date(ts * 1000).toLocaleString('en-IN', {
     day: '2-digit',
@@ -45,13 +11,113 @@ function formatTimestamp(ts) {
   })
 }
 
+function ClipsModal({ personName, clips, onClose }) {
+  const [playingClip, setPlayingClip] = useState(null)
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="card modal" style={{ width: 520 }} onClick={(e) => e.stopPropagation()}>
+        <h3>{personName} — Clips</h3>
+
+        {playingClip && (
+          <video
+            key={playingClip.id}
+            src={api.clipVideoUrl(playingClip.id)}
+            controls
+            autoPlay
+            style={{ width: '100%', borderRadius: 8, marginBottom: '0.75rem', background: '#000' }}
+          />
+        )}
+
+        <div className="clips-list">
+          {clips.map((clip) => (
+            <div
+              key={clip.id}
+              className={`clips-list-row${playingClip?.id === clip.id ? ' clips-list-row-active' : ''}`}
+              onClick={() => setPlayingClip(clip)}
+            >
+              <span>{formatTimestamp(clip.ts)}</span>
+              <span className="camera-tile-site">{clip.camera_name}</span>
+            </div>
+          ))}
+        </div>
+
+        <div className="modal-actions">
+          <button type="button" className="btn btn-outline" onClick={onClose}>
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function ClipsCell({ personName, recordingCameraName }) {
+  const [clips, setClips] = useState(null)
+  const [showModal, setShowModal] = useState(false)
+
+  useEffect(() => {
+    api.getClips(personName).then(setClips).catch(() => setClips([]))
+  }, [personName])
+
+  if (clips === null) return <span className="stat-tile-sub">Loading…</span>
+
+  const liveBadge = recordingCameraName && (
+    <span className="pill pill-danger" style={{ marginRight: '0.5rem' }}>
+      <span className="dot dot-danger" /> LIVE — {recordingCameraName}
+    </span>
+  )
+
+  if (clips.length === 0) {
+    return (
+      <>
+        {liveBadge}
+        <span className="stat-tile-sub">
+          {recordingCameraName ? 'Recording — check back shortly' : 'No clips yet'}
+        </span>
+      </>
+    )
+  }
+
+  return (
+    <>
+      {liveBadge}
+      <span style={{ marginRight: '0.5rem' }}>
+        {clips.length} clip{clips.length === 1 ? '' : 's'}
+      </span>
+      <button type="button" className="btn btn-outline" onClick={() => setShowModal(true)}>
+        View
+      </button>
+      {showModal && (
+        <ClipsModal personName={personName} clips={clips} onClose={() => setShowModal(false)} />
+      )}
+    </>
+  )
+}
+
 export default function Analytics() {
   const [days, setDays] = useState(7)
   const [rows, setRows] = useState([])
+  const [activeByName, setActiveByName] = useState({})
 
   useEffect(() => {
     api.getPeopleAnalytics(days).then(setRows).catch(() => {})
   }, [days])
+
+  useEffect(() => {
+    const load = () => {
+      api.getActiveClips()
+        .then((active) => {
+          const map = {}
+          for (const a of active) map[a.person_name] = a.camera_name
+          setActiveByName(map)
+        })
+        .catch(() => {})
+    }
+    load()
+    const interval = setInterval(load, 5000)
+    return () => clearInterval(interval)
+  }, [])
 
   return (
     <div>
@@ -76,7 +142,7 @@ export default function Analytics() {
               <th>Days Seen</th>
               <th>Most Seen At</th>
               <th>Last Seen</th>
-              <th>Hourly Pattern</th>
+              <th>Clips</th>
             </tr>
           </thead>
           <tbody>
@@ -95,7 +161,7 @@ export default function Analytics() {
                   <td>{row.top_camera_name}</td>
                   <td>{formatTimestamp(row.last_seen)}</td>
                   <td>
-                    <HourlySparkline hourly={row.hourly} />
+                    <ClipsCell personName={row.name} recordingCameraName={activeByName[row.name]} />
                   </td>
                 </tr>
               ))

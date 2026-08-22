@@ -103,6 +103,65 @@ img.sidebar-avatar {
   cursor: default;
 }
 
+.sidebar-item-parent {
+  padding-right: 0.4rem;
+}
+
+.sidebar-item-label {
+  flex: 1;
+  color: inherit;
+  text-decoration: none;
+  padding: 0.5rem 0;
+  margin: -0.5rem 0;
+}
+
+.sidebar-item-parent .sidebar-item-label.sidebar-item-active {
+  background: transparent;
+  color: var(--brand-dark);
+  font-weight: 600;
+}
+
+.sidebar-expand-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--text-faint);
+  padding: 0.2rem 0.3rem;
+  display: flex;
+  align-items: center;
+}
+
+.sidebar-chevron {
+  display: inline-block;
+  transition: transform 0.15s ease;
+  font-size: 0.8rem;
+}
+
+.sidebar-chevron-open {
+  transform: rotate(180deg);
+}
+
+.sidebar-submenu {
+  display: flex;
+  flex-direction: column;
+  margin: 0.1rem 0 0.3rem 0.75rem;
+  border-left: 1px solid var(--border);
+  padding-left: 0.5rem;
+}
+
+.sidebar-subitem {
+  padding: 0.4rem 0.75rem;
+  border-radius: 8px;
+  font-size: 0.82rem;
+  color: var(--text-muted);
+  text-decoration: none;
+  margin-bottom: 0.1rem;
+}
+
+.sidebar-subitem:hover {
+  background: #f6f7fb;
+}
+
 .sidebar-tag {
   font-size: 0.62rem;
   background: #f1f2f5;

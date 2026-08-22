@@ -93,10 +93,15 @@ def delete_face(name: str) -> list[str]:
 
 
 def rename_face(old_name: str, new_name: str) -> int:
-    """Renames every enrolled sample for this person. Returns rows affected
-    (0 means old_name wasn't enrolled)."""
+    """Renames every enrolled sample for this person, and cascades to past
+    detection_events too — those rows store the name as a plain text snapshot,
+    not a reference, so without this a rename leaves history fragmented under
+    the old name, showing up as a second, orphaned person in Attendance/
+    Analytics. Returns enrolled-sample rows affected (0 means old_name wasn't
+    enrolled)."""
     with get_connection() as conn:
         cur = conn.execute("UPDATE enrolled_faces SET name = ? WHERE name = ?", (new_name, old_name))
+        conn.execute("UPDATE detection_events SET name = ? WHERE name = ?", (new_name, old_name))
         return cur.rowcount
 
 
@@ -146,6 +151,45 @@ def get_attendance(date: str | None = None) -> list[dict]:
             (day_start, day_end),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_attendance_report(name: str, start_date: str, end_date: str) -> list[dict]:
+    """Day-by-day attendance breakdown for one person over [start_date, end_date]
+    (inclusive, both "YYYY-MM-DD"), built from the same detection_events log as
+    get_attendance/get_person_analytics — the detailed per-person view behind
+    the Attendance page's downloadable report."""
+    range_start = datetime.strptime(start_date, "%Y-%m-%d").timestamp()
+    range_end = datetime.strptime(end_date, "%Y-%m-%d").timestamp() + 86400
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT ts, camera_id FROM detection_events WHERE name = ? AND ts >= ? AND ts < ? ORDER BY ts",
+            (name, range_start, range_end),
+        ).fetchall()
+
+    days: dict[str, dict] = {}
+    for row in rows:
+        day_key = datetime.fromtimestamp(row["ts"]).strftime("%Y-%m-%d")
+        d = days.setdefault(day_key, {
+            "date": day_key, "first_seen": row["ts"], "last_seen": row["ts"],
+            "cameras": set(), "total_detections": 0,
+        })
+        d["first_seen"] = min(d["first_seen"], row["ts"])
+        d["last_seen"] = max(d["last_seen"], row["ts"])
+        d["cameras"].add(row["camera_id"])
+        d["total_detections"] += 1
+
+    result = []
+    for day_key in sorted(days):
+        d = days[day_key]
+        result.append({
+            "date": d["date"],
+            "first_seen": d["first_seen"],
+            "last_seen": d["last_seen"],
+            "camera_ids": sorted(d["cameras"]),
+            "total_detections": d["total_detections"],
+        })
+    return result
 
 
 def get_person_analytics(days: int = 7) -> list[dict]:

@@ -15,6 +15,10 @@ backend/data/
 # secrets
 backend/.env
 
+# Claude Code session/local state — not part of the app
+.claude/
+
 # auto-downloaded YOLO model weights (ultralytics re-downloads these on demand)
 backend/*.pt
 .env
+*.pem

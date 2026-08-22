@@ -1,0 +1,20 @@
+# python
+__pycache__/
+*.pyc
+.venv/
+backend/*.log
+
+# node
+node_modules/
+frontend/dist/
+frontend/vite.log
+
+# local data (face embeddings, sqlite db, enrolled photos)
+backend/data/
+
+# secrets
+backend/.env
+
+# auto-downloaded YOLO model weights (ultralytics re-downloads these on demand)
+backend/*.pt
+.env

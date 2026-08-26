@@ -20,6 +20,17 @@ class FaceRecognizer:
     """
 
     def __init__(self):
+        # Tried DmlExecutionProvider (Intel Iris Xe iGPU) this session: an
+        # isolated micro-benchmark of det_10g/w600k_r50 alone on synthetic
+        # input showed a promising 5-6x speedup, but the REAL pipeline
+        # (FaceAnalysis.get() chaining 5 models — detection, landmark_3d_68,
+        # landmark_2d_106, genderage, recognition — per face, at higher
+        # resolution, on a real frame) measured 30-38 SECONDS per frame on
+        # DirectML, worse than CPU by a huge margin — froze live detection
+        # results entirely. Reverted. A single isolated model's synthetic
+        # benchmark does not predict this pipeline's real behavior; don't
+        # trust one without re-measuring the actual end-to-end call.
+        #
         # Tried capping intra_op_num_threads here to reduce peak CPU% per
         # call — measurement showed it backfired: the real problem is each
         # call blocking the GIL/event loop for its full wall-clock duration,

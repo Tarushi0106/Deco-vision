@@ -65,6 +65,7 @@ function AddPersonModal({ onClose, onAdded }) {
 
 function EditPersonModal({ person, onClose, onSaved }) {
   const [name, setName] = useState(person.name)
+  const [employeeId, setEmployeeId] = useState(person.employee_id || '')
   const [file, setFile] = useState(null)
   const [status, setStatus] = useState(null)
 
@@ -75,9 +76,7 @@ function EditPersonModal({ person, onClose, onSaved }) {
     setStatus({ loading: true })
     try {
       // rename first (if changed) so the added photo below lands under the new name
-      if (newName !== person.name) {
-        await api.renamePerson(person.name, newName)
-      }
+      await api.renamePerson(person.name, newName, employeeId.trim())
       if (file) {
         const form = new FormData()
         form.append('name', newName)
@@ -100,6 +99,14 @@ function EditPersonModal({ person, onClose, onSaved }) {
         <div className="form-row">
           <label>Name</label>
           <input value={name} onChange={(e) => setName(e.target.value)} required />
+        </div>
+        <div className="form-row">
+          <label>Employee ID</label>
+          <input
+            value={employeeId}
+            onChange={(e) => setEmployeeId(e.target.value)}
+            placeholder="e.g. EMP01 — shown on the Attendance roster"
+          />
         </div>
         <div className="form-row">
           <label>Add a photo</label>

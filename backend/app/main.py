@@ -14,6 +14,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile, We
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from openpyxl import Workbook
 from pydantic import BaseModel
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -21,7 +22,10 @@ from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
-from . import alerts_db, camera_db, clips_db, config, face_db, user_db
+from . import (
+    alerts_db, camera_db, clips_db, config, desk_db, face_db, footfall_db, footfall_gate_db, footfall_report,
+    scheduler, user_db,
+)
 from .camera_client import camera_client, get_camera_client, sync_face_to_all_devices
 from .pipeline import pipeline_manager
 
@@ -93,12 +97,38 @@ class LoginIn(BaseModel):
 
 class PersonRename(BaseModel):
     new_name: str
+    employee_id: str | None = None
 
 
 class SettingsIn(BaseModel):
     restricted_start: str | None = None  # "HH:MM"; empty/omitted disables intrusion detection
     restricted_end: str | None = None
     detection_fps: float | None = None  # how often frames are sent for face recognition
+
+
+class DeskZoneIn(BaseModel):
+    camera_id: int
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+
+
+class DeskZoneUpdate(BaseModel):
+    zone_label: str | None = None
+    x1: float | None = None
+    y1: float | None = None
+    x2: float | None = None
+    y2: float | None = None
+
+
+class FootfallGateIn(BaseModel):
+    camera_id: int
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    entry_sign: int = 1
 
 
 @app.on_event("startup")
@@ -108,11 +138,16 @@ def startup():
     user_db.init_db()
     alerts_db.init_db()
     clips_db.init_db()
+    footfall_db.init_db()
+    footfall_gate_db.init_db()
+    desk_db.init_db()
     pipeline_manager.start()
+    scheduler.start_scheduler()
 
 
 @app.on_event("shutdown")
 def shutdown():
+    scheduler.shutdown_scheduler()
     pipeline_manager.stop()
 
 
@@ -182,6 +217,70 @@ def remove_site(site_id: int):
     return {"ok": True}
 
 
+@app.get("/api/desk-zones")
+def list_desk_zones(camera_id: int | None = None):
+    return desk_db.list_zones(camera_id)
+
+
+@app.post("/api/desk-zones")
+def create_desk_zone(zone: DeskZoneIn):
+    """Zones are anonymous — no employee is assigned at creation time. Who
+    occupies a zone is resolved automatically, every detection cycle, by
+    desk_tracker.py from face recognition (+ pose-based continuity)."""
+    zone_id = desk_db.create_zone(zone.camera_id, zone.x1, zone.y1, zone.x2, zone.y2)
+    pipeline_manager.refresh_desk_zones()
+    return {"id": zone_id}
+
+
+@app.put("/api/desk-zones/{zone_id}")
+def edit_desk_zone(zone_id: int, zone: DeskZoneUpdate):
+    fields = {k: v for k, v in zone.model_dump().items() if v is not None}
+    desk_db.update_zone(zone_id, **fields)
+    pipeline_manager.refresh_desk_zones()
+    return {"ok": True}
+
+
+@app.delete("/api/desk-zones/{zone_id}")
+def remove_desk_zone(zone_id: int):
+    desk_db.delete_zone(zone_id)
+    pipeline_manager.refresh_desk_zones()
+    return {"ok": True}
+
+
+@app.get("/api/desk-analytics/report")
+def get_desk_analytics_report(date: str | None = None):
+    """Per-employee daily desk-time report: every enrolled employee (like
+    the Attendance roster), with desk/away totals + movement count from
+    desk_db (real tracked sessions, not estimates), plus their live
+    current-desk/current-status from the running DeskTracker — which is
+    only meaningful for TODAY; a past date always reports "unknown" there,
+    since there's no "current" moment to speak of in history."""
+    report = desk_db.get_daily_report(date)
+    by_employee = {e["employee_name"]: e for e in report["employees"]}
+
+    is_today = date is None or date == datetime.now().strftime("%Y-%m-%d")
+    live_status = pipeline_manager.get_desk_status() if is_today else {}
+
+    employees = []
+    for person in face_db.list_enrolled_roster():
+        name = person["name"]
+        e = by_employee.get(name)
+        status = live_status.get(name)
+        employees.append({
+            "employee_name": name,
+            "desk_seconds": e["desk_seconds"] if e else 0,
+            "away_seconds": e["away_seconds"] if e else 0,
+            "movements": e["movements"] if e else 0,
+            "first_session": e["first_session"] if e else None,
+            "last_session": e["last_session"] if e else None,
+            "current_status": status["status"] if status else "unknown",
+            "current_desk": status["zone_label"] if status else None,
+        })
+    employees.sort(key=lambda e: -e["desk_seconds"])
+
+    return {"date": report["date"], "employees": employees}
+
+
 @app.post("/api/auth/login")
 def login(payload: LoginIn):
     return user_db.record_login(payload.email)
@@ -201,6 +300,7 @@ def get_stats():
 
     uptime_seconds = int(time.time() - START_TIME)
     footfall = face_db.count_footfall_today()
+    unique_footfall_today = footfall_db.get_daily_report()["total"]
 
     return {
         "active_cameras": live_count,
@@ -212,6 +312,7 @@ def get_stats():
         "uptime_seconds": uptime_seconds,
         "footfall_in_today": footfall["in"],
         "footfall_out_today": footfall["out"],
+        "unique_footfall_today": unique_footfall_today,
     }
 
 
@@ -250,7 +351,114 @@ def update_settings(settings: SettingsIn):
 
 @app.get("/api/attendance")
 def get_attendance(date: str | None = None):
-    return face_db.get_attendance(date)
+    """Full-roster daily attendance — every enrolled person, present or
+    absent, with check-in/out, checkout camera, detections, and best
+    recognition match. See face_db.get_daily_attendance_roster."""
+    cameras = camera_db.list_cameras()
+    cameras_by_id = {c["id"]: c["name"] for c in cameras}
+    report = face_db.get_daily_attendance_roster(date)
+    for row in report["roster"]:
+        row["checkout_camera_name"] = cameras_by_id.get(row["checkout_camera_id"])
+    report["camera_scope"] = len(cameras)
+    return report
+
+
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return ""
+    h, m = divmod(round(seconds / 60), 60)
+    return f"{h}h {m}m" if h else f"{m}m"
+
+
+def _attendance_roster_rows(report: dict, cameras_by_id: dict) -> list[list[str]]:
+    rows = []
+    for r in report["roster"]:
+        rows.append([
+            r["name"],
+            r["employee_id"] or "—",
+            datetime.fromtimestamp(r["check_in"]).strftime("%H:%M") if r["check_in"] else "—",
+            datetime.fromtimestamp(r["check_out"]).strftime("%H:%M") if r["check_out"] else "—",
+            cameras_by_id.get(r["checkout_camera_id"], "—"),
+            _format_duration(r["time_stay_seconds"]) or "—",
+            str(r["detections"]),
+            f"{round(r['best_match'] * 100)}%" if r["best_match"] is not None else "—",
+            "Present" if r["present"] else "Absent",
+        ])
+    return rows
+
+
+@app.get("/api/attendance/daily/xlsx")
+def get_attendance_daily_xlsx(date: str | None = None):
+    cameras_by_id = {c["id"]: c["name"] for c in camera_db.list_cameras()}
+    report = face_db.get_daily_attendance_roster(date)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Attendance"
+    ws.append(["Employee", "ID Code", "Check-In", "Check-Out", "Check-Out Camera",
+               "Time Stay", "Detections", "Best Match", "Status"])
+    for row in _attendance_roster_rows(report, cameras_by_id):
+        ws.append(row)
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    filename = f"attendance_{report['date']}.xlsx"
+    return Response(
+        content=buffer.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/attendance/daily/pdf")
+def get_attendance_daily_pdf(date: str | None = None):
+    cameras_by_id = {c["id"]: c["name"] for c in camera_db.list_cameras()}
+    report = face_db.get_daily_attendance_roster(date)
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer, pagesize=A4,
+        topMargin=1.6 * cm, bottomMargin=1.6 * cm, leftMargin=1.2 * cm, rightMargin=1.2 * cm,
+    )
+    styles = getSampleStyleSheet()
+    elements = [
+        Paragraph("Deco Vision — Daily Attendance", styles["Title"]),
+        Paragraph(
+            f"{report['date']} &nbsp;&nbsp;·&nbsp;&nbsp; generated {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+            styles["Normal"],
+        ),
+        Spacer(1, 0.4 * cm),
+        Paragraph(
+            f"Present: {report['present']} &nbsp;&nbsp;·&nbsp;&nbsp; Absent: {report['absent']} "
+            f"&nbsp;&nbsp;·&nbsp;&nbsp; Total detections: {report['total_detections']}",
+            styles["Normal"],
+        ),
+        Spacer(1, 0.5 * cm),
+    ]
+
+    table_data = [["Employee", "ID", "In", "Out", "Camera", "Stay", "Det.", "Match", "Status"]]
+    table_data.extend(_attendance_roster_rows(report, cameras_by_id))
+    table = Table(table_data, colWidths=[3.6 * cm, 1.6 * cm, 1.6 * cm, 1.6 * cm, 3 * cm, 1.6 * cm, 1.4 * cm, 1.6 * cm, 1.8 * cm])
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1a2b4c")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#dddddd")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f6f7fb")]),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    elements.append(table)
+
+    doc.build(elements)
+    filename = f"attendance_{report['date']}.pdf"
+    return Response(
+        content=buffer.getvalue(),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/api/attendance/report")
@@ -262,17 +470,18 @@ def get_attendance_report(name: str, start: str, end: str):
     return rows
 
 
-@app.get("/api/attendance/report/csv")
-def get_attendance_report_csv(name: str, start: str, end: str):
+@app.get("/api/attendance/report/xlsx")
+def get_attendance_report_xlsx(name: str, start: str, end: str):
     cameras_by_id = {c["id"]: c["name"] for c in camera_db.list_cameras()}
     rows = face_db.get_attendance_report(name, start, end)
 
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["Date", "First Seen", "Last Seen", "Total Detections", "Cameras"])
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Attendance"
+    ws.append(["Date", "First Seen", "Last Seen", "Total Detections", "Cameras"])
     for r in rows:
         camera_names = ", ".join(cameras_by_id.get(cid, "—") for cid in r["camera_ids"])
-        writer.writerow([
+        ws.append([
             r["date"],
             datetime.fromtimestamp(r["first_seen"]).strftime("%H:%M:%S"),
             datetime.fromtimestamp(r["last_seen"]).strftime("%H:%M:%S"),
@@ -280,11 +489,13 @@ def get_attendance_report_csv(name: str, start: str, end: str):
             camera_names,
         ])
 
+    buffer = io.BytesIO()
+    wb.save(buffer)
     safe_name = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
-    filename = f"attendance_{safe_name}_{start}_to_{end}.csv"
+    filename = f"attendance_{safe_name}_{start}_to_{end}.xlsx"
     return Response(
-        content=output.getvalue().encode("utf-8"),
-        media_type="text/csv",
+        content=buffer.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
@@ -349,6 +560,83 @@ def get_attendance_report_pdf(name: str, start: str, end: str):
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/footfall-gate")
+def list_footfall_gates(camera_id: int | None = None):
+    if camera_id is not None:
+        gate = footfall_gate_db.get_gate(camera_id)
+        return [gate] if gate else []
+    return footfall_gate_db.list_gates()
+
+
+@app.post("/api/footfall-gate")
+def set_footfall_gate(gate: FootfallGateIn):
+    """One line per camera — drawing a new one replaces any existing line
+    for that camera. Once a line exists, footfall counting for that camera
+    switches from "a face was recognized anywhere in the frame" to "someone
+    was tracked crossing this line" (see gate_tracker.py)."""
+    footfall_gate_db.set_gate(gate.camera_id, gate.x1, gate.y1, gate.x2, gate.y2, gate.entry_sign)
+    pipeline_manager.refresh_footfall_gate()
+    return {"ok": True}
+
+
+@app.post("/api/footfall-gate/{camera_id}/flip")
+def flip_footfall_gate(camera_id: int):
+    """Swaps which side of the line counts as "entering" — for when a
+    freshly-drawn line counts people leaving as entries, or vice versa."""
+    footfall_gate_db.flip_gate_direction(camera_id)
+    pipeline_manager.refresh_footfall_gate()
+    return {"ok": True}
+
+
+@app.delete("/api/footfall-gate/{camera_id}")
+def remove_footfall_gate(camera_id: int):
+    footfall_gate_db.delete_gate(camera_id)
+    pipeline_manager.refresh_footfall_gate()
+    return {"ok": True}
+
+
+@app.get("/api/footfall/report")
+def get_footfall_report(date: str | None = None):
+    """Full daily unique-footfall report (see footfall_counter.py): total
+    unique count, hourly breakdown, camera breakdown, and the combined
+    Person ID / First Seen / Camera / Last Seen table — the on-demand,
+    JSON/dashboard form. See also the CSV/XLSX variants below and
+    scheduler.py / scripts/generate_footfall_report.py for the end-of-day
+    job that finalizes this same report to disk."""
+    return footfall_report.enrich_with_camera_names(footfall_db.get_daily_report(date))
+
+
+@app.get("/api/footfall/report/csv")
+def get_footfall_report_csv(date: str | None = None):
+    report = footfall_report.enrich_with_camera_names(footfall_db.get_daily_report(date))
+
+    output = io.StringIO()
+    footfall_db.write_csv_rows(report, csv.writer(output))
+
+    filename = f"footfall_{report['date']}.csv"
+    return Response(
+        content=output.getvalue().encode("utf-8"),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/footfall/report/xlsx")
+def get_footfall_report_xlsx(date: str | None = None):
+    report = footfall_report.enrich_with_camera_names(footfall_db.get_daily_report(date))
+    wb = footfall_db.build_workbook(report)
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+
+    filename = f"footfall_{report['date']}.xlsx"
+    return Response(
+        content=buffer.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
@@ -431,6 +719,8 @@ def rename_person(name: str, payload: PersonRename):
     rows_changed = face_db.rename_face(name, new_name)
     if rows_changed == 0:
         raise HTTPException(404, f"No enrolled person named {name!r}")
+    if payload.employee_id is not None:
+        face_db.set_employee_id(new_name, payload.employee_id.strip() or None)
     clips_db.rename_person_clips(name, new_name)
     pipeline_manager.reload_faces()
     logger.info("Renamed %s to %s (%d sample(s))", name, new_name, rows_changed)
@@ -515,6 +805,14 @@ def _sync_people_from_camera() -> dict:
 @app.post("/api/people/sync-from-camera")
 async def sync_people_from_camera():
     return await asyncio.to_thread(_sync_people_from_camera)
+
+
+@app.get("/api/cameras/{camera_id}/snapshot")
+def camera_snapshot(camera_id: int):
+    frame = pipeline_manager.get_latest_jpeg(camera_id)
+    if frame is None:
+        raise HTTPException(404, "No live frame available for this camera")
+    return Response(content=frame, media_type="image/jpeg")
 
 
 @app.websocket("/ws/live/{camera_id}")

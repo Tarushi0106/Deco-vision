@@ -80,6 +80,11 @@
   font-size: 0.85rem;
 }
 
+.tab-switcher {
+  display: flex;
+  gap: 0.5rem;
+}
+
 .modal-backdrop {
   position: fixed;
   inset: 0;

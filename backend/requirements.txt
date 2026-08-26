@@ -12,3 +12,5 @@ ultralytics
 psutil
 imageio-ffmpeg
 reportlab
+openpyxl
+apscheduler

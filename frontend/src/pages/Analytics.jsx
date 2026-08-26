@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
+import DeskAnalyticsPanel from './DeskAnalytics'
 import './pages.css'
 
 function formatTimestamp(ts) {
@@ -95,7 +96,7 @@ function ClipsCell({ personName, recordingCameraName }) {
   )
 }
 
-export default function Analytics() {
+function PeopleAnalyticsPanel() {
   const [days, setDays] = useState(7)
   const [rows, setRows] = useState([])
   const [activeByName, setActiveByName] = useState({})
@@ -121,11 +122,8 @@ export default function Analytics() {
 
   return (
     <div>
-      <div className="page-toolbar">
-        <div>
-          <h2>Face Recognition Analytics</h2>
-          <div className="page-toolbar-sub">Per-person visit patterns from recognized sightings</div>
-        </div>
+      <div className="page-toolbar" style={{ marginBottom: '0.75rem' }}>
+        <div className="page-toolbar-sub">Per-person visit patterns from recognized sightings</div>
         <select value={days} onChange={(e) => setDays(Number(e.target.value))} className="btn btn-outline">
           <option value={1}>Last 24 hours</option>
           <option value={7}>Last 7 days</option>
@@ -169,6 +167,44 @@ export default function Analytics() {
           </tbody>
         </table>
       </div>
+    </div>
+  )
+}
+
+const TABS = [
+  { key: 'people', label: 'People Analytics' },
+  { key: 'desk', label: 'Desk Analytics' },
+]
+
+export default function Analytics() {
+  const [tab, setTab] = useState('people')
+
+  return (
+    <div>
+      <div className="page-toolbar">
+        <div>
+          <h2>Analytics</h2>
+          <div className="page-toolbar-sub">
+            {tab === 'people'
+              ? 'Face recognition visit patterns per person'
+              : 'Automatic desk occupancy and time tracking'}
+          </div>
+        </div>
+        <div className="tab-switcher">
+          {TABS.map((t) => (
+            <button
+              key={t.key}
+              type="button"
+              className={`btn ${tab === t.key ? 'btn-primary' : 'btn-outline'}`}
+              onClick={() => setTab(t.key)}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {tab === 'people' ? <PeopleAnalyticsPanel /> : <DeskAnalyticsPanel />}
     </div>
   )
 }

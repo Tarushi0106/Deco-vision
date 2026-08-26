@@ -33,8 +33,11 @@ try:
 except ImportError:
     psutil = None
 
-from . import alerts_db, camera_db, clips_db, face_db
+from . import alerts_db, camera_db, clips_db, face_db, footfall_gate_db
+from .desk_tracker import DeskTracker
 from .detection_worker import run_worker
+from .footfall_counter import FootfallCounter, resolve_footfall_camera_ids
+from .gate_tracker import GateTracker
 from .video_source import RtspSource, WebcamSource
 
 logger = logging.getLogger("dashboard.pipeline")
@@ -54,6 +57,16 @@ JPEG_QUALITY = 80
 # high-res re-check (see detection_worker.py) instead of a blanket downscale.
 VIDEO_ENCODE_INTERVAL_SECONDS = 1 / 15  # matches main.py's VIDEO_FPS — no point encoding faster than that
 STALE_SOURCE_TIMEOUT_SECONDS = 5  # force-reconnect a capture source that's stopped delivering frames
+# Diagnosed live: camera 1 rejected login with "number of user logins has
+# exceeded the limit" — the device's own brute-force lockout, most likely
+# self-inflicted by this loop's old fixed 3s retry hammering the login
+# endpoint through an auth failure (transient network blip, device reboot,
+# whatever the original cause) for as long as this process had been running.
+# Backing off exponentially means a real outage gets retried patiently instead
+# of continuously re-triggering/extending a device-side lockout; a successful
+# reconnect resets it back to the base delay immediately.
+RECONNECT_BASE_DELAY_SECONDS = 3
+RECONNECT_MAX_DELAY_SECONDS = 60
 DEFAULT_DETECTION_FPS = 1  # how often frames are sent to the worker for face recognition; user-configurable
 SETTINGS_POLL_INTERVAL_SECONDS = 2  # how often the sender thread re-reads detection_fps from settings
 # onnxruntime (face rec) and YOLO both default to spawning threads across every
@@ -176,7 +189,7 @@ class CameraPipeline:
             if now - last < DETECTION_LOG_COOLDOWN_SECONDS:
                 continue
             self._last_logged[name] = now
-            face_db.log_detection_event(self.camera_id, name, det["bbox"])
+            face_db.log_detection_event(self.camera_id, name, det["bbox"], score=det.get("score"))
 
     def _update_clip_sessions(self, frame, now: float) -> None:
         """Called once per encoded frame from the capture loop (never from
@@ -330,12 +343,14 @@ class CameraPipeline:
         source = None
         last_frame_at = time.time()
         last_encode_at = 0.0
+        retry_delay = RECONNECT_BASE_DELAY_SECONDS
         while self._running:
             try:
                 if source is None:
                     source = self._create_source()
                     logger.info("Camera %s: video source opened", self.camera_id)
                     last_frame_at = time.time()
+                    retry_delay = RECONNECT_BASE_DELAY_SECONDS  # a successful open resets the backoff
 
                 frame = source.get_frame()
                 if frame is None:
@@ -372,9 +387,11 @@ class CameraPipeline:
                         pass  # clip writer thread is behind — drop this tick's frame rather than block capture
 
             except RuntimeError as e:
-                logger.error("Camera %s: video source error: %s — retrying in 3s", self.camera_id, e)
+                logger.error("Camera %s: video source error: %s — retrying in %ds",
+                              self.camera_id, e, retry_delay)
                 source = None
-                time.sleep(3)
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, RECONNECT_MAX_DELAY_SECONDS)
 
         if source is not None:
             source.release()
@@ -418,6 +435,30 @@ class PipelineManager:
         self._embed_response_queue: multiprocessing.Queue = multiprocessing.Queue()
         self._worker_process: multiprocessing.Process | None = None
 
+        # Unique footfall (people counting) — see footfall_counter.py. Lives
+        # here, in the main process, because its in-memory dedup cache needs
+        # to persist across the worker's whole lifetime and it writes to the
+        # DB, which (like every other DB module) this process owns, not the
+        # worker. Constructed in start() rather than here: pipeline_manager
+        # is a module-level singleton built at import time, before main.py's
+        # startup handler has called footfall_db.init_db() — building it
+        # this early would query a table that doesn't exist yet.
+        self._footfall_counter: FootfallCounter | None = None
+        # camera IDs config.FOOTFALL_CAMERAS resolves to — recomputed in
+        # start() and refresh_cameras() so a camera rename/add/remove is
+        # picked up without a restart. Only faces from cameras in this set
+        # ever reach the footfall counter (see _dispatch_result).
+        self._footfall_camera_ids: set[int] = set()
+
+        # Desk-time analytics — see desk_tracker.py. Same startup-ordering
+        # constraint and reason as _footfall_counter above (desk_db.init_db()
+        # hasn't run yet at import time).
+        self._desk_tracker: DeskTracker | None = None
+
+        # Footfall gate-line crossing — see gate_tracker.py. Same
+        # startup-ordering constraint as the two above.
+        self._gate_tracker: GateTracker | None = None
+
         self._running = False
         self._sender_thread: threading.Thread | None = None
         self._receiver_thread: threading.Thread | None = None
@@ -441,7 +482,38 @@ class PipelineManager:
         except Exception as e:
             logger.warning("Could not set detection worker CPU affinity: %s", e)
 
+    def _refresh_footfall_cameras(self) -> None:
+        resolved = resolve_footfall_camera_ids(camera_db.list_cameras())
+        if resolved != self._footfall_camera_ids:
+            self._footfall_camera_ids = resolved
+            logger.info("Footfall counting enabled on camera ID(s): %s", sorted(resolved) or "none")
+
+    def refresh_desk_zones(self) -> None:
+        """Call after any /api/desk-zones CRUD so a new/edited/deleted zone
+        takes effect immediately."""
+        if self._desk_tracker is not None:
+            self._desk_tracker.refresh_zones()
+
+    def get_desk_status(self) -> dict[str, dict]:
+        """Live (right-now) per-employee desk status — see
+        DeskTracker.get_live_status(). Only meaningful for "today"; the
+        Desk Analytics report merges this in for today's date only."""
+        if self._desk_tracker is None:
+            return {}
+        return self._desk_tracker.get_live_status()
+
+    def refresh_footfall_gate(self) -> None:
+        """Call after any /api/footfall-gate CRUD so a new/edited/deleted
+        gate line takes effect immediately."""
+        if self._gate_tracker is not None:
+            self._gate_tracker.refresh_gates()
+
     def start(self) -> None:
+        self._footfall_counter = FootfallCounter()
+        self._refresh_footfall_cameras()
+        self._desk_tracker = DeskTracker()
+        self._gate_tracker = GateTracker(footfall_gate_db)
+
         self._worker_process = multiprocessing.Process(
             target=run_worker,
             args=(
@@ -503,6 +575,7 @@ class PipelineManager:
         just the password would leave the pipeline running on its already
         -open, old-credentials connection until that connection happened to
         drop on its own."""
+        self._refresh_footfall_cameras()
         cameras = {c["id"]: c for c in camera_db.list_cameras()}
 
         for camera_id in list(self._pipelines):
@@ -565,7 +638,52 @@ class PipelineManager:
             return
 
         if "faces" in result:
+            frame_w, frame_h = result.get("frame_size", (0, 0))
+
+            # Footfall gate-line crossing (see gate_tracker.py) needs the
+            # embedding, so it runs BEFORE the pop below strips it. Returns
+            # True iff this camera has a gate line configured at all — in
+            # that case it already called footfall_counter.process() itself,
+            # exactly once per actual crossing, so the fallback below must
+            # not ALSO count every frame a face happens to be visible.
+            gate_active = False
+            if (
+                self._gate_tracker is not None
+                and self._footfall_counter is not None
+                and camera_id in self._footfall_camera_ids
+            ):
+                gate_active = self._gate_tracker.process_frame(
+                    camera_id, result["faces"], frame_w, frame_h, self._footfall_counter,
+                )
+
+            for face in result["faces"]:
+                # Pop rather than leave in place: this same dict is stored as
+                # this camera's "latest detections" below and handed straight
+                # to the /ws/detections websocket as JSON — a raw numpy
+                # embedding array is neither JSON-serializable nor something
+                # that should leave the backend as a live-view payload.
+                embedding = face.pop("embedding", None)
+                # Gated to configured entry/exit gate camera(s) only (see
+                # config.FOOTFALL_CAMERAS) — footfall counting does not run
+                # on every camera in the system by default. Whole-frame
+                # fallback only when that camera has no gate line drawn yet;
+                # once one exists, gate_active already handled counting above.
+                if (
+                    embedding is not None
+                    and self._footfall_counter is not None
+                    and camera_id in self._footfall_camera_ids
+                    and not gate_active
+                ):
+                    self._footfall_counter.process(camera_id, embedding, name=face.get("name"))
+
+            if self._desk_tracker is not None:
+                self._desk_tracker.process_frame(camera_id, result["faces"], frame_w, frame_h)
+
             pipeline.set_detections(result["faces"])
+
+        if "people" in result and self._desk_tracker is not None:
+            frame_w, frame_h = result.get("frame_size", (0, 0))
+            self._desk_tracker.process_pose_frame(camera_id, result["people"], frame_w, frame_h)
 
         for direction in result.get("footfall_events", []):
             face_db.log_footfall(camera_id, direction)

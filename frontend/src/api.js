@@ -26,8 +26,11 @@ export const api = {
   updateSite: (id, data) => req(`/api/sites/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteSite: (id) => req(`/api/sites/${id}`, { method: 'DELETE' }),
   deletePerson: (name) => req(`/api/people/${encodeURIComponent(name)}`, { method: 'DELETE' }),
-  renamePerson: (name, newName) =>
-    req(`/api/people/${encodeURIComponent(name)}`, { method: 'PUT', body: JSON.stringify({ new_name: newName }) }),
+  renamePerson: (name, newName, employeeId) =>
+    req(`/api/people/${encodeURIComponent(name)}`, {
+      method: 'PUT',
+      body: JSON.stringify({ new_name: newName, employee_id: employeeId ?? null }),
+    }),
   syncPeopleFromCamera: () => req('/api/people/sync-from-camera', { method: 'POST' }),
   login: (email) => req('/api/auth/login', { method: 'POST', body: JSON.stringify({ email }) }),
   listAlerts: ({ resolved } = {}) =>
@@ -38,12 +41,24 @@ export const api = {
   getAttendance: (date) => req(`/api/attendance${date ? `?date=${date}` : ''}`),
   getAttendanceReport: (name, start, end) =>
     req(`/api/attendance/report?name=${encodeURIComponent(name)}&start=${start}&end=${end}`),
-  attendanceReportCsvUrl: (name, start, end) =>
-    `${API_BASE}/api/attendance/report/csv?name=${encodeURIComponent(name)}&start=${start}&end=${end}`,
+  attendanceReportXlsxUrl: (name, start, end) =>
+    `${API_BASE}/api/attendance/report/xlsx?name=${encodeURIComponent(name)}&start=${start}&end=${end}`,
   attendanceReportPdfUrl: (name, start, end) =>
     `${API_BASE}/api/attendance/report/pdf?name=${encodeURIComponent(name)}&start=${start}&end=${end}`,
   getPeopleAnalytics: (days = 7) => req(`/api/analytics/people?days=${days}`),
   getClips: (personName) => req(`/api/clips?person=${encodeURIComponent(personName)}`),
   clipVideoUrl: (clipId) => `${API_BASE}/api/clips/${clipId}/video`,
   getActiveClips: () => req('/api/clips/active'),
+  getFootfallReport: (date) => req(`/api/footfall/report${date ? `?date=${date}` : ''}`),
+  footfallReportCsvUrl: (date) => `${API_BASE}/api/footfall/report/csv${date ? `?date=${date}` : ''}`,
+  footfallReportXlsxUrl: (date) => `${API_BASE}/api/footfall/report/xlsx${date ? `?date=${date}` : ''}`,
+  listDeskZones: (cameraId) => req(`/api/desk-zones${cameraId ? `?camera_id=${cameraId}` : ''}`),
+  createDeskZone: (data) => req('/api/desk-zones', { method: 'POST', body: JSON.stringify(data) }),
+  updateDeskZone: (id, data) => req(`/api/desk-zones/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteDeskZone: (id) => req(`/api/desk-zones/${id}`, { method: 'DELETE' }),
+  getDeskAnalyticsReport: (date) => req(`/api/desk-analytics/report${date ? `?date=${date}` : ''}`),
+  listFootfallGates: (cameraId) => req(`/api/footfall-gate${cameraId ? `?camera_id=${cameraId}` : ''}`),
+  setFootfallGate: (data) => req('/api/footfall-gate', { method: 'POST', body: JSON.stringify(data) }),
+  flipFootfallGate: (cameraId) => req(`/api/footfall-gate/${cameraId}/flip`, { method: 'POST' }),
+  deleteFootfallGate: (cameraId) => req(`/api/footfall-gate/${cameraId}`, { method: 'DELETE' }),
 }

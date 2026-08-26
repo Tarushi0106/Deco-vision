@@ -19,12 +19,9 @@ const NAV_GROUPS = [
       { to: '/people', label: 'People' },
       { to: '/cameras', label: 'Camera Management' },
       { to: '/sites', label: 'Site Management' },
-      {
-        to: '/attendance',
-        label: 'Attendance',
-        children: [{ to: '/attendance-report', label: 'Attendance Report' }],
-      },
+      { to: '/attendance', label: 'Attendance' },
       { to: '/analytics', label: 'Analytics' },
+      { to: '/footfall', label: 'Footfall' },
     ],
   },
   {

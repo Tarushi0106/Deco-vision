@@ -31,6 +31,10 @@ def init_db() -> None:
             # row was pulled from, so re-running the camera sync doesn't
             # re-import the same person every time
             conn.execute("ALTER TABLE enrolled_faces ADD COLUMN camera_face_id TEXT")
+        if "employee_id" not in existing_face_cols:
+            # optional HR-facing ID code (e.g. "EMP01"), shown on the
+            # Attendance roster — nobody has one until set explicitly
+            conn.execute("ALTER TABLE enrolled_faces ADD COLUMN employee_id TEXT")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS detection_events (
@@ -47,6 +51,11 @@ def init_db() -> None:
         existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(detection_events)")}
         if "camera_id" not in existing_cols:
             conn.execute("ALTER TABLE detection_events ADD COLUMN camera_id INTEGER")
+        if "score" not in existing_cols:
+            # recognition similarity score (recognizer._match's return value)
+            # at the moment this sighting was logged — powers the Attendance
+            # roster's "Best Match" column
+            conn.execute("ALTER TABLE detection_events ADD COLUMN score REAL")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS footfall_counts (
@@ -107,18 +116,24 @@ def rename_face(old_name: str, new_name: str) -> int:
 
 def load_faces_with_photos() -> list[dict]:
     with get_connection() as conn:
-        rows = conn.execute("SELECT name, source_photo FROM enrolled_faces ORDER BY name").fetchall()
-    grouped: dict[str, list[str]] = {}
-    for name, source_photo in rows:
-        grouped.setdefault(name, []).append(source_photo)
-    return [{"name": name, "photos": photos, "sample_count": len(photos)} for name, photos in grouped.items()]
+        rows = conn.execute("SELECT name, source_photo, employee_id FROM enrolled_faces ORDER BY name").fetchall()
+    grouped: dict[str, dict] = {}
+    for name, source_photo, employee_id in rows:
+        g = grouped.setdefault(name, {"photos": [], "employee_id": None})
+        g["photos"].append(source_photo)
+        if employee_id:
+            g["employee_id"] = employee_id
+    return [
+        {"name": name, "photos": g["photos"], "sample_count": len(g["photos"]), "employee_id": g["employee_id"]}
+        for name, g in grouped.items()
+    ]
 
 
-def log_detection_event(camera_id: int, name: str, bbox: list[int]) -> None:
+def log_detection_event(camera_id: int, name: str, bbox: list[int], score: float | None = None) -> None:
     with get_connection() as conn:
         conn.execute(
-            "INSERT INTO detection_events (ts, camera_id, name, bbox) VALUES (?, ?, ?, ?)",
-            (time.time(), camera_id, name, str(bbox)),
+            "INSERT INTO detection_events (ts, camera_id, name, bbox, score) VALUES (?, ?, ?, ?, ?)",
+            (time.time(), camera_id, name, str(bbox), score),
         )
 
 
@@ -130,6 +145,99 @@ def count_detections_today() -> int:
             "SELECT COUNT(*) FROM detection_events WHERE ts >= ?", (midnight,)
         ).fetchone()
     return row[0]
+
+
+def list_enrolled_roster() -> list[dict]:
+    """Distinct enrolled people (one row per person, not per sample), with
+    their employee_id if one's been set — the base roster the Attendance
+    page cross-references detection_events against to also show who's
+    ABSENT, not just who showed up."""
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT name, MAX(employee_id) AS employee_id FROM enrolled_faces GROUP BY name ORDER BY name"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_employee_id(name: str, employee_id: str | None) -> None:
+    with get_connection() as conn:
+        conn.execute("UPDATE enrolled_faces SET employee_id = ? WHERE name = ?", (employee_id, name))
+
+
+def get_daily_attendance_roster(date: str | None = None) -> dict:
+    """The full day's attendance roster — every ENROLLED person, present or
+    absent, built from list_enrolled_roster() + detection_events. A present
+    person gets check_in/check_out (first/last sighting), which camera the
+    LAST sighting was on, total detections, and the best (highest)
+    recognition score seen that day; an absent person gets nulls and
+    detections=0. This is the whole-roster counterpart to get_attendance()
+    above, which only lists who showed up."""
+    if date is None:
+        date = datetime.now().strftime("%Y-%m-%d")
+    day_start = datetime.strptime(date, "%Y-%m-%d").timestamp()
+    day_end = day_start + 86400
+
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        events = conn.execute(
+            "SELECT name, ts, camera_id, score FROM detection_events "
+            "WHERE ts >= ? AND ts < ? AND name != 'Unknown' ORDER BY ts",
+            (day_start, day_end),
+        ).fetchall()
+
+    by_name: dict[str, dict] = {}
+    for e in events:
+        d = by_name.setdefault(
+            e["name"],
+            {"first_seen": e["ts"], "last_seen": e["ts"], "checkout_camera_id": e["camera_id"],
+             "detections": 0, "best_match": None},
+        )
+        d["first_seen"] = min(d["first_seen"], e["ts"])
+        if e["ts"] >= d["last_seen"]:
+            d["last_seen"] = e["ts"]
+            d["checkout_camera_id"] = e["camera_id"]
+        d["detections"] += 1
+        if e["score"] is not None:
+            d["best_match"] = e["score"] if d["best_match"] is None else max(d["best_match"], e["score"])
+
+    roster = []
+    for person in list_enrolled_roster():
+        name = person["name"]
+        d = by_name.get(name)
+        if d:
+            roster.append({
+                "name": name,
+                "employee_id": person["employee_id"],
+                "present": True,
+                "check_in": d["first_seen"],
+                "check_out": d["last_seen"],
+                "checkout_camera_id": d["checkout_camera_id"],
+                "time_stay_seconds": round(d["last_seen"] - d["first_seen"]),
+                "detections": d["detections"],
+                "best_match": d["best_match"],
+            })
+        else:
+            roster.append({
+                "name": name,
+                "employee_id": person["employee_id"],
+                "present": False,
+                "check_in": None,
+                "check_out": None,
+                "checkout_camera_id": None,
+                "time_stay_seconds": None,
+                "detections": 0,
+                "best_match": None,
+            })
+
+    present_count = sum(1 for r in roster if r["present"])
+    return {
+        "date": date,
+        "present": present_count,
+        "absent": len(roster) - present_count,
+        "total_detections": len(events),
+        "roster": roster,
+    }
 
 
 def get_attendance(date: str | None = None) -> list[dict]:

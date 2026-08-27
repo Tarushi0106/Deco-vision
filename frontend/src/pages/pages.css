@@ -209,11 +209,56 @@
 
 .clips-list-row {
   display: flex;
+  align-items: center;
   justify-content: space-between;
+  gap: 0.75rem;
   padding: 0.5rem 0.75rem;
   font-size: 0.85rem;
   cursor: pointer;
   border-bottom: 1px solid var(--border);
+}
+
+.clips-list-play {
+  color: var(--brand);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.daily-activity-modal {
+  width: 560px;
+  max-width: 90vw;
+}
+
+.daily-activity-search {
+  margin-bottom: 1rem;
+}
+
+.daily-activity-search-title {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-bottom: 0.6rem;
+}
+
+.daily-activity-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.daily-activity-controls label {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.daily-activity-controls select,
+.daily-activity-controls input[type='date'] {
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: var(--font);
+  font-size: 0.85rem;
 }
 
 .clips-list-row:last-child {

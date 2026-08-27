@@ -18,7 +18,29 @@ SERVER_PORT = int(os.getenv("SERVER_PORT", "8811"))
 # which makes OpenCV's ffmpeg backend fail to open the stream with no
 # useful error - forcing TCP fixes that for the large majority of devices.
 RTSP_TRANSPORT = os.getenv("RTSP_TRANSPORT", "tcp")
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = f"rtsp_transport;{RTSP_TRANSPORT}"
+# fflags;nobuffer + flags;low_delay + max_delay;0: ffmpeg's RTSP demuxer
+# otherwise keeps its own internal jitter/probe buffer on top of whatever
+# OpenCV does (CAP_PROP_BUFFERSIZE only controls OpenCV's own queue, not
+# ffmpeg's) - that's real, observed latency a purpose-built live-viewing
+# NVR client doesn't have on the identical camera/network, since it isn't
+# using ffmpeg's general-purpose (buffer-for-seekability) defaults.
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+    f"rtsp_transport;{RTSP_TRANSPORT}|fflags;nobuffer|flags;low_delay|max_delay;0"
+)
+
+# Cameras confirmed to support on-demand playback from their own onboard
+# recording (ONVIF Profile G / Replay - see onvif_client.py), mapped to the
+# recording's ONVIF channel number. Only camera 1 is in here: validated
+# live this session (real HEVC+audio pulled via ffmpeg for an exact
+# requested time window). Cameras 2/3 live on a different physical device
+# whose ONVIF replay support was NOT confirmed (its ONVIF port didn't
+# respond the same way camera 1's did) - they keep local self-recording
+# (pipeline.py) until/unless that's verified too. A camera in this dict
+# skips local recording entirely; clips are fetched from the camera only
+# when actually played, never stored permanently on this machine.
+CAMERA_ONVIF_REPLAY_CHANNEL = {
+    1: 1,
+}
 
 # Unique footfall (people counting, see footfall_counter.py) is opt-in per
 # camera, not automatic for every camera in the system: comma-separated list
@@ -47,6 +69,24 @@ FOOTFALL_SIMILARITY_THRESHOLD = float(os.getenv("FOOTFALL_SIMILARITY_THRESHOLD",
 # When the end-of-day footfall report job (scheduler.py) runs, as "HH:MM" —
 # shortly after midnight by default so it finalizes the day that just ended.
 FOOTFALL_REPORT_FINALIZE_TIME = os.getenv("FOOTFALL_REPORT_FINALIZE_TIME", "00:05")
+
+# Rolling local storage window for recognition clips (see clips_db.py's
+# delete_expired_clips, run daily by scheduler.py): a clip and its video
+# file are deleted once older than this, on every camera. Note this is a
+# ceiling on what OUR storage keeps, not a guarantee - camera 1's own
+# onboard recording (the source replay_prefetch.py / on-demand fetches pull
+# from) independently only holds ~3 days before it overwrites itself
+# (confirmed live), so its practical availability window is whichever is
+# smaller: this setting, or however far back the camera's own memory still
+# reaches. Self-recording cameras (anything NOT in CAMERA_ONVIF_REPLAY_
+# CHANNEL) save locally as they're recorded, so for them this setting is
+# the real ceiling.
+CLIP_RETENTION_DAYS = int(os.getenv("CLIP_RETENTION_DAYS", "7"))
+
+# When the daily clip-retention prune job (scheduler.py) runs, as "HH:MM" -
+# shortly after the footfall finalize job so both maintenance jobs land
+# together just after midnight.
+CLIP_RETENTION_PRUNE_TIME = os.getenv("CLIP_RETENTION_PRUNE_TIME", "00:15")
 
 # Desk-time analytics (see desk_tracker.py): how long an employee can go
 # unconfirmed at their desk zone — by face OR by the pose-tracking bridge —

@@ -47,10 +47,10 @@ export default function CameraTile({ camera, showOverlay = true, onClick, large 
         const { faces } = JSON.parse(event.data)
         overlayCtx.clearRect(0, 0, overlay.width, overlay.height)
         overlayCtx.lineWidth = 2
-        overlayCtx.font = '14px sans-serif'
+        overlayCtx.font = 'bold 18px sans-serif'
         overlayCtx.textBaseline = 'bottom'
 
-        const LABEL_HEIGHT = 18
+        const LABEL_HEIGHT = 25
         const placedLabels = []
         const overlaps = (a, b) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y
 
@@ -63,6 +63,10 @@ export default function CameraTile({ camera, showOverlay = true, onClick, large 
           const [x1, y1, x2, y2] = face.bbox
           const known = face.name !== 'Unknown'
           const color = known ? '#1a7f4b' : '#c62828'
+          // Recognized-name label uses a distinct, lighter blue background
+          // (rather than reusing the box's dark green) — white text on the
+          // dark green read poorly; blue + white has much better contrast.
+          const labelBg = known ? '#2f6fed' : color
           overlayCtx.strokeStyle = color
           overlayCtx.strokeRect(x1, y1, x2 - x1, y2 - y1)
 
@@ -78,7 +82,7 @@ export default function CameraTile({ camera, showOverlay = true, onClick, large 
           }
           placedLabels.push(candidate)
 
-          overlayCtx.fillStyle = color
+          overlayCtx.fillStyle = labelBg
           overlayCtx.fillRect(candidate.x, candidate.y, candidate.w, candidate.h)
           overlayCtx.fillStyle = 'white'
           overlayCtx.fillText(label, candidate.x + 4, candidate.y + LABEL_HEIGHT - 4)

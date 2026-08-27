@@ -33,7 +33,7 @@ try:
 except ImportError:
     psutil = None
 
-from . import alerts_db, camera_db, clips_db, face_db, footfall_gate_db
+from . import alerts_db, camera_db, clips_db, config, face_db, footfall_gate_db
 from .desk_tracker import DeskTracker
 from .detection_worker import run_worker
 from .footfall_counter import FootfallCounter, resolve_footfall_camera_ids
@@ -98,7 +98,11 @@ CLIP_BUFFER_SECONDS = CLIP_PRE_SECONDS + 2  # rolling buffer used only to seed t
 PRESENCE_GRACE_SECONDS = 60  # how long to keep a clip open after the person's last recognition hit
 MAX_CLIP_DURATION_SECONDS = 300  # cap a single clip (e.g. someone sitting for an hour) — chapters into new clips past this
 MIN_CLIP_DURATION_SECONDS = 1.5  # discard clips shorter than this — a single flickered detection, not a real visit
-MAX_CLIPS_PER_PERSON = 30  # retention cap — older clips (file + row) are deleted past this
+# No retention cap — clips are kept indefinitely per explicit request (Daily
+# Activity search needs full history, not just the most recent slice). This
+# is a deliberate disk-usage tradeoff: ~3.4MB/clip measured, unbounded
+# growth over time. Revisit with a time-based cap (e.g. keep N days) instead
+# of a count-based one if disk space becomes a real constraint.
 # Measured this session: 3 clips finalizing around the same time each spawned their own
 # ffmpeg transcode with no thread cap, pegging all 12 logical cores to 100% on top of the
 # already-pinned recognition worker — the exact "everything is slow" oversubscription
@@ -126,9 +130,14 @@ class CameraPipeline:
         # running it inline in the capture loop (below) directly stole time from reading/
         # encoding the next camera frame, which showed up as live-feed lag even though
         # recognition itself (a separate process) was unaffected. Moved to its own thread,
-        # fed by this small drop-if-full queue, so clip encoding can NEVER block capture —
-        # worst case a clip frame is skipped, never the live view stuttering.
-        self._clip_frame_queue: "queue.Queue" = queue.Queue(maxsize=2)
+        # fed by this drop-if-full queue, so clip encoding can NEVER block capture — worst
+        # case a clip frame is skipped, never the live view stuttering. Sized for ~30s of
+        # buffering at the 15fps encode rate (was 2 — ~130ms — until diagnosed live: any
+        # transient load on the writer thread silently dropped frames, so a clip's reported
+        # duration (wall-clock presence span) could end up far longer than its actual
+        # playable video (fewer frames than that span implies at 15fps) — see
+        # _open_clip_session's frames_written tracking for the other half of that fix.
+        self._clip_frame_queue: "queue.Queue" = queue.Queue(maxsize=450)
         self._clip_thread: threading.Thread | None = None
         # last time each name was seen in a recognition result — written by
         # set_detections() (called from PipelineManager's receiver thread),
@@ -198,7 +207,14 @@ class CameraPipeline:
         keeps writing frames to it every tick they're still within
         PRESENCE_GRACE_SECONDS of their last recognition hit, and finalizes
         it once they've been gone that long (or the clip hits the max
-        duration cap, in which case it chapters into a fresh one)."""
+        duration cap, in which case it chapters into a fresh one).
+
+        For a camera in config.CAMERA_ONVIF_REPLAY_CHANNEL, "the clip" is
+        just this start/end timestamp window — no local frames are ever
+        written; playback fetches the same window straight from the
+        camera's own recording on demand (see onvif_client.py / main.py's
+        /api/clips/{id}/video)."""
+        is_replay_camera = self.camera_id in config.CAMERA_ONVIF_REPLAY_CHANNEL
         with self._presence_lock:
             last_detection_snapshot = dict(self._last_detection)
 
@@ -207,16 +223,22 @@ class CameraPipeline:
                 continue
             session = self._active_clip_sessions.get(name)
             if session is None:
-                session = self._open_clip_session(name, now, frame)
+                session = (
+                    {"start_ts": now, "last_written_ts": now, "replay": True}
+                    if is_replay_camera
+                    else self._open_clip_session(name, now, frame)
+                )
                 if session is None:
                     continue
                 self._active_clip_sessions[name] = session
                 self._active_names = frozenset(self._active_clip_sessions)
-            try:
-                out_w, out_h = session["out_size"]
-                session["writer"].write(cv2.resize(frame, (out_w, out_h)) if frame.shape[1::-1] != (out_w, out_h) else frame)
-            except Exception:
-                logger.exception("Camera %s: failed writing clip frame for %s", self.camera_id, name)
+            if not session.get("replay"):
+                try:
+                    out_w, out_h = session["out_size"]
+                    session["writer"].write(cv2.resize(frame, (out_w, out_h)) if frame.shape[1::-1] != (out_w, out_h) else frame)
+                    session["frames_written"] += 1
+                except Exception:
+                    logger.exception("Camera %s: failed writing clip frame for %s", self.camera_id, name)
             session["last_written_ts"] = now
             if now - session["start_ts"] >= MAX_CLIP_DURATION_SECONDS:
                 self._finalize_clip_session(name, session)
@@ -265,6 +287,7 @@ class CameraPipeline:
             return {
                 "writer": writer, "raw_path": raw_path, "file_path": file_path,
                 "start_ts": start_ts, "last_written_ts": now, "out_size": (out_width, out_height),
+                "fps": fps, "frames_written": len(pre_roll),
             }
         except Exception:
             logger.exception("Camera %s: failed to open clip for %s", self.camera_id, name)
@@ -276,12 +299,31 @@ class CameraPipeline:
         thread so a multi-minute clip can't stall this camera's live capture
         loop. Safe to run off-thread: by the time this is called, `session`
         has already been removed from _active_clip_sessions by the caller."""
+        if session.get("replay"):
+            # No local file was ever written — the DB row's start_ts/duration
+            # IS the clip; playback fetches those exact seconds from the
+            # camera's own recording when actually requested. Cheap enough
+            # to log inline, no background thread needed. Wall-clock is the
+            # right measure here (unlike the local-recording path below) —
+            # there's no frame queue/writer to drop frames from.
+            duration = session["last_written_ts"] - session["start_ts"]
+            if duration >= MIN_CLIP_DURATION_SECONDS:
+                clips_db.log_clip(name, self.camera_id, session["start_ts"], duration, "")
+            return
+
+        # The reported/logged duration is the actual video's length (frame
+        # count / fps), NOT the wall-clock presence span used above — they
+        # can diverge if the writer thread ever fell behind and frames got
+        # dropped (see _clip_frame_queue's sizing comment). Using the real
+        # frame count means the number shown always matches what's actually
+        # playable, even in a worst case where drops still happen.
+        duration = session["frames_written"] / session["fps"]
+
         try:
             session["writer"].release()
         except Exception:
             logger.exception("Camera %s: failed to release writer for %s", self.camera_id, name)
             return
-        duration = session["last_written_ts"] - session["start_ts"]
         if duration < MIN_CLIP_DURATION_SECONDS:
             Path(session["raw_path"]).unlink(missing_ok=True)
             return
@@ -312,7 +354,6 @@ class CameraPipeline:
                 )
                 return
             clips_db.log_clip(name, self.camera_id, session["start_ts"], duration, str(file_path))
-            clips_db.prune_old_clips(name, MAX_CLIPS_PER_PERSON)
         except Exception:
             logger.exception("Camera %s: failed to transcode/log clip for %s", self.camera_id, name)
         finally:

@@ -395,11 +395,13 @@ function GateEditor() {
 export default function Footfall() {
   const [date, setDate] = useState(todayStr())
   const [report, setReport] = useState(null)
+  const [peopleCount, setPeopleCount] = useState(null)
   const [error, setError] = useState(null)
 
   useEffect(() => {
     setError(null)
     api.getFootfallReport(date).then(setReport).catch((err) => setError(err.message))
+    api.getPeopleCountReport(date).then(setPeopleCount).catch(() => {})
   }, [date])
 
   const busiestHour = useMemo(() => {
@@ -445,6 +447,11 @@ export default function Footfall() {
 
       <div className="stat-grid">
         <StatTile label="Unique Footfall" value={report ? report.total : '—'} sub={`on ${date}`} />
+        <StatTile
+          label="People Counted"
+          value={peopleCount ? peopleCount.total_in + peopleCount.total_out : '—'}
+          sub={peopleCount ? `${peopleCount.total_in} in · ${peopleCount.total_out} out` : `on ${date}`}
+        />
         <StatTile label="Busiest Hour" value={busiestHour ?? '—'} sub="by first-seen visits" />
         <StatTile
           label="Top Camera"

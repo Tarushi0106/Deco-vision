@@ -26,6 +26,7 @@ from . import (
     alerts_db, camera_db, clips_db, config, desk_db, face_db, footfall_db, footfall_gate_db, footfall_report,
     scheduler, user_db,
 )
+from . import onvif_client, pipeline, replay_prefetch
 from .camera_client import camera_client, get_camera_client, sync_face_to_all_devices
 from .pipeline import pipeline_manager
 
@@ -143,10 +144,12 @@ def startup():
     desk_db.init_db()
     pipeline_manager.start()
     scheduler.start_scheduler()
+    replay_prefetch.start()
 
 
 @app.on_event("shutdown")
 def shutdown():
+    replay_prefetch.stop()
     scheduler.shutdown_scheduler()
     pipeline_manager.stop()
 
@@ -641,6 +644,16 @@ def get_footfall_report_xlsx(date: str | None = None):
     )
 
 
+@app.get("/api/footfall/people-count")
+def get_people_count_report(date: str | None = None):
+    """Raw IN/OUT people-counting totals (see person_tracker.py /
+    face_db.get_people_counting_report) — every midline crossing counted, no
+    identity, no dedup. Distinct from /api/footfall/report, which is the
+    embedding-deduped unique-visitor count. Powers the Footfall page's
+    "People Counted" stat tile."""
+    return face_db.get_people_counting_report(date)
+
+
 @app.get("/api/analytics/people")
 def get_people_analytics(days: int = 7):
     cameras_by_id = {c["id"]: c["name"] for c in camera_db.list_cameras()}
@@ -656,7 +669,9 @@ def list_active_clips():
 
 
 @app.get("/api/clips")
-def list_clips(person: str, limit: int = 50):
+def list_clips(person: str, limit: int = 2000):
+    # No storage-side cap anymore (see pipeline.py) — this default just
+    # bounds a single response/render, not how much history is kept.
     cameras_by_id = {c["id"]: c["name"] for c in camera_db.list_cameras()}
     clips = clips_db.list_clips_for_person(person, limit)
     for c in clips:
@@ -664,12 +679,102 @@ def list_clips(person: str, limit: int = 50):
     return clips
 
 
+@app.get("/api/people/{name}/clips-for-day")
+def get_clips_for_day(name: str, date: str):
+    """The Daily Activity date search's real source of truth for "all the
+    clips of that day" — the plain /api/clips list only shows sightings that
+    already have a clips row, which for replay cameras (config.
+    CAMERA_ONVIF_REPLAY_CHANNEL) can be incomplete (rows deleted by the old
+    prune-to-30 cap, back before it was removed). Since the camera's own
+    onboard recording still has that footage regardless, this reconstructs
+    any missing sessions from detection_events (never pruned) and backfills
+    them as real clips rows (empty file_path — fetched on first play, same
+    as any other replay clip) so the list becomes complete and self-healing.
+    Non-replay cameras can't be recovered this way — once a self-recorded
+    clip's local file is gone, so is the video — so they're left as-is.
+    Bounded to config.CLIP_RETENTION_DAYS: backfilling further back would
+    just recreate rows the nightly prune job (scheduler.py) is going to
+    delete again on its next run, and the camera's own onboard recording is
+    unlikely to still have footage that old anyway (confirmed live: camera
+    1 only holds ~3 days before overwriting itself)."""
+    day_start = datetime.strptime(date, "%Y-%m-%d").timestamp()
+    day_end = day_start + 86400
+    cameras_by_id = {c["id"]: c["name"] for c in camera_db.list_cameras()}
+
+    existing = clips_db.list_clips_for_person(name, limit=2000)
+    existing_by_cam: dict[int, list[dict]] = {}
+    for c in existing:
+        existing_by_cam.setdefault(c["camera_id"], []).append(c)
+
+    retention_cutoff = time.time() - config.CLIP_RETENTION_DAYS * 86400
+    backfilled = []
+    for camera_id in config.CAMERA_ONVIF_REPLAY_CHANNEL if day_start >= retention_cutoff else []:
+        sessions = face_db.get_person_day_sessions(
+            name, camera_id, date,
+            pipeline.PRESENCE_GRACE_SECONDS, pipeline.MAX_CLIP_DURATION_SECONDS, pipeline.MIN_CLIP_DURATION_SECONDS,
+        )
+        known = existing_by_cam.get(camera_id, [])
+        for s in sessions:
+            if any(abs(k["ts"] - s["ts"]) < 5 for k in known):
+                continue
+            new_id = clips_db.log_clip(name, camera_id, s["ts"], s["duration"], "")
+            backfilled.append({
+                "id": new_id, "person_name": name, "camera_id": camera_id,
+                "ts": s["ts"], "duration": s["duration"], "file_path": "",
+            })
+
+    result = [c for c in existing + backfilled if day_start <= c["ts"] < day_end]
+    for c in result:
+        c["camera_name"] = cameras_by_id.get(c["camera_id"], "—")
+    result.sort(key=lambda c: c["ts"])
+    return result
+
+
 @app.get("/api/clips/{clip_id}/video")
 def get_clip_video(clip_id: int):
     clip = clips_db.get_clip(clip_id)
-    if clip is None or not Path(clip["file_path"]).exists():
+    if clip is None:
         raise HTTPException(404, "Clip not found")
-    return FileResponse(clip["file_path"], media_type="video/mp4")
+
+    # A settled miss (replay_prefetch.py or an earlier play attempt already
+    # tried and the camera had nothing) — never retried, so this fails fast
+    # instead of repeating a doomed 2-3 minute fetch.
+    if clip["file_path"] == clips_db.UNAVAILABLE_SENTINEL:
+        raise HTTPException(404, "This footage is no longer available on the camera")
+
+    # Already cached locally — either a prior fetch (on-demand or background
+    # prefetch) for a replay camera, or an old-style clip a non-replay
+    # camera self-recorded.
+    if clip["file_path"] and Path(clip["file_path"]).exists():
+        return FileResponse(clip["file_path"], media_type="video/mp4")
+
+    replay_channel = config.CAMERA_ONVIF_REPLAY_CHANNEL.get(clip["camera_id"])
+    if replay_channel is None:
+        raise HTTPException(404, "Clip not found")
+
+    cam = camera_db.get_camera_connection(clip["camera_id"])
+    if cam is None:
+        raise HTTPException(404, "Camera not found")
+    replay_url = onvif_client.build_replay_rtsp_url(
+        cam["host"], cam["port"], cam["user"], cam["password"], replay_channel,
+        clip["ts"] - onvif_client.REPLAY_PADDING_SECONDS,
+        clip["ts"] + clip["duration"] + onvif_client.REPLAY_PADDING_SECONDS,
+    )
+    # Measured live against the real camera: fetch latency is dominated by a
+    # large FIXED per-request cost (a 5.8s window took ~121s, a 98s window
+    # took ~185s), not by clip length — modeled here as a generous flat
+    # floor plus a modest per-second margin, not a multiplier off duration
+    # (which would drastically under-time short clips, the common case).
+    timeout = clip["duration"] * 1.5 + 180.0
+    camera_dir = clips_db.CLIPS_DIR / str(clip["camera_id"])
+    camera_dir.mkdir(parents=True, exist_ok=True)
+    out_path = camera_dir / f"replay_{clip_id}_{uuid.uuid4().hex[:8]}.mp4"
+    fetched = onvif_client.fetch_replay_clip(replay_url, out_path, timeout=timeout)
+    if fetched is None:
+        clips_db.set_clip_file_path(clip_id, clips_db.UNAVAILABLE_SENTINEL)
+        raise HTTPException(502, "Could not fetch this clip from the camera's own recording")
+    clips_db.set_clip_file_path(clip_id, str(fetched))
+    return FileResponse(fetched, media_type="video/mp4")
 
 
 @app.get("/api/debug/snaped-faces")

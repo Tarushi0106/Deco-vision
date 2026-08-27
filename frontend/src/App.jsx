@@ -18,7 +18,7 @@ const PAGES = [
   { path: '/cameras', title: 'Cameras', breadcrumb: 'Deco Vision / Cameras', element: <CameraManagement /> },
   { path: '/sites', title: 'Sites', breadcrumb: 'Deco Vision / Sites', element: <Sites /> },
   { path: '/attendance', title: 'Attendance', breadcrumb: 'Deco Vision / Attendance', element: <Attendance /> },
-  { path: '/analytics', title: 'Analytics', breadcrumb: 'Deco Vision / Analytics', element: <Analytics /> },
+  { path: '/analytics', title: 'Workforce Analytics', breadcrumb: 'Deco Vision / Workforce Analytics', element: <Analytics /> },
   { path: '/footfall', title: 'Footfall', breadcrumb: 'Deco Vision / Footfall', element: <Footfall /> },
 ]
 

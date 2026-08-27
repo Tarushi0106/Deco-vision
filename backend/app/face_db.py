@@ -300,6 +300,44 @@ def get_attendance_report(name: str, start_date: str, end_date: str) -> list[dic
     return result
 
 
+def get_person_day_sessions(
+    name: str, camera_id: int, date: str,
+    grace_seconds: float, max_duration_seconds: float, min_duration_seconds: float,
+) -> list[dict]:
+    """Reconstructs presence sessions (ts, duration) for one person on one
+    camera/day purely from detection_events — the same gap/chapter grouping
+    pipeline.py's _update_clip_sessions uses live, just applied retroactively.
+    detection_events is never pruned (unlike the old clips table, which used
+    to cap at 30/person before that cap was removed), so this can rebuild
+    "all the clips of that day" even for sightings whose clips row was
+    deleted by that old cap or never created at all. See main.py's
+    /api/people/{name}/clips-for-day, which uses this to backfill missing
+    clips rows for replay-capable cameras."""
+    day_start = datetime.strptime(date, "%Y-%m-%d").timestamp()
+    day_end = day_start + 86400
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT ts FROM detection_events WHERE name = ? AND camera_id = ? AND ts >= ? AND ts < ? ORDER BY ts",
+            (name, camera_id, day_start, day_end),
+        ).fetchall()
+
+    sessions = []
+    session_start = session_last = None
+    for (ts,) in rows:
+        if session_start is None:
+            session_start = session_last = ts
+        elif ts - session_last > grace_seconds or ts - session_start >= max_duration_seconds:
+            duration = max(session_last - session_start, min_duration_seconds * 2)
+            sessions.append({"ts": session_start, "duration": duration})
+            session_start = session_last = ts
+        else:
+            session_last = ts
+    if session_start is not None:
+        duration = max(session_last - session_start, min_duration_seconds * 2)
+        sessions.append({"ts": session_start, "duration": duration})
+    return sessions
+
+
 def get_person_analytics(days: int = 7) -> list[dict]:
     """Per-person visit patterns over the last N days, built from
     detection_events (already deduped 30s per person/camera) — no new
@@ -349,6 +387,55 @@ def log_footfall(camera_id: int, direction: str) -> None:
             "INSERT INTO footfall_counts (ts, camera_id, direction) VALUES (?, ?, ?)",
             (time.time(), camera_id, direction),
         )
+
+
+def get_people_counting_report(date: str | None = None) -> dict:
+    """Raw IN/OUT midline-crossing counts for one day (see person_tracker.py)
+    — every crossing counted, no identity, no dedup, unlike footfall_db's
+    unique-footfall report (embedding-based, one row per distinct visit).
+    This is the "people counting" view: total traffic through each camera's
+    frame, not distinct visitors. Caller (main.py) attaches camera_name,
+    matching how every other report in this app does it."""
+    if date is None:
+        date = datetime.now().strftime("%Y-%m-%d")
+    day_start = datetime.strptime(date, "%Y-%m-%d").timestamp()
+    day_end = day_start + 86400
+
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT ts, camera_id, direction FROM footfall_counts WHERE ts >= ? AND ts < ? ORDER BY ts",
+            (day_start, day_end),
+        ).fetchall()
+
+    hourly_in, hourly_out = [0] * 24, [0] * 24
+    by_camera: dict[int, dict] = {}
+    events = []
+    total_in = total_out = 0
+    for row in rows:
+        event = dict(row)
+        events.append(event)
+        hour = datetime.fromtimestamp(event["ts"]).hour
+        cam = by_camera.setdefault(event["camera_id"], {"camera_id": event["camera_id"], "in": 0, "out": 0})
+        if event["direction"] == "in":
+            hourly_in[hour] += 1
+            cam["in"] += 1
+            total_in += 1
+        else:
+            hourly_out[hour] += 1
+            cam["out"] += 1
+            total_out += 1
+
+    return {
+        "date": date,
+        "total_in": total_in,
+        "total_out": total_out,
+        "total": total_in + total_out,
+        "hourly_in": hourly_in,
+        "hourly_out": hourly_out,
+        "by_camera": sorted(by_camera.values(), key=lambda c: c["camera_id"]),
+        "events": events,
+    }
 
 
 def count_footfall_today() -> dict:

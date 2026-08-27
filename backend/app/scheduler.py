@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from . import config, footfall_report
+from . import clips_db, config, footfall_report
 
 logger = logging.getLogger("dashboard.footfall.scheduler")
 
@@ -39,6 +39,14 @@ def _finalize_yesterday() -> None:
         logger.exception("Footfall: end-of-day report generation failed for %s", date)
 
 
+def _prune_expired_clips() -> None:
+    try:
+        deleted = clips_db.delete_expired_clips(config.CLIP_RETENTION_DAYS)
+        logger.info("Clips: pruned %d recording(s) older than %d day(s)", deleted, config.CLIP_RETENTION_DAYS)
+    except Exception:
+        logger.exception("Clips: retention prune failed")
+
+
 def _catch_up_if_missed() -> None:
     """Runs once at startup: if the backend was down through yesterday's
     scheduled finalize time (so the cron trigger never got a chance to fire
@@ -58,8 +66,14 @@ def start_scheduler() -> None:
         return
 
     _catch_up_if_missed()
+    # Also run once immediately at startup — unlike the footfall finalize
+    # job, this is idempotent and cheap to run right away rather than wait
+    # for the first scheduled fire, so a long-overdue backlog (e.g. after
+    # this feature was first deployed) doesn't sit around for up to 24h.
+    _prune_expired_clips()
 
     hour, minute = (int(p) for p in config.FOOTFALL_REPORT_FINALIZE_TIME.split(":"))
+    prune_hour, prune_minute = (int(p) for p in config.CLIP_RETENTION_PRUNE_TIME.split(":"))
     _scheduler = BackgroundScheduler(timezone=datetime.now().astimezone().tzinfo)
     _scheduler.add_job(
         _finalize_yesterday,
@@ -67,8 +81,15 @@ def start_scheduler() -> None:
         id="footfall_finalize_daily",
         misfire_grace_time=MISFIRE_GRACE_SECONDS,
     )
+    _scheduler.add_job(
+        _prune_expired_clips,
+        trigger=CronTrigger(hour=prune_hour, minute=prune_minute),
+        id="clips_retention_prune_daily",
+        misfire_grace_time=MISFIRE_GRACE_SECONDS,
+    )
     _scheduler.start()
     logger.info("Footfall: end-of-day report job scheduled daily at %02d:%02d", hour, minute)
+    logger.info("Clips: retention prune job scheduled daily at %02d:%02d", prune_hour, prune_minute)
 
 
 def shutdown_scheduler() -> None:

@@ -1,7 +1,12 @@
-export const API_BASE = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8811'
-export const WS_HOST = API_BASE.replace(/^https?:\/\//, '')
-export const WS_PROTOCOL = API_BASE.startsWith('https') ? 'wss' : 'ws'
+const configuredApiBase = import.meta.env.VITE_API_BASE
 
+export const API_BASE = configuredApiBase || ''
+export const WS_HOST = configuredApiBase
+  ? configuredApiBase.replace(/^https?:\/\//, '')
+  : window.location.host
+export const WS_PROTOCOL = configuredApiBase
+  ? configuredApiBase.startsWith('https') ? 'wss' : 'ws'
+  : window.location.protocol === 'https:' ? 'wss' : 'ws'
 async function req(path, options) {
   const res = await fetch(`${API_BASE}${path}`, {
     headers: { 'Content-Type': 'application/json' },

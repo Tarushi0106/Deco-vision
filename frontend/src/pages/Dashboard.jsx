@@ -60,7 +60,7 @@ function IntrusionWindowCard() {
         </button>
       </form>
       <div className="stat-tile-sub" style={{ marginTop: '0.5rem' }}>
-        Any person seen on any camera in this window raises an intrusion alert. Leave blank to disable.
+       Anybody seen on any camera in this window raises an intrusion alert. Leave blank to disable.
         {status?.saved && ' Saved.'}
         {status?.error && ` ${status.error}`}
       </div>

@@ -1,4 +1,5 @@
 import base64
+import contextlib
 import json
 import shutil
 import sqlite3
@@ -22,9 +23,19 @@ SEED_MANIFEST = SEED_DIR / "enrolled_faces.json"
 SEED_PHOTOS_DIR = SEED_DIR / "enrollment_photos"
 
 
-def get_connection() -> sqlite3.Connection:
+@contextlib.contextmanager
+def get_connection():
+    """Closed on exit — see alerts_db.get_connection for why this matters
+    (sqlite3's own `with conn:` never closes the connection, which leaked
+    a file descriptor per call and eventually exhausted the process's
+    open-file limit)."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def init_db() -> None:

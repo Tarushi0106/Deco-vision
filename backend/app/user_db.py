@@ -11,6 +11,7 @@ dashboard's Login.jsx — no password, any email works) is untouched: a row
 can have both a login_count from that flow and a password_hash/role from
 this one, independently."""
 
+import contextlib
 import re
 import secrets
 import sqlite3
@@ -27,9 +28,19 @@ ROLE_VIEWER = "viewer"
 ALL_ROLES = (ROLE_SUPER_ADMIN, ROLE_COMPANY_ADMIN, ROLE_OPERATOR, ROLE_VIEWER)
 
 
-def get_connection() -> sqlite3.Connection:
+@contextlib.contextmanager
+def get_connection():
+    """Closed on exit — see alerts_db.get_connection for why this matters
+    (sqlite3's own `with conn:` never closes the connection, which leaked
+    a file descriptor per call and eventually exhausted the process's
+    open-file limit)."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def init_db() -> None:

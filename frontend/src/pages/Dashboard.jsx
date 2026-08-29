@@ -60,7 +60,7 @@ function IntrusionWindowCard() {
         </button>
       </form>
       <div className="stat-tile-sub" style={{ marginTop: '0.5rem' }}>
-        Any person seen on any camera in this window raises an intrusion alert. Leave blank to disable.
+       Anybody seen on any camera in this window raises an intrusion alert. Leave blank to disable.
         {status?.saved && ' Saved.'}
         {status?.error && ` ${status.error}`}
       </div>
@@ -109,7 +109,7 @@ function DetectionRateCard() {
       </form>
       <div className="stat-tile-sub" style={{ marginTop: '0.5rem' }}>
         How often face recognition runs per camera. Lower is easier on the machine, higher is more responsive.
-        Video playback is unaffected either way — recognition runs in its own process.
+        Video playback is unaffected either way â€” recognition runs in its own process.
         {status?.saved && ' Saved.'}
         {status?.error && ` ${status.error}`}
       </div>
@@ -145,27 +145,26 @@ export default function Dashboard() {
       <div className="stat-grid">
         <StatTile
           label="Active Cameras"
-          value={stats ? stats.active_cameras : '—'}
-          sub={stats ? `of ${stats.total_cameras} total` : ''}
+          value={stats ? stats.active_cameras : 'â€”'}
         />
         <StatTile
           label="Faces Enrolled"
-          value={stats ? stats.faces_enrolled : '—'}
+          value={stats ? stats.faces_enrolled : 'â€”'}
           sub="in Allow List"
         />
         <StatTile
           label="Active Alerts"
-          value={stats ? stats.active_alerts : '—'}
+          value={stats ? stats.active_alerts : 'â€”'}
           sub="fall + intrusion, unresolved"
         />
         <StatTile
           label="Detections Today"
-          value={stats ? stats.detections_today : '—'}
+          value={stats ? stats.detections_today : 'â€”'}
           sub="recognized sightings, deduped 30s"
         />
         <StatTile
           label="Footfall Today"
-          value={stats ? `${stats.footfall_in_today} in / ${stats.footfall_out_today} out` : '—'}
+          value={stats ? `${stats.footfall_in_today} in / ${stats.footfall_out_today} out` : 'â€”'}
           sub="midline crossings, all cameras"
         />
         <StatTile
@@ -191,12 +190,12 @@ export default function Dashboard() {
           <div className="camera-grid">
             {cameras.map((cam) =>
               expanded?.id === cam.id ? (
-                // already streaming full-res + overlay in the modal below —
+                // already streaming full-res + overlay in the modal below â€”
                 // avoid opening a second, redundant pair of sockets for the
                 // same camera just to render a thumbnail behind it
                 <div key={cam.id} className="camera-tile card camera-tile-clickable" onClick={() => setExpanded(null)}>
                   <div className="camera-tile-video">
-                    <div className="camera-tile-offline">Viewing below — click to close</div>
+                    <div className="camera-tile-offline">Viewing below â€” click to close</div>
                   </div>
                   <div className="camera-tile-label">
                     <span>{cam.name}</span>

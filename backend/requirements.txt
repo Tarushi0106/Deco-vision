@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+opencv-python
+numpy
+websockets
+python-dotenv
+insightface
+# DirectML build: same onnxruntime API, but can run on the machine's GPU
+# (Intel Iris Xe here) instead of CPU only — measured 5-6x faster inference
+# on this box's real hardware, see recognizer.py's providers list.
+onnxruntime-directml
+requests
+python-multipart
+ultralytics
+psutil
+imageio-ffmpeg
+reportlab

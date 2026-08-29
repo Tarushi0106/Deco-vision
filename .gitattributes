@@ -1,0 +1,15 @@
+# Binary assets — tell git never to attempt a text/line-based merge on these.
+# Without this, a real merge conflict touching one of these files can corrupt
+# it (raw bytes from both sides spliced together with conflict-marker text)
+# instead of just asking you to pick one side cleanly.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.mp4 binary
+*.mp3 binary
+*.db binary
+*.pdf binary
+*.woff binary
+*.woff2 binary

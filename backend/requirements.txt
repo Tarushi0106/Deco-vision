@@ -5,13 +5,16 @@ numpy
 websockets
 python-dotenv
 insightface
-# DirectML build: same onnxruntime API, but can run on the machine's GPU
-# (Intel Iris Xe here) instead of CPU only — measured 5-6x faster inference
-# on this box's real hardware, see recognizer.py's providers list.
-onnxruntime-directml
+onnxruntime
 requests
 python-multipart
 ultralytics
 psutil
 imageio-ffmpeg
 reportlab
+openpyxl
+apscheduler
+pyjwt
+bcrypt
+qrcode[pil]
+slowapi

@@ -4,111 +4,6 @@ import CameraTile from '../components/CameraTile'
 import CameraModal from '../components/CameraModal'
 import './pages.css'
 
-function formatTime(ts) {
-  return new Date(ts * 1000).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })
-}
-
-function formatClipTime(ts) {
-  return new Date(ts * 1000).toLocaleString('en-IN', {
-    day: '2-digit',
-    month: 'short',
-    hour: '2-digit',
-    minute: '2-digit',
-  })
-}
-
-function AttendancePanel() {
-  const [rows, setRows] = useState([])
-
-  useEffect(() => {
-    const load = () => api.getAttendance().then(setRows).catch(() => {})
-    load()
-    const interval = setInterval(load, 15000)
-    return () => clearInterval(interval)
-  }, [])
-
-  return (
-    <div className="card panel">
-      <div className="panel-header">
-        <h3>Today's Attendance</h3>
-      </div>
-      {rows.length === 0 ? (
-        <div className="empty-state">No recognized sightings yet today.</div>
-      ) : (
-        <table>
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th>First Seen</th>
-              <th>Last Seen</th>
-              <th>Cameras</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((row) => (
-              <tr key={row.name}>
-                <td>{row.name}</td>
-                <td>{formatTime(row.first_seen)}</td>
-                <td>{formatTime(row.last_seen)}</td>
-                <td>{row.cameras}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
-    </div>
-  )
-}
-
-function RecentClipsPanel() {
-  const [clips, setClips] = useState([])
-  const [playingClip, setPlayingClip] = useState(null)
-
-  useEffect(() => {
-    const load = () => api.getRecentClips(50).then(setClips).catch(() => {})
-    load()
-    const interval = setInterval(load, 15000)
-    return () => clearInterval(interval)
-  }, [])
-
-  return (
-    <div className="card panel">
-      <div className="panel-header">
-        <h3>Recent Clips</h3>
-        <span className="stat-tile-sub">{clips.length} clip{clips.length === 1 ? '' : 's'}</span>
-      </div>
-
-      {playingClip && (
-        <video
-          key={playingClip.id}
-          src={api.clipVideoUrl(playingClip.id)}
-          controls
-          autoPlay
-          style={{ width: '100%', borderRadius: 8, marginBottom: '0.75rem', background: '#000' }}
-        />
-      )}
-
-      {clips.length === 0 ? (
-        <div className="empty-state">No clips recorded yet.</div>
-      ) : (
-        <div className="clips-list">
-          {clips.map((clip) => (
-            <div
-              key={clip.id}
-              className={`clips-list-row${playingClip?.id === clip.id ? ' clips-list-row-active' : ''}`}
-              onClick={() => setPlayingClip(clip)}
-            >
-              <span>{clip.person_name}</span>
-              <span className="camera-tile-site">{clip.camera_name}</span>
-              <span>{formatClipTime(clip.ts)}</span>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  )
-}
-
 export default function LiveCameras() {
   const [cameras, setCameras] = useState([])
   const [expanded, setExpanded] = useState(null)
@@ -155,11 +50,6 @@ export default function LiveCameras() {
       </div>
 
       {expanded && <CameraModal camera={expanded} onClose={() => setExpanded(null)} />}
-
-      <div className="dashboard-main-grid" style={{ marginTop: '1rem', gridTemplateColumns: '1fr 1fr' }}>
-        <AttendancePanel />
-        <RecentClipsPanel />
-      </div>
     </div>
   )
 }

@@ -1,0 +1,65 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      EC2_HOST: 56.228.1.6
+      EC2_USER: ubuntu
+      APP_DIR: /home/ubuntu/Deco-vision
+
+    steps:
+      - name: Deploy latest main to EC2
+        shell: bash
+        env:
+          EC2_PRIVATE_KEY: ${{ secrets.EC2_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+
+          key_file="$RUNNER_TEMP/deco-vision.pem"
+          printf '%s\n' "$EC2_PRIVATE_KEY" > "$key_file"
+          chmod 600 "$key_file"
+
+          ssh_opts=(-i "$key_file" -o BatchMode=yes -o StrictHostKeyChecking=no)
+          remote="${EC2_USER}@${EC2_HOST}"
+
+          ssh "${ssh_opts[@]}" "$remote" bash -s -- "$APP_DIR" <<'REMOTE'
+          set -euo pipefail
+          app_dir="$1"
+
+          cd "$app_dir"
+          git fetch origin main
+          git reset --hard origin/main
+
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libgl1 ffmpeg
+
+          cd "$app_dir/backend"
+          python3 -m venv venv
+          ./venv/bin/pip install --upgrade pip
+          ./venv/bin/pip install -r requirements.txt
+          sudo systemctl restart deco-vision-backend
+
+          cd "$app_dir/frontend"
+          npm ci
+          npm run build
+          sudo chmod o+x /home/ubuntu
+          sudo nginx -t
+          sudo systemctl reload nginx
+
+          curl --fail --silent --show-error http://127.0.0.1:8811/health >/dev/null
+          curl --fail --silent --show-error http://127.0.0.1/ >/dev/null
+          REMOTE
+
+          rm -f "$key_file"
+          echo "Deployment completed successfully."

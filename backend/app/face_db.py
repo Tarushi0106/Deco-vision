@@ -1,3 +1,7 @@
+import base64
+import contextlib
+import json
+import shutil
 import sqlite3
 import time
 from datetime import datetime
@@ -6,11 +10,32 @@ from pathlib import Path
 import numpy as np
 
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "app.db"
+ENROLLMENT_PHOTOS_DIR = Path(__file__).resolve().parent.parent / "data" / "enrollment_photos"
+
+# One-time export of the currently-enrolled roster (see scripts/export_seed_
+# faces.py) - committed to git under backend/seed_data/, unlike backend/data/
+# itself (gitignored on purpose: it's per-deployment operational data, and
+# enrollment photos alone can run 50+MB, which doesn't belong in every
+# clone). This is how a fresh deployment gets the real roster back without
+# re-enrolling everyone by hand - see seed_enrolled_faces_if_empty() below.
+SEED_DIR = Path(__file__).resolve().parent.parent / "seed_data"
+SEED_MANIFEST = SEED_DIR / "enrolled_faces.json"
+SEED_PHOTOS_DIR = SEED_DIR / "enrollment_photos"
 
 
-def get_connection() -> sqlite3.Connection:
+@contextlib.contextmanager
+def get_connection():
+    """Closed on exit — see alerts_db.get_connection for why this matters
+    (sqlite3's own `with conn:` never closes the connection, which leaked
+    a file descriptor per call and eventually exhausted the process's
+    open-file limit)."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def init_db() -> None:
@@ -31,6 +56,10 @@ def init_db() -> None:
             # row was pulled from, so re-running the camera sync doesn't
             # re-import the same person every time
             conn.execute("ALTER TABLE enrolled_faces ADD COLUMN camera_face_id TEXT")
+        if "employee_id" not in existing_face_cols:
+            # optional HR-facing ID code (e.g. "EMP01"), shown on the
+            # Attendance roster — nobody has one until set explicitly
+            conn.execute("ALTER TABLE enrolled_faces ADD COLUMN employee_id TEXT")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS detection_events (
@@ -47,6 +76,11 @@ def init_db() -> None:
         existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(detection_events)")}
         if "camera_id" not in existing_cols:
             conn.execute("ALTER TABLE detection_events ADD COLUMN camera_id INTEGER")
+        if "score" not in existing_cols:
+            # recognition similarity score (recognizer._match's return value)
+            # at the moment this sighting was logged — powers the Attendance
+            # roster's "Best Match" column
+            conn.execute("ALTER TABLE detection_events ADD COLUMN score REAL")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS footfall_counts (
@@ -59,6 +93,40 @@ def init_db() -> None:
         existing_footfall_cols = {row[1] for row in conn.execute("PRAGMA table_info(footfall_counts)")}
         if "camera_id" not in existing_footfall_cols:
             conn.execute("ALTER TABLE footfall_counts ADD COLUMN camera_id INTEGER")
+
+
+def seed_enrolled_faces_if_empty() -> int:
+    """Loads the committed roster export (backend/seed_data/, see the
+    module docstring comment above SEED_DIR) into a genuinely empty
+    enrolled_faces table — the fresh-deployment bootstrap. Never touches
+    anything if there's already at least one enrolled face, so this is
+    always safe to call on every startup: it only ever does something the
+    very first time a new deployment's database is created. Returns how
+    many faces were seeded (0 if nothing to do)."""
+    if not SEED_MANIFEST.exists():
+        return 0
+    with get_connection() as conn:
+        if conn.execute("SELECT COUNT(*) FROM enrolled_faces").fetchone()[0] > 0:
+            return 0
+
+        manifest = json.loads(SEED_MANIFEST.read_text(encoding="utf-8"))
+        if not manifest:
+            return 0
+
+        ENROLLMENT_PHOTOS_DIR.mkdir(parents=True, exist_ok=True)
+        for entry in manifest:
+            src = SEED_PHOTOS_DIR / entry["source_photo"]
+            dst = ENROLLMENT_PHOTOS_DIR / entry["source_photo"]
+            if src.exists() and not dst.exists():
+                shutil.copy2(src, dst)
+            embedding = np.frombuffer(base64.b64decode(entry["embedding_b64"]), dtype=np.float32)
+            conn.execute(
+                "INSERT INTO enrolled_faces (name, source_photo, embedding, camera_face_id, employee_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (entry["name"], entry["source_photo"], embedding.tobytes(),
+                 entry.get("camera_face_id"), entry.get("employee_id")),
+            )
+        return len(manifest)
 
 
 def add_face(name: str, source_photo: str, embedding: np.ndarray, camera_face_id: str | None = None) -> None:
@@ -107,18 +175,24 @@ def rename_face(old_name: str, new_name: str) -> int:
 
 def load_faces_with_photos() -> list[dict]:
     with get_connection() as conn:
-        rows = conn.execute("SELECT name, source_photo FROM enrolled_faces ORDER BY name").fetchall()
-    grouped: dict[str, list[str]] = {}
-    for name, source_photo in rows:
-        grouped.setdefault(name, []).append(source_photo)
-    return [{"name": name, "photos": photos, "sample_count": len(photos)} for name, photos in grouped.items()]
+        rows = conn.execute("SELECT name, source_photo, employee_id FROM enrolled_faces ORDER BY name").fetchall()
+    grouped: dict[str, dict] = {}
+    for name, source_photo, employee_id in rows:
+        g = grouped.setdefault(name, {"photos": [], "employee_id": None})
+        g["photos"].append(source_photo)
+        if employee_id:
+            g["employee_id"] = employee_id
+    return [
+        {"name": name, "photos": g["photos"], "sample_count": len(g["photos"]), "employee_id": g["employee_id"]}
+        for name, g in grouped.items()
+    ]
 
 
-def log_detection_event(camera_id: int, name: str, bbox: list[int]) -> None:
+def log_detection_event(camera_id: int, name: str, bbox: list[int], score: float | None = None) -> None:
     with get_connection() as conn:
         conn.execute(
-            "INSERT INTO detection_events (ts, camera_id, name, bbox) VALUES (?, ?, ?, ?)",
-            (time.time(), camera_id, name, str(bbox)),
+            "INSERT INTO detection_events (ts, camera_id, name, bbox, score) VALUES (?, ?, ?, ?, ?)",
+            (time.time(), camera_id, name, str(bbox), score),
         )
 
 
@@ -130,6 +204,99 @@ def count_detections_today() -> int:
             "SELECT COUNT(*) FROM detection_events WHERE ts >= ?", (midnight,)
         ).fetchone()
     return row[0]
+
+
+def list_enrolled_roster() -> list[dict]:
+    """Distinct enrolled people (one row per person, not per sample), with
+    their employee_id if one's been set — the base roster the Attendance
+    page cross-references detection_events against to also show who's
+    ABSENT, not just who showed up."""
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT name, MAX(employee_id) AS employee_id FROM enrolled_faces GROUP BY name ORDER BY name"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_employee_id(name: str, employee_id: str | None) -> None:
+    with get_connection() as conn:
+        conn.execute("UPDATE enrolled_faces SET employee_id = ? WHERE name = ?", (employee_id, name))
+
+
+def get_daily_attendance_roster(date: str | None = None) -> dict:
+    """The full day's attendance roster — every ENROLLED person, present or
+    absent, built from list_enrolled_roster() + detection_events. A present
+    person gets check_in/check_out (first/last sighting), which camera the
+    LAST sighting was on, total detections, and the best (highest)
+    recognition score seen that day; an absent person gets nulls and
+    detections=0. This is the whole-roster counterpart to get_attendance()
+    above, which only lists who showed up."""
+    if date is None:
+        date = datetime.now().strftime("%Y-%m-%d")
+    day_start = datetime.strptime(date, "%Y-%m-%d").timestamp()
+    day_end = day_start + 86400
+
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        events = conn.execute(
+            "SELECT name, ts, camera_id, score FROM detection_events "
+            "WHERE ts >= ? AND ts < ? AND name != 'Unknown' ORDER BY ts",
+            (day_start, day_end),
+        ).fetchall()
+
+    by_name: dict[str, dict] = {}
+    for e in events:
+        d = by_name.setdefault(
+            e["name"],
+            {"first_seen": e["ts"], "last_seen": e["ts"], "checkout_camera_id": e["camera_id"],
+             "detections": 0, "best_match": None},
+        )
+        d["first_seen"] = min(d["first_seen"], e["ts"])
+        if e["ts"] >= d["last_seen"]:
+            d["last_seen"] = e["ts"]
+            d["checkout_camera_id"] = e["camera_id"]
+        d["detections"] += 1
+        if e["score"] is not None:
+            d["best_match"] = e["score"] if d["best_match"] is None else max(d["best_match"], e["score"])
+
+    roster = []
+    for person in list_enrolled_roster():
+        name = person["name"]
+        d = by_name.get(name)
+        if d:
+            roster.append({
+                "name": name,
+                "employee_id": person["employee_id"],
+                "present": True,
+                "check_in": d["first_seen"],
+                "check_out": d["last_seen"],
+                "checkout_camera_id": d["checkout_camera_id"],
+                "time_stay_seconds": round(d["last_seen"] - d["first_seen"]),
+                "detections": d["detections"],
+                "best_match": d["best_match"],
+            })
+        else:
+            roster.append({
+                "name": name,
+                "employee_id": person["employee_id"],
+                "present": False,
+                "check_in": None,
+                "check_out": None,
+                "checkout_camera_id": None,
+                "time_stay_seconds": None,
+                "detections": 0,
+                "best_match": None,
+            })
+
+    present_count = sum(1 for r in roster if r["present"])
+    return {
+        "date": date,
+        "present": present_count,
+        "absent": len(roster) - present_count,
+        "total_detections": len(events),
+        "roster": roster,
+    }
 
 
 def get_attendance(date: str | None = None) -> list[dict]:
@@ -192,6 +359,44 @@ def get_attendance_report(name: str, start_date: str, end_date: str) -> list[dic
     return result
 
 
+def get_person_day_sessions(
+    name: str, camera_id: int, date: str,
+    grace_seconds: float, max_duration_seconds: float, min_duration_seconds: float,
+) -> list[dict]:
+    """Reconstructs presence sessions (ts, duration) for one person on one
+    camera/day purely from detection_events — the same gap/chapter grouping
+    pipeline.py's _update_clip_sessions uses live, just applied retroactively.
+    detection_events is never pruned (unlike the old clips table, which used
+    to cap at 30/person before that cap was removed), so this can rebuild
+    "all the clips of that day" even for sightings whose clips row was
+    deleted by that old cap or never created at all. See main.py's
+    /api/people/{name}/clips-for-day, which uses this to backfill missing
+    clips rows for replay-capable cameras."""
+    day_start = datetime.strptime(date, "%Y-%m-%d").timestamp()
+    day_end = day_start + 86400
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT ts FROM detection_events WHERE name = ? AND camera_id = ? AND ts >= ? AND ts < ? ORDER BY ts",
+            (name, camera_id, day_start, day_end),
+        ).fetchall()
+
+    sessions = []
+    session_start = session_last = None
+    for (ts,) in rows:
+        if session_start is None:
+            session_start = session_last = ts
+        elif ts - session_last > grace_seconds or ts - session_start >= max_duration_seconds:
+            duration = max(session_last - session_start, min_duration_seconds * 2)
+            sessions.append({"ts": session_start, "duration": duration})
+            session_start = session_last = ts
+        else:
+            session_last = ts
+    if session_start is not None:
+        duration = max(session_last - session_start, min_duration_seconds * 2)
+        sessions.append({"ts": session_start, "duration": duration})
+    return sessions
+
+
 def get_person_analytics(days: int = 7) -> list[dict]:
     """Per-person visit patterns over the last N days, built from
     detection_events (already deduped 30s per person/camera) — no new
@@ -241,6 +446,55 @@ def log_footfall(camera_id: int, direction: str) -> None:
             "INSERT INTO footfall_counts (ts, camera_id, direction) VALUES (?, ?, ?)",
             (time.time(), camera_id, direction),
         )
+
+
+def get_people_counting_report(date: str | None = None) -> dict:
+    """Raw IN/OUT midline-crossing counts for one day (see person_tracker.py)
+    — every crossing counted, no identity, no dedup, unlike footfall_db's
+    unique-footfall report (embedding-based, one row per distinct visit).
+    This is the "people counting" view: total traffic through each camera's
+    frame, not distinct visitors. Caller (main.py) attaches camera_name,
+    matching how every other report in this app does it."""
+    if date is None:
+        date = datetime.now().strftime("%Y-%m-%d")
+    day_start = datetime.strptime(date, "%Y-%m-%d").timestamp()
+    day_end = day_start + 86400
+
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT ts, camera_id, direction FROM footfall_counts WHERE ts >= ? AND ts < ? ORDER BY ts",
+            (day_start, day_end),
+        ).fetchall()
+
+    hourly_in, hourly_out = [0] * 24, [0] * 24
+    by_camera: dict[int, dict] = {}
+    events = []
+    total_in = total_out = 0
+    for row in rows:
+        event = dict(row)
+        events.append(event)
+        hour = datetime.fromtimestamp(event["ts"]).hour
+        cam = by_camera.setdefault(event["camera_id"], {"camera_id": event["camera_id"], "in": 0, "out": 0})
+        if event["direction"] == "in":
+            hourly_in[hour] += 1
+            cam["in"] += 1
+            total_in += 1
+        else:
+            hourly_out[hour] += 1
+            cam["out"] += 1
+            total_out += 1
+
+    return {
+        "date": date,
+        "total_in": total_in,
+        "total_out": total_out,
+        "total": total_in + total_out,
+        "hourly_in": hourly_in,
+        "hourly_out": hourly_out,
+        "by_camera": sorted(by_camera.values(), key=lambda c: c["camera_id"]),
+        "events": events,
+    }
 
 
 def count_footfall_today() -> dict:

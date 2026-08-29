@@ -4,6 +4,7 @@ detection event (see pipeline.py's CameraPipeline), so Analytics can show
 """
 
 from __future__ import annotations
+import contextlib
 import sqlite3
 import time
 from pathlib import Path
@@ -11,10 +12,29 @@ from pathlib import Path
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "app.db"
 CLIPS_DIR = Path(__file__).resolve().parent.parent / "data" / "clips"
 
+# Sentinel file_path for a replay-camera clip whose fetch was attempted and
+# came back with no footage (the camera's own onboard recording has already
+# overwritten that window - confirmed live, see onvif_client.py). Distinct
+# from "" (never attempted yet): a "" clip is still a live candidate for
+# on-demand or background prefetch; this one is a settled miss, never
+# retried again, so a doomed 2-3 minute fetch isn't repeated on every play
+# click or every prefetch pass.
+UNAVAILABLE_SENTINEL = "unavailable"
 
-def get_connection() -> sqlite3.Connection:
+
+@contextlib.contextmanager
+def get_connection():
+    """Closed on exit — see alerts_db.get_connection for why this matters
+    (sqlite3's own `with conn:` never closes the connection, which leaked
+    a file descriptor per call and eventually exhausted the process's
+    open-file limit)."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def init_db() -> None:
@@ -63,15 +83,6 @@ def list_clips_for_person(person_name: str, limit: int = 50) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def list_recent_clips(limit: int = 50) -> list[dict]:
-    with get_connection() as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT * FROM clips ORDER BY ts DESC LIMIT ?", (limit,)
-        ).fetchall()
-    return [dict(r) for r in rows]
-
-
 def count_clips_for_person(person_name: str) -> int:
     with get_connection() as conn:
         row = conn.execute("SELECT COUNT(*) FROM clips WHERE person_name = ?", (person_name,)).fetchone()
@@ -85,15 +96,52 @@ def get_clip(clip_id: int) -> dict | None:
     return dict(row) if row else None
 
 
-def prune_old_clips(person_name: str, keep: int) -> None:
-    """Keep only the most recent `keep` clips for this person — clip files
-    are small but unbounded retention would fill the disk over time."""
+def set_clip_file_path(clip_id: int, file_path: str) -> None:
+    """Fills in a replay-camera clip's file_path after its first on-demand
+    fetch from the camera (see onvif_client.py) - caches the result so
+    every later play of the same clip is instant instead of re-fetching.
+    Also used to write UNAVAILABLE_SENTINEL after a failed fetch."""
+    with get_connection() as conn:
+        conn.execute("UPDATE clips SET file_path = ? WHERE id = ?", (file_path, clip_id))
+
+
+def list_pending_replay_clips(camera_ids: list[int], retention_days: float, limit: int) -> list[dict]:
+    """Clips on a replay camera (config.CAMERA_ONVIF_REPLAY_CHANNEL) that
+    haven't been fetched yet (file_path == "", never attempted - see
+    UNAVAILABLE_SENTINEL for a settled miss) and are still within the
+    retention window - the backlog replay_prefetch.py works through in the
+    background so clips are cached ahead of anyone clicking Play. Newest
+    first: a recent clip is both more likely to still be on the camera's
+    own storage and more likely to matter to someone browsing right now."""
+    if not camera_ids:
+        return []
+    cutoff = time.time() - retention_days * 86400
+    placeholders = ",".join("?" * len(camera_ids))
     with get_connection() as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT id, file_path FROM clips WHERE person_name = ? ORDER BY ts DESC",
-            (person_name,),
+            f"SELECT id, camera_id, ts, duration FROM clips "
+            f"WHERE camera_id IN ({placeholders}) AND file_path = '' AND ts >= ? "
+            f"ORDER BY ts DESC LIMIT ?",
+            (*camera_ids, cutoff, limit),
         ).fetchall()
-        for row in rows[keep:]:
-            Path(row["file_path"]).unlink(missing_ok=True)
-            conn.execute("DELETE FROM clips WHERE id = ?", (row["id"],))
+    return [dict(r) for r in rows]
+
+
+def delete_expired_clips(retention_days: float) -> int:
+    """Deletes clips (row + local video file, if any) older than
+    retention_days - the rolling recording-history window (see
+    config.CLIP_RETENTION_DAYS), run daily by scheduler.py. Files are
+    removed before their row so a crash mid-prune can only leave a stray
+    orphaned file (wastes disk, harmless) rather than a DB row pointing at
+    an already-deleted file (would 404 confusingly on play). Returns how
+    many clips were deleted."""
+    cutoff = time.time() - retention_days * 86400
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT id, file_path FROM clips WHERE ts < ?", (cutoff,)).fetchall()
+        for row in rows:
+            if row["file_path"] and row["file_path"] != UNAVAILABLE_SENTINEL:
+                Path(row["file_path"]).unlink(missing_ok=True)
+        conn.execute("DELETE FROM clips WHERE ts < ?", (cutoff,))
+    return len(rows)

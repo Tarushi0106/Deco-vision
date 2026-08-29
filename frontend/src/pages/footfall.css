@@ -1,0 +1,160 @@
+/* Chart tokens for the Footfall dashboard — categorical/sequential slots the
+   rest of theme.css doesn't need. Values are the validated default palette
+   (see the dataviz skill's references/palette.md), re-checked against this
+   app's actual card surfaces (#ffffff light / #171b24 dark). */
+.viz-root {
+  --viz-sequential: #2a78d6;
+  --viz-cat-1: #2a78d6;
+  --viz-cat-2: #eb6834;
+  --viz-cat-3: #1baf7a;
+  --viz-cat-4: #eda100;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .viz-root {
+    --viz-sequential: #3987e5;
+    --viz-cat-1: #3987e5;
+    --viz-cat-2: #d95926;
+    --viz-cat-3: #199e70;
+    --viz-cat-4: #c98500;
+  }
+}
+
+:root[data-theme="dark"] .viz-root {
+  --viz-sequential: #3987e5;
+  --viz-cat-1: #3987e5;
+  --viz-cat-2: #d95926;
+  --viz-cat-3: #199e70;
+  --viz-cat-4: #c98500;
+}
+
+.footfall-charts-grid {
+  display: grid;
+  grid-template-columns: 1.3fr 1fr;
+  gap: 1rem;
+  align-items: start;
+}
+
+.viz-chart-wrap {
+  position: relative;
+}
+
+.viz-svg {
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
+
+.viz-baseline {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+
+.viz-bar-sequential {
+  fill: var(--viz-sequential);
+  cursor: pointer;
+  transition: filter 0.1s ease;
+}
+
+.viz-bar {
+  cursor: pointer;
+  transition: filter 0.1s ease;
+}
+
+.viz-bar-sequential:hover,
+.viz-bar-sequential:focus-visible,
+.viz-bar:hover,
+.viz-bar:focus-visible {
+  filter: brightness(1.12);
+  outline: none;
+}
+
+.viz-bar-hover {
+  filter: brightness(1.12);
+}
+
+.viz-bar-label {
+  fill: var(--text);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.viz-axis-label {
+  fill: var(--text-faint);
+  font-size: 9px;
+}
+
+.viz-row-label {
+  fill: var(--text-muted);
+  font-size: 11px;
+  dominant-baseline: middle;
+}
+
+.viz-bar-end-label {
+  fill: var(--text);
+  font-size: 11px;
+  font-weight: 600;
+  dominant-baseline: middle;
+}
+
+.viz-tooltip {
+  position: absolute;
+  transform: translate(-50%, -100%);
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.35rem 0.6rem;
+  box-shadow: 0 4px 12px rgba(16, 24, 40, 0.12);
+  pointer-events: none;
+  white-space: nowrap;
+  z-index: 5;
+}
+
+.viz-tooltip-value {
+  font-size: 0.85rem;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.viz-tooltip-label {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+.footfall-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.footfall-gate-editor {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  background: #0d0f14;
+  border-radius: 8px;
+  overflow: hidden;
+  cursor: crosshair;
+  user-select: none;
+}
+
+.footfall-gate-video,
+.footfall-gate-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.footfall-gate-overlay {
+  pointer-events: none;
+}
+
+.footfall-gate-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}

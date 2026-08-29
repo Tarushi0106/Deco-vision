@@ -5,6 +5,7 @@ has credentials for ("exit", "Main gate camera", "Technical section" —
 the latter two are separate RTSP channels off the same NVR unit).
 """
 
+import contextlib
 import sqlite3
 from pathlib import Path
 
@@ -13,9 +14,19 @@ from . import config
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "app.db"
 
 
-def get_connection() -> sqlite3.Connection:
+@contextlib.contextmanager
+def get_connection():
+    """Closed on exit — see alerts_db.get_connection for why this matters
+    (sqlite3's own `with conn:` never closes the connection, which leaked
+    a file descriptor per call and eventually exhausted the process's
+    open-file limit)."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def init_db() -> None:

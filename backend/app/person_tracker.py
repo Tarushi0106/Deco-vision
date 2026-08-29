@@ -8,8 +8,17 @@ across different camera views.
 import math
 import time
 
-MAX_MATCH_DISTANCE = 80  # pixels between samples — tune if footfall misses fast walkers
-TRACK_TIMEOUT_SECONDS = 2.0
+# Both tuned around detection_worker.POSE_INTERVAL_SECONDS (20s) — pose
+# detection only samples each camera that infrequently, so a track has to
+# survive a full ~20s gap between samples to ever be matched again. The
+# original TRACK_TIMEOUT_SECONDS=2.0 pruned every track before the NEXT
+# sample could ever arrive, so best_id was always None and a footfall event
+# could structurally never fire — confirmed live: footfall_counts had zero
+# rows, ever, despite this code path running continuously. MAX_MATCH_DISTANCE
+# raised to match: 80px assumed near-continuous sampling, but a person can
+# walk a large fraction of the frame in 20s.
+MAX_MATCH_DISTANCE = 250  # pixels between samples — tune if footfall misses fast walkers or double-counts crowds
+TRACK_TIMEOUT_SECONDS = 45.0  # > 2x POSE_INTERVAL_SECONDS, tolerates one late/missed sample
 FALL_CONSECUTIVE_SAMPLES = 3  # ~60s at the current 20s pose-detection cadence (detection_worker.POSE_INTERVAL_SECONDS)
 FALL_ANGLE_THRESHOLD_DEGREES = 60  # torso more horizontal than this = "down"
 KEYPOINT_CONF_THRESHOLD = 0.5

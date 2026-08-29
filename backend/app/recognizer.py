@@ -20,26 +20,26 @@ class FaceRecognizer:
     """
 
     def __init__(self):
-        # Benchmarked on this machine's real hardware (Intel Iris Xe iGPU, no
-        # discrete GPU): DirectML ran det_10g at ~92ms and w600k_r50 at ~122ms
-        # vs. 557ms/587ms on CPU — a 5-6x speedup, measured even while the CPU
-        # was already busy with capture/API/other processes (onnxruntime-directml
-        # is now the installed package; CPUExecutionProvider stays listed as a
-        # fallback for any op DirectML doesn't support, and for machines with
-        # no usable GPU at all). This budget is what pays for the higher
-        # det_size below without reintroducing the CPU-oversubscription lag
-        # this session already fixed once.
-        self._app = FaceAnalysis(name="buffalo_l", providers=["DmlExecutionProvider", "CPUExecutionProvider"])
-        # Raised from 640: on the Technical section camera (2880x1620, wide
-        # multi-person view), a fully frontal, unobstructed face was measured
-        # getting ZERO detection at 640 — det_size that small only gives a
-        # face that occupies a small fraction of a wide scene a handful of
-        # real pixels to work with. Must move together with
-        # detection_worker.DETECTION_DOWNSCALE_MAX_DIM — that pre-resize
-        # happens BEFORE the frame ever reaches this det_size, so raising
-        # only one of the two just moves the same bottleneck, it doesn't
-        # remove it.
+        # Tried DmlExecutionProvider (Intel Iris Xe iGPU) this session: an
+        # isolated micro-benchmark of det_10g/w600k_r50 alone on synthetic
+        # input showed a promising 5-6x speedup, but the REAL pipeline
+        # (FaceAnalysis.get() chaining 5 models — detection, landmark_3d_68,
+        # landmark_2d_106, genderage, recognition — per face, at higher
+        # resolution, on a real frame) measured 30-38 SECONDS per frame on
+        # DirectML, worse than CPU by a huge margin — froze live detection
+        # results entirely. Reverted. A single isolated model's synthetic
+        # benchmark does not predict this pipeline's real behavior; don't
+        # trust one without re-measuring the actual end-to-end call.
         #
+        # Tried capping intra_op_num_threads here to reduce peak CPU% per
+        # call — measurement showed it backfired: the real problem is each
+        # call blocking the GIL/event loop for its full wall-clock duration,
+        # and fewer threads means each call takes LONGER to finish (more
+        # blocked time), not less. Left at onnxruntime's default (use
+        # available cores, finish fast) and controlling total impact via
+        # DETECTION_INTERVAL_SECONDS/PERSON_ANALYSIS_INTERVAL_SECONDS
+        # (how often it's called) instead, in pipeline.py.
+        self._app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
         # Measured on the live Entry/Exit camera: real faces score 0.78-0.87
         # det_score, but at the old 0.5 threshold this office's busy patterned
         # wall graphics/glass reflections occasionally clear the bar as a
@@ -49,7 +49,7 @@ class FaceRecognizer:
         # surfacing as a wrong name on an empty patch of wall. Raised to keep
         # full margin below real faces while cutting off that low-confidence
         # band the phantoms lived in.
-        self._app.prepare(ctx_id=-1, det_size=(1280, 1280), det_thresh=0.65)
+        self._app.prepare(ctx_id=-1, det_size=(640, 640), det_thresh=0.65)
         self._reload_enrolled()
 
     def _reload_enrolled(self) -> None:

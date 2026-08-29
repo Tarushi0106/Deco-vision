@@ -63,7 +63,7 @@ function IntrusionWindowCard() {
         </button>
       </form>
       <div className="stat-tile-sub" style={{ marginTop: '0.5rem' }}>
-        Any person seen on any camera in this window raises an intrusion alert. Leave blank to disable.
+        Anybody seen on any camera in this window raises an intrusion alert. Leave blank to disable.
         {status?.saved && ' Saved.'}
         {status?.error && ` ${status.error}`}
       </div>
@@ -171,6 +171,16 @@ export default function Dashboard() {
           label="Footfall Today"
           value={stats ? `${stats.footfall_in_today} in / ${stats.footfall_out_today} out` : '—'}
           sub="midline crossings, all cameras"
+        />
+        <StatTile
+          label="Cameras Given"
+          value={stats ? stats.cameras_assigned : '—'}
+          sub={stats ? `of ${stats.total_cameras} total, via a license` : ''}
+        />
+        <StatTile
+          label="Cameras Accessed"
+          value={stats ? stats.cameras_accessed : '—'}
+          sub="assigned cameras currently live"
         />
       </div>
 

@@ -8,8 +8,9 @@ import CameraManagement from './pages/CameraManagement'
 import Intrusion from './pages/Intrusion'
 import Sites from './pages/Sites'
 import Attendance from './pages/Attendance'
-import AttendanceReport from './pages/AttendanceReport'
 import Analytics from './pages/Analytics'
+import Footfall from './pages/Footfall'
+import LicenseManagement from './pages/LicenseManagement'
 import './theme.css'
 
 const PAGES = [
@@ -20,13 +21,12 @@ const PAGES = [
   { path: '/intrusion', title: 'Intrusion', breadcrumb: 'Deco Vision / Intrusion', element: <Intrusion /> },
   { path: '/sites', title: 'Sites', breadcrumb: 'Deco Vision / Sites', element: <Sites /> },
   { path: '/attendance', title: 'Attendance', breadcrumb: 'Deco Vision / Attendance', element: <Attendance /> },
+  { path: '/analytics', title: 'Workforce Analytics', breadcrumb: 'Deco Vision / Workforce Analytics', element: <Analytics /> },
+  { path: '/footfall', title: 'Footfall', breadcrumb: 'Deco Vision / Footfall', element: <Footfall /> },
   {
-    path: '/attendance-report',
-    title: 'Attendance Report',
-    breadcrumb: 'Deco Vision / Attendance / Report',
-    element: <AttendanceReport />,
+    path: '/license-management', title: 'License & Camera Access',
+    breadcrumb: 'Deco Vision / License & Camera Access', element: <LicenseManagement />,
   },
-  { path: '/analytics', title: 'Analytics', breadcrumb: 'Deco Vision / Analytics', element: <Analytics /> },
 ]
 
 function App() {

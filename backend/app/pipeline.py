@@ -33,8 +33,11 @@ try:
 except ImportError:
     psutil = None
 
-from . import alerts_db, camera_db, clips_db, face_db, zones_db
+from . import alerts_db, camera_db, clips_db, config, face_db, footfall_gate_db, zones_db
+from .desk_tracker import DeskTracker
 from .detection_worker import run_worker
+from .footfall_counter import FootfallCounter, resolve_footfall_camera_ids
+from .gate_tracker import GateTracker
 from .video_source import RtspSource, WebcamSource
 
 logger = logging.getLogger("dashboard.pipeline")
@@ -54,6 +57,16 @@ JPEG_QUALITY = 80
 # high-res re-check (see detection_worker.py) instead of a blanket downscale.
 VIDEO_ENCODE_INTERVAL_SECONDS = 1 / 15  # matches main.py's VIDEO_FPS — no point encoding faster than that
 STALE_SOURCE_TIMEOUT_SECONDS = 5  # force-reconnect a capture source that's stopped delivering frames
+# Diagnosed live: camera 1 rejected login with "number of user logins has
+# exceeded the limit" — the device's own brute-force lockout, most likely
+# self-inflicted by this loop's old fixed 3s retry hammering the login
+# endpoint through an auth failure (transient network blip, device reboot,
+# whatever the original cause) for as long as this process had been running.
+# Backing off exponentially means a real outage gets retried patiently instead
+# of continuously re-triggering/extending a device-side lockout; a successful
+# reconnect resets it back to the base delay immediately.
+RECONNECT_BASE_DELAY_SECONDS = 3
+RECONNECT_MAX_DELAY_SECONDS = 60
 DEFAULT_DETECTION_FPS = 1  # how often frames are sent to the worker for face recognition; user-configurable
 SETTINGS_POLL_INTERVAL_SECONDS = 2  # how often the sender thread re-reads detection_fps from settings
 # onnxruntime (face rec) and YOLO both default to spawning threads across every
@@ -68,8 +81,8 @@ WORKER_MAX_CPU_CORES = 4
 # out and gets silently misreported as "no face detected" — the worker only
 # checks embed_request_queue BETWEEN frames, never mid-frame, and a busy
 # multi-person camera's detect cycle (see detection_worker.py's
-# MAX_FULL_RES_RECHECKS comment: measured 11+s on an 8-face frame) can run
-# longer than the old 10s budget while 3 live cameras keep it fed.
+# MAX_FULL_RES_RECHECKS comment) can run longer than the old 10s budget
+# while multiple live cameras keep it fed.
 EMBED_REQUEST_TIMEOUT_SECONDS = 25
 # how long an after-hours intrusion alert stays "fresh" before it's allowed
 # to fire again for the same camera — otherwise it would refire every sample
@@ -95,7 +108,11 @@ CLIP_BUFFER_SECONDS = CLIP_PRE_SECONDS + 2  # rolling buffer used only to seed t
 PRESENCE_GRACE_SECONDS = 60  # how long to keep a clip open after the person's last recognition hit
 MAX_CLIP_DURATION_SECONDS = 300  # cap a single clip (e.g. someone sitting for an hour) — chapters into new clips past this
 MIN_CLIP_DURATION_SECONDS = 1.5  # discard clips shorter than this — a single flickered detection, not a real visit
-MAX_CLIPS_PER_PERSON = 30  # retention cap — older clips (file + row) are deleted past this
+# No retention cap — clips are kept indefinitely per explicit request (Daily
+# Activity search needs full history, not just the most recent slice). This
+# is a deliberate disk-usage tradeoff: ~3.4MB/clip measured, unbounded
+# growth over time. Revisit with a time-based cap (e.g. keep N days) instead
+# of a count-based one if disk space becomes a real constraint.
 # Measured this session: 3 clips finalizing around the same time each spawned their own
 # ffmpeg transcode with no thread cap, pegging all 12 logical cores to 100% on top of the
 # already-pinned recognition worker — the exact "everything is slow" oversubscription
@@ -123,9 +140,14 @@ class CameraPipeline:
         # running it inline in the capture loop (below) directly stole time from reading/
         # encoding the next camera frame, which showed up as live-feed lag even though
         # recognition itself (a separate process) was unaffected. Moved to its own thread,
-        # fed by this small drop-if-full queue, so clip encoding can NEVER block capture —
-        # worst case a clip frame is skipped, never the live view stuttering.
-        self._clip_frame_queue: "queue.Queue" = queue.Queue(maxsize=2)
+        # fed by this drop-if-full queue, so clip encoding can NEVER block capture — worst
+        # case a clip frame is skipped, never the live view stuttering. Sized for ~30s of
+        # buffering at the 15fps encode rate (was 2 — ~130ms — until diagnosed live: any
+        # transient load on the writer thread silently dropped frames, so a clip's reported
+        # duration (wall-clock presence span) could end up far longer than its actual
+        # playable video (fewer frames than that span implies at 15fps) — see
+        # _open_clip_session's frames_written tracking for the other half of that fix.
+        self._clip_frame_queue: "queue.Queue" = queue.Queue(maxsize=450)
         self._clip_thread: threading.Thread | None = None
         # last time each name was seen in a recognition result — written by
         # set_detections() (called from PipelineManager's receiver thread),
@@ -186,7 +208,7 @@ class CameraPipeline:
             if now - last < DETECTION_LOG_COOLDOWN_SECONDS:
                 continue
             self._last_logged[name] = now
-            face_db.log_detection_event(self.camera_id, name, det["bbox"])
+            face_db.log_detection_event(self.camera_id, name, det["bbox"], score=det.get("score"))
 
     def _update_clip_sessions(self, frame, now: float) -> None:
         """Called once per encoded frame from the capture loop (never from
@@ -195,7 +217,14 @@ class CameraPipeline:
         keeps writing frames to it every tick they're still within
         PRESENCE_GRACE_SECONDS of their last recognition hit, and finalizes
         it once they've been gone that long (or the clip hits the max
-        duration cap, in which case it chapters into a fresh one)."""
+        duration cap, in which case it chapters into a fresh one).
+
+        For a camera in config.CAMERA_ONVIF_REPLAY_CHANNEL, "the clip" is
+        just this start/end timestamp window — no local frames are ever
+        written; playback fetches the same window straight from the
+        camera's own recording on demand (see onvif_client.py / main.py's
+        /api/clips/{id}/video)."""
+        is_replay_camera = self.camera_id in config.CAMERA_ONVIF_REPLAY_CHANNEL
         with self._presence_lock:
             last_detection_snapshot = dict(self._last_detection)
 
@@ -204,16 +233,22 @@ class CameraPipeline:
                 continue
             session = self._active_clip_sessions.get(name)
             if session is None:
-                session = self._open_clip_session(name, now, frame)
+                session = (
+                    {"start_ts": now, "last_written_ts": now, "replay": True}
+                    if is_replay_camera
+                    else self._open_clip_session(name, now, frame)
+                )
                 if session is None:
                     continue
                 self._active_clip_sessions[name] = session
                 self._active_names = frozenset(self._active_clip_sessions)
-            try:
-                out_w, out_h = session["out_size"]
-                session["writer"].write(cv2.resize(frame, (out_w, out_h)) if frame.shape[1::-1] != (out_w, out_h) else frame)
-            except Exception:
-                logger.exception("Camera %s: failed writing clip frame for %s", self.camera_id, name)
+            if not session.get("replay"):
+                try:
+                    out_w, out_h = session["out_size"]
+                    session["writer"].write(cv2.resize(frame, (out_w, out_h)) if frame.shape[1::-1] != (out_w, out_h) else frame)
+                    session["frames_written"] += 1
+                except Exception:
+                    logger.exception("Camera %s: failed writing clip frame for %s", self.camera_id, name)
             session["last_written_ts"] = now
             if now - session["start_ts"] >= MAX_CLIP_DURATION_SECONDS:
                 self._finalize_clip_session(name, session)
@@ -262,6 +297,7 @@ class CameraPipeline:
             return {
                 "writer": writer, "raw_path": raw_path, "file_path": file_path,
                 "start_ts": start_ts, "last_written_ts": now, "out_size": (out_width, out_height),
+                "fps": fps, "frames_written": len(pre_roll),
             }
         except Exception:
             logger.exception("Camera %s: failed to open clip for %s", self.camera_id, name)
@@ -273,12 +309,31 @@ class CameraPipeline:
         thread so a multi-minute clip can't stall this camera's live capture
         loop. Safe to run off-thread: by the time this is called, `session`
         has already been removed from _active_clip_sessions by the caller."""
+        if session.get("replay"):
+            # No local file was ever written — the DB row's start_ts/duration
+            # IS the clip; playback fetches those exact seconds from the
+            # camera's own recording when actually requested. Cheap enough
+            # to log inline, no background thread needed. Wall-clock is the
+            # right measure here (unlike the local-recording path below) —
+            # there's no frame queue/writer to drop frames from.
+            duration = session["last_written_ts"] - session["start_ts"]
+            if duration >= MIN_CLIP_DURATION_SECONDS:
+                clips_db.log_clip(name, self.camera_id, session["start_ts"], duration, "")
+            return
+
+        # The reported/logged duration is the actual video's length (frame
+        # count / fps), NOT the wall-clock presence span used above — they
+        # can diverge if the writer thread ever fell behind and frames got
+        # dropped (see _clip_frame_queue's sizing comment). Using the real
+        # frame count means the number shown always matches what's actually
+        # playable, even in a worst case where drops still happen.
+        duration = session["frames_written"] / session["fps"]
+
         try:
             session["writer"].release()
         except Exception:
             logger.exception("Camera %s: failed to release writer for %s", self.camera_id, name)
             return
-        duration = session["last_written_ts"] - session["start_ts"]
         if duration < MIN_CLIP_DURATION_SECONDS:
             Path(session["raw_path"]).unlink(missing_ok=True)
             return
@@ -309,7 +364,6 @@ class CameraPipeline:
                 )
                 return
             clips_db.log_clip(name, self.camera_id, session["start_ts"], duration, str(file_path))
-            clips_db.prune_old_clips(name, MAX_CLIPS_PER_PERSON)
         except Exception:
             logger.exception("Camera %s: failed to transcode/log clip for %s", self.camera_id, name)
         finally:
@@ -340,12 +394,14 @@ class CameraPipeline:
         source = None
         last_frame_at = time.time()
         last_encode_at = 0.0
+        retry_delay = RECONNECT_BASE_DELAY_SECONDS
         while self._running:
             try:
                 if source is None:
                     source = self._create_source()
                     logger.info("Camera %s: video source opened", self.camera_id)
                     last_frame_at = time.time()
+                    retry_delay = RECONNECT_BASE_DELAY_SECONDS  # a successful open resets the backoff
 
                 frame = source.get_frame()
                 if frame is None:
@@ -382,9 +438,11 @@ class CameraPipeline:
                         pass  # clip writer thread is behind — drop this tick's frame rather than block capture
 
             except RuntimeError as e:
-                logger.error("Camera %s: video source error: %s — retrying in 3s", self.camera_id, e)
+                logger.error("Camera %s: video source error: %s — retrying in %ds",
+                              self.camera_id, e, retry_delay)
                 source = None
-                time.sleep(3)
+                time.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, RECONNECT_MAX_DELAY_SECONDS)
 
         if source is not None:
             source.release()
@@ -428,6 +486,30 @@ class PipelineManager:
         self._embed_response_queue: multiprocessing.Queue = multiprocessing.Queue()
         self._worker_process: multiprocessing.Process | None = None
 
+        # Unique footfall (people counting) — see footfall_counter.py. Lives
+        # here, in the main process, because its in-memory dedup cache needs
+        # to persist across the worker's whole lifetime and it writes to the
+        # DB, which (like every other DB module) this process owns, not the
+        # worker. Constructed in start() rather than here: pipeline_manager
+        # is a module-level singleton built at import time, before main.py's
+        # startup handler has called footfall_db.init_db() — building it
+        # this early would query a table that doesn't exist yet.
+        self._footfall_counter: FootfallCounter | None = None
+        # camera IDs config.FOOTFALL_CAMERAS resolves to — recomputed in
+        # start() and refresh_cameras() so a camera rename/add/remove is
+        # picked up without a restart. Only faces from cameras in this set
+        # ever reach the footfall counter (see _dispatch_result).
+        self._footfall_camera_ids: set[int] = set()
+
+        # Desk-time analytics — see desk_tracker.py. Same startup-ordering
+        # constraint and reason as _footfall_counter above (desk_db.init_db()
+        # hasn't run yet at import time).
+        self._desk_tracker: DeskTracker | None = None
+
+        # Footfall gate-line crossing — see gate_tracker.py. Same
+        # startup-ordering constraint as the two above.
+        self._gate_tracker: GateTracker | None = None
+
         self._running = False
         self._sender_thread: threading.Thread | None = None
         self._receiver_thread: threading.Thread | None = None
@@ -451,7 +533,38 @@ class PipelineManager:
         except Exception as e:
             logger.warning("Could not set detection worker CPU affinity: %s", e)
 
+    def _refresh_footfall_cameras(self) -> None:
+        resolved = resolve_footfall_camera_ids(camera_db.list_cameras())
+        if resolved != self._footfall_camera_ids:
+            self._footfall_camera_ids = resolved
+            logger.info("Footfall counting enabled on camera ID(s): %s", sorted(resolved) or "none")
+
+    def refresh_desk_zones(self) -> None:
+        """Call after any /api/desk-zones CRUD so a new/edited/deleted zone
+        takes effect immediately."""
+        if self._desk_tracker is not None:
+            self._desk_tracker.refresh_zones()
+
+    def get_desk_status(self) -> dict[str, dict]:
+        """Live (right-now) per-employee desk status — see
+        DeskTracker.get_live_status(). Only meaningful for "today"; the
+        Desk Analytics report merges this in for today's date only."""
+        if self._desk_tracker is None:
+            return {}
+        return self._desk_tracker.get_live_status()
+
+    def refresh_footfall_gate(self) -> None:
+        """Call after any /api/footfall-gate CRUD so a new/edited/deleted
+        gate line takes effect immediately."""
+        if self._gate_tracker is not None:
+            self._gate_tracker.refresh_gates()
+
     def start(self) -> None:
+        self._footfall_counter = FootfallCounter()
+        self._refresh_footfall_cameras()
+        self._desk_tracker = DeskTracker()
+        self._gate_tracker = GateTracker(footfall_gate_db)
+
         self._worker_process = multiprocessing.Process(
             target=run_worker,
             args=(
@@ -513,6 +626,7 @@ class PipelineManager:
         just the password would leave the pipeline running on its already
         -open, old-credentials connection until that connection happened to
         drop on its own."""
+        self._refresh_footfall_cameras()
         cameras = {c["id"]: c for c in camera_db.list_cameras()}
 
         for camera_id in list(self._pipelines):
@@ -575,8 +689,53 @@ class PipelineManager:
             return
 
         if "faces" in result:
+            frame_w, frame_h = result.get("frame_size", (0, 0))
+
+            # Footfall gate-line crossing (see gate_tracker.py) needs the
+            # embedding, so it runs BEFORE the pop below strips it. Returns
+            # True iff this camera has a gate line configured at all — in
+            # that case it already called footfall_counter.process() itself,
+            # exactly once per actual crossing, so the fallback below must
+            # not ALSO count every frame a face happens to be visible.
+            gate_active = False
+            if (
+                self._gate_tracker is not None
+                and self._footfall_counter is not None
+                and camera_id in self._footfall_camera_ids
+            ):
+                gate_active = self._gate_tracker.process_frame(
+                    camera_id, result["faces"], frame_w, frame_h, self._footfall_counter,
+                )
+
+            for face in result["faces"]:
+                # Pop rather than leave in place: this same dict is stored as
+                # this camera's "latest detections" below and handed straight
+                # to the /ws/detections websocket as JSON — a raw numpy
+                # embedding array is neither JSON-serializable nor something
+                # that should leave the backend as a live-view payload.
+                embedding = face.pop("embedding", None)
+                # Gated to configured entry/exit gate camera(s) only (see
+                # config.FOOTFALL_CAMERAS) — footfall counting does not run
+                # on every camera in the system by default. Whole-frame
+                # fallback only when that camera has no gate line drawn yet;
+                # once one exists, gate_active already handled counting above.
+                if (
+                    embedding is not None
+                    and self._footfall_counter is not None
+                    and camera_id in self._footfall_camera_ids
+                    and not gate_active
+                ):
+                    self._footfall_counter.process(camera_id, embedding, name=face.get("name"))
+
+            if self._desk_tracker is not None:
+                self._desk_tracker.process_frame(camera_id, result["faces"], frame_w, frame_h)
+
             self._check_zone_violations(camera_id, result["faces"])
             pipeline.set_detections(result["faces"])
+
+        if "people" in result and self._desk_tracker is not None:
+            frame_w, frame_h = result.get("frame_size", (0, 0))
+            self._desk_tracker.process_pose_frame(camera_id, result["people"], frame_w, frame_h)
 
         for direction in result.get("footfall_events", []):
             face_db.log_footfall(camera_id, direction)
@@ -601,16 +760,16 @@ class PipelineManager:
         who isn't on that zone's allowed_names list raises a zone_intrusion
         alert. Test point is each face's bbox center — the only real-time,
         per-identity position signal available (pose/body bbox only runs
-        every detection_worker.POSE_INTERVAL_SECONDS and carries no name)."""
+        every detection_worker.POSE_INTERVAL_SECONDS and carries no name).
+        A zone with both restricted_start/restricted_end set only enforces
+        during that window; leaving them blank means the allow-list applies
+        at any time."""
         zones = zones_db.list_zones(camera_id=camera_id)
         if not zones:
             return
         for zone in zones:
             if not zone["enabled"]:
                 continue
-            # a zone with both times set only enforces its allow-list during
-            # that window (e.g. "22:00-06:00" — after hours only); leaving
-            # either blank means the allow-list applies at any time, as before
             if zone.get("restricted_start") and zone.get("restricted_end"):
                 if not self._time_in_window(zone["restricted_start"], zone["restricted_end"]):
                     continue

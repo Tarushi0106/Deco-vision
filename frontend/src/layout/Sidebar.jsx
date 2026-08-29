@@ -20,12 +20,10 @@ const NAV_GROUPS = [
       { to: '/cameras', label: 'Camera Management' },
       { to: '/intrusion', label: 'Intrusion' },
       { to: '/sites', label: 'Site Management' },
-      {
-        to: '/attendance',
-        label: 'Attendance',
-        children: [{ to: '/attendance-report', label: 'Attendance Report' }],
-      },
-      { to: '/analytics', label: 'Analytics' },
+      { to: '/attendance', label: 'Attendance' },
+      { to: '/analytics', label: 'Workforce Analytics' },
+      { to: '/footfall', label: 'Footfall' },
+      { to: '/license-management', label: 'License & Access' },
     ],
   },
   {

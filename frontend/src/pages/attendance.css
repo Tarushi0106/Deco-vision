@@ -1,0 +1,204 @@
+.attendance-report-modal {
+  width: 720px;
+  max-width: 90vw;
+}
+
+.attendance-row-actions {
+  display: flex;
+  gap: 0.35rem;
+  flex-wrap: nowrap;
+}
+
+.attendance-row-actions .btn {
+  padding: 0.3rem 0.6rem;
+  font-size: 0.78rem;
+  white-space: nowrap;
+}
+
+.attendance-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1.5rem;
+  padding: 1.25rem 1.4rem;
+  margin-bottom: 1rem;
+}
+
+.attendance-header-left {
+  display: flex;
+  gap: 0.9rem;
+}
+
+.attendance-header-icon {
+  width: 44px;
+  height: 44px;
+  border-radius: 10px;
+  background: var(--brand-bg);
+  color: var(--brand);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 1.3rem;
+  flex-shrink: 0;
+}
+
+.attendance-eyebrow {
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--brand);
+}
+
+.attendance-header-left h2 {
+  margin: 0.15rem 0 0.25rem;
+}
+
+.attendance-updated {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin-top: 0.4rem;
+}
+
+.attendance-header-actions {
+  display: flex;
+  align-items: flex-end;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.attendance-date-field label {
+  display: block;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+  margin-bottom: 0.3rem;
+}
+
+.attendance-banner {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: var(--success-bg);
+  color: var(--success);
+  border-radius: 8px;
+  padding: 0.6rem 1rem;
+  font-size: 0.85rem;
+  font-weight: 500;
+  margin-bottom: 1rem;
+}
+
+.attendance-filters {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 0.6rem;
+  margin-bottom: 0.75rem;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.attendance-filters select {
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: var(--font);
+}
+
+.attendance-toolbar-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0.5rem;
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.attendance-pagination {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.attendance-pagination select {
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: var(--font);
+}
+
+.attendance-page-buttons {
+  display: flex;
+  gap: 0.3rem;
+}
+
+.attendance-page-btn {
+  min-width: 28px;
+  height: 28px;
+  border: 1px solid var(--border);
+  background: var(--card-bg);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: var(--text);
+}
+
+.attendance-page-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.attendance-page-btn-active {
+  background: var(--brand);
+  border-color: var(--brand);
+  color: white;
+}
+
+.attendance-table-wrap table thead th {
+  background: #1a2b4c;
+  color: white;
+  text-transform: uppercase;
+  font-size: 0.68rem;
+  letter-spacing: 0.03em;
+  border-bottom: none;
+}
+
+.attendance-employee-cell {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.attendance-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  object-fit: cover;
+  flex-shrink: 0;
+}
+
+.attendance-avatar-fallback {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--brand-bg);
+  color: var(--brand);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.75rem;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.attendance-row-absent {
+  color: var(--text-faint);
+}
+
+.attendance-stat-grid {
+  grid-template-columns: repeat(5, 1fr);
+}

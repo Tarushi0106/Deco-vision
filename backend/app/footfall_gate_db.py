@@ -6,15 +6,26 @@ plus which side counts as "outside" (entry_sign): crossing FROM the
 outside side TO the inside side is what counts as an entry.
 """
 
+import contextlib
 import sqlite3
 from pathlib import Path
 
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "app.db"
 
 
-def get_connection() -> sqlite3.Connection:
+@contextlib.contextmanager
+def get_connection():
+    """Closed on exit — see alerts_db.get_connection for why this matters
+    (sqlite3's own `with conn:` never closes the connection, which leaked
+    a file descriptor per call and eventually exhausted the process's
+    open-file limit)."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def init_db() -> None:

@@ -2,6 +2,7 @@
 settings table backing them (currently just the restricted-hours window)."""
 
 from __future__ import annotations
+import contextlib
 import sqlite3
 import time
 from pathlib import Path
@@ -9,9 +10,22 @@ from pathlib import Path
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "app.db"
 
 
-def get_connection() -> sqlite3.Connection:
+@contextlib.contextmanager
+def get_connection():
+    """A fresh sqlite3.Connection per call, closed on exit — sqlite3's own
+    `with conn:` only commits/rolls back, it never closes the connection,
+    so every prior get_connection() call leaked a file descriptor. Under
+    this app's constant background DB traffic (capture loop, sender/
+    receiver threads, replay prefetch) that exhausted the process's fd
+    limit (ulimit -n) within minutes, breaking every DB-backed endpoint
+    with "unable to open database file" until the next restart."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def init_db() -> None:

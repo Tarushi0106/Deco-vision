@@ -1,4 +1,6 @@
 import os
+import secrets
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -87,6 +89,46 @@ CLIP_RETENTION_DAYS = int(os.getenv("CLIP_RETENTION_DAYS", "7"))
 # shortly after the footfall finalize job so both maintenance jobs land
 # together just after midnight.
 CLIP_RETENTION_PRUNE_TIME = os.getenv("CLIP_RETENTION_PRUNE_TIME", "00:15")
+
+# License & Camera Access Management (auth.py / license_db.py): JWT signing
+# secret for that module's real password-based login — separate from the
+# existing trivial /api/auth/login (user_db.record_login), which has no
+# password and stays exactly as-is for the main dashboard's "who's using
+# this" tracking. Persisted to a file rather than regenerated per process,
+# so a backend restart doesn't invalidate every signed-in session (this app
+# gets restarted often during development) - only used if JWT_SECRET isn't
+# set in the environment, which is the recommended path for production.
+_JWT_SECRET_FILE = Path(__file__).resolve().parent.parent / "data" / "jwt_secret.key"
+
+
+def _load_or_create_jwt_secret() -> str:
+    env_secret = os.getenv("JWT_SECRET")
+    if env_secret:
+        return env_secret
+    _JWT_SECRET_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if _JWT_SECRET_FILE.exists():
+        return _JWT_SECRET_FILE.read_text().strip()
+    secret = secrets.token_hex(32)
+    _JWT_SECRET_FILE.write_text(secret)
+    return secret
+
+
+JWT_SECRET = _load_or_create_jwt_secret()
+JWT_ALGORITHM = "HS256"
+JWT_ACCESS_TOKEN_MINUTES = int(os.getenv("JWT_ACCESS_TOKEN_MINUTES", "60"))
+
+# Bootstrap Super Admin (user_db.py's init_db creates this account if no
+# super_admin exists yet) - otherwise there'd be no way to sign into the
+# License module at all on a fresh database. Change the password after
+# first login; this is a development-friendly default, not a production
+# secret.
+SUPER_ADMIN_EMAIL = os.getenv("SUPER_ADMIN_EMAIL", "admin@deco-vision.local")
+SUPER_ADMIN_PASSWORD = os.getenv("SUPER_ADMIN_PASSWORD", "ChangeMe123!")
+
+# Rate limiting (slowapi, in-memory — no Redis dependency at this scale)
+# for the License module's public-ish endpoints (login, activation), which
+# are the ones worth throttling against brute-force/abuse.
+AUTH_RATE_LIMIT = os.getenv("AUTH_RATE_LIMIT", "10/minute")
 
 # Desk-time analytics (see desk_tracker.py): how long an employee can go
 # unconfirmed at their desk zone — by face OR by the pose-tracking bridge —

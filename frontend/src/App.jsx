@@ -9,6 +9,7 @@ import Sites from './pages/Sites'
 import Attendance from './pages/Attendance'
 import Analytics from './pages/Analytics'
 import Footfall from './pages/Footfall'
+import LicenseManagement from './pages/LicenseManagement'
 import './theme.css'
 
 const PAGES = [
@@ -20,6 +21,10 @@ const PAGES = [
   { path: '/attendance', title: 'Attendance', breadcrumb: 'Deco Vision / Attendance', element: <Attendance /> },
   { path: '/analytics', title: 'Workforce Analytics', breadcrumb: 'Deco Vision / Workforce Analytics', element: <Analytics /> },
   { path: '/footfall', title: 'Footfall', breadcrumb: 'Deco Vision / Footfall', element: <Footfall /> },
+  {
+    path: '/license-management', title: 'License & Camera Access',
+    breadcrumb: 'Deco Vision / License & Camera Access', element: <LicenseManagement />,
+  },
 ]
 
 function App() {

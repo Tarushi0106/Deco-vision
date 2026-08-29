@@ -168,6 +168,16 @@ export default function Dashboard() {
           value={stats ? `${stats.footfall_in_today} in / ${stats.footfall_out_today} out` : '—'}
           sub="midline crossings, all cameras"
         />
+        <StatTile
+          label="Cameras Given"
+          value={stats ? stats.cameras_assigned : '—'}
+          sub={stats ? `of ${stats.total_cameras} total, via a license` : ''}
+        />
+        <StatTile
+          label="Cameras Accessed"
+          value={stats ? stats.cameras_accessed : '—'}
+          sub="assigned cameras currently live"
+        />
       </div>
 
       <div className="dashboard-main-grid">

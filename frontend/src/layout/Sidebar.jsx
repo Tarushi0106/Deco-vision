@@ -22,6 +22,7 @@ const NAV_GROUPS = [
       { to: '/attendance', label: 'Attendance' },
       { to: '/analytics', label: 'Workforce Analytics' },
       { to: '/footfall', label: 'Footfall' },
+      { to: '/license-management', label: 'License & Access' },
     ],
   },
   {

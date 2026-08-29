@@ -1,3 +1,6 @@
+import base64
+import json
+import shutil
 import sqlite3
 import time
 from datetime import datetime
@@ -6,6 +9,17 @@ from pathlib import Path
 import numpy as np
 
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "app.db"
+ENROLLMENT_PHOTOS_DIR = Path(__file__).resolve().parent.parent / "data" / "enrollment_photos"
+
+# One-time export of the currently-enrolled roster (see scripts/export_seed_
+# faces.py) - committed to git under backend/seed_data/, unlike backend/data/
+# itself (gitignored on purpose: it's per-deployment operational data, and
+# enrollment photos alone can run 50+MB, which doesn't belong in every
+# clone). This is how a fresh deployment gets the real roster back without
+# re-enrolling everyone by hand - see seed_enrolled_faces_if_empty() below.
+SEED_DIR = Path(__file__).resolve().parent.parent / "seed_data"
+SEED_MANIFEST = SEED_DIR / "enrolled_faces.json"
+SEED_PHOTOS_DIR = SEED_DIR / "enrollment_photos"
 
 
 def get_connection() -> sqlite3.Connection:
@@ -68,6 +82,40 @@ def init_db() -> None:
         existing_footfall_cols = {row[1] for row in conn.execute("PRAGMA table_info(footfall_counts)")}
         if "camera_id" not in existing_footfall_cols:
             conn.execute("ALTER TABLE footfall_counts ADD COLUMN camera_id INTEGER")
+
+
+def seed_enrolled_faces_if_empty() -> int:
+    """Loads the committed roster export (backend/seed_data/, see the
+    module docstring comment above SEED_DIR) into a genuinely empty
+    enrolled_faces table — the fresh-deployment bootstrap. Never touches
+    anything if there's already at least one enrolled face, so this is
+    always safe to call on every startup: it only ever does something the
+    very first time a new deployment's database is created. Returns how
+    many faces were seeded (0 if nothing to do)."""
+    if not SEED_MANIFEST.exists():
+        return 0
+    with get_connection() as conn:
+        if conn.execute("SELECT COUNT(*) FROM enrolled_faces").fetchone()[0] > 0:
+            return 0
+
+        manifest = json.loads(SEED_MANIFEST.read_text(encoding="utf-8"))
+        if not manifest:
+            return 0
+
+        ENROLLMENT_PHOTOS_DIR.mkdir(parents=True, exist_ok=True)
+        for entry in manifest:
+            src = SEED_PHOTOS_DIR / entry["source_photo"]
+            dst = ENROLLMENT_PHOTOS_DIR / entry["source_photo"]
+            if src.exists() and not dst.exists():
+                shutil.copy2(src, dst)
+            embedding = np.frombuffer(base64.b64decode(entry["embedding_b64"]), dtype=np.float32)
+            conn.execute(
+                "INSERT INTO enrolled_faces (name, source_photo, embedding, camera_face_id, employee_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (entry["name"], entry["source_photo"], embedding.tobytes(),
+                 entry.get("camera_face_id"), entry.get("employee_id")),
+            )
+        return len(manifest)
 
 
 def add_face(name: str, source_photo: str, embedding: np.ndarray, camera_face_id: str | None = None) -> None:

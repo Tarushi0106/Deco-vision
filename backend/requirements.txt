@@ -14,3 +14,7 @@ imageio-ffmpeg
 reportlab
 openpyxl
 apscheduler
+pyjwt
+bcrypt
+qrcode[pil]
+slowapi

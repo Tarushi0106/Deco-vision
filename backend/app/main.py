@@ -10,7 +10,9 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile, WebSocket, WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -21,10 +23,13 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from . import (
-    alerts_db, camera_db, clips_db, config, desk_db, face_db, footfall_db, footfall_gate_db, footfall_report,
-    scheduler, user_db,
+    alerts_db, auth, camera_db, clips_db, config, desk_db, face_db, footfall_db, footfall_gate_db, footfall_report,
+    license_db, license_qr, scheduler, user_db,
 )
 from . import onvif_client, pipeline, replay_prefetch
 from .camera_client import camera_client, get_camera_client, sync_face_to_all_devices
@@ -37,6 +42,13 @@ logger = logging.getLogger("dashboard")
 
 app = FastAPI()
 START_TIME = time.time()
+
+# In-memory rate limiting (slowapi) for the License module's public-ish
+# endpoints (login, activation) — no Redis dependency at this scale/single-
+# instance deployment; see config.AUTH_RATE_LIMIT.
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -135,6 +147,9 @@ class FootfallGateIn(BaseModel):
 @app.on_event("startup")
 def startup():
     face_db.init_db()
+    seeded = face_db.seed_enrolled_faces_if_empty()
+    if seeded:
+        logger.info("Seeded %d enrolled face row(s) from backend/seed_data/ (fresh deployment)", seeded)
     camera_db.init_db()
     user_db.init_db()
     alerts_db.init_db()
@@ -142,6 +157,7 @@ def startup():
     footfall_db.init_db()
     footfall_gate_db.init_db()
     desk_db.init_db()
+    license_db.init_db()
     pipeline_manager.start()
     scheduler.start_scheduler()
     replay_prefetch.start()
@@ -298,7 +314,8 @@ def list_users():
 def get_stats():
     cameras = camera_db.list_cameras()
     active_configured = [c for c in cameras if c["is_configured"] and c["status"] == "active"]
-    live_count = sum(1 for c in active_configured if pipeline_manager.is_live(c["id"]))
+    live_ids = {c["id"] for c in active_configured if pipeline_manager.is_live(c["id"])}
+    live_count = len(live_ids)
     degraded = live_count < len(active_configured)
 
     uptime_seconds = int(time.time() - START_TIME)
@@ -316,6 +333,12 @@ def get_stats():
         "footfall_in_today": footfall["in"],
         "footfall_out_today": footfall["out"],
         "unique_footfall_today": unique_footfall_today,
+        # Cameras handed out via a license, and how many of those are
+        # actually live right now — "given" vs. "accessed" (see
+        # license_db.py). Just counts, no license/company details, so this
+        # stays on the otherwise-unauthenticated main dashboard endpoint.
+        "cameras_assigned": license_db.count_assigned_cameras(),
+        "cameras_accessed": license_db.count_live_assigned_cameras(live_ids),
     }
 
 
@@ -948,6 +971,384 @@ async def detections_feed(websocket: WebSocket, camera_id: int):
             await asyncio.sleep(DETECTIONS_INTERVAL)
     except (WebSocketDisconnect, ConnectionResetError, RuntimeError):
         logger.info("detections_feed client disconnected (camera %s)", camera_id)
+
+
+####################################################################
+# License & Camera Access Management
+#
+# A self-contained module bolted onto the existing app: its own auth
+# (auth.py, real JWT + bcrypt passwords — distinct from the trivial
+# /api/auth/login above), its own tables (license_db.py), reusing the
+# existing `cameras` table for the camera side of a "CameraAssignment".
+# Every endpoint below requires a valid bearer token except login and
+# activation, which are the public entry points and are rate-limited.
+####################################################################
+
+def _audit(user: dict | None, action: str, target_type: str = "", target_id: str = "", details: str = "") -> None:
+    license_db.log_audit(
+        user["uuid"] if user else None, user["email"] if user else "", action, target_type, target_id, details
+    )
+
+
+def _serialize_license(lic: dict) -> dict:
+    out = dict(lic)
+    out["cameras_assigned"] = license_db.count_cameras_for_license(lic["id"])
+    out["cameras_remaining"] = max(0, lic["max_cameras"] - out["cameras_assigned"])
+    return out
+
+
+class LicenseLoginIn(BaseModel):
+    email: str
+    password: str
+
+
+class CompanyIn(BaseModel):
+    name: str
+
+
+class LicenseUserIn(BaseModel):
+    email: str
+    name: str
+    role: str
+    company_id: str | None = None
+    password: str | None = None  # if omitted, a temp password is generated and returned once
+
+
+class LicenseCreateIn(BaseModel):
+    company_id: str
+    max_cameras: int
+    device_bind_enabled: bool = False
+    label: str = ""
+
+
+class LicenseUpdateIn(BaseModel):
+    label: str | None = None
+    max_cameras: int | None = None
+    device_bind_enabled: bool | None = None
+
+
+class CameraIdsIn(BaseModel):
+    camera_ids: list[int]
+
+
+class ActivateIn(BaseModel):
+    code: str | None = None
+    qr_token: str | None = None
+    device_fingerprint: str | None = None
+
+
+def _sanitize_user(user: dict) -> dict:
+    return {
+        "uuid": user["uuid"], "email": user["email"], "name": user["name"],
+        "role": user["role"], "company_id": user.get("company_id"), "is_active": bool(user.get("is_active", 1)),
+    }
+
+
+@app.post("/api/auth/license/login")
+@limiter.limit(config.AUTH_RATE_LIMIT)
+def license_login(request: Request, payload: LicenseLoginIn):
+    user = user_db.get_user_by_email(payload.email)
+    if user is None or not user.get("password_hash") or not auth.verify_password(payload.password, user["password_hash"]):
+        _audit(None, "login_failed", "user", "", f"email={payload.email}")
+        raise HTTPException(401, "Invalid email or password")
+    if not user.get("is_active", 1):
+        raise HTTPException(403, "This account has been disabled")
+    token, jti = auth.create_access_token(user)
+    license_db.create_session(user["uuid"], jti, time.time() + config.JWT_ACCESS_TOKEN_MINUTES * 60)
+    _audit(user, "login", "user", user["uuid"])
+    return {"access_token": token, "token_type": "bearer", "user": _sanitize_user(user)}
+
+
+@app.post("/api/auth/license/logout")
+def license_logout(user: dict = Depends(auth.get_current_user)):
+    license_db.revoke_session(user["jti"])
+    _audit(user, "logout", "user", user["uuid"])
+    return {"ok": True}
+
+
+@app.get("/api/auth/license/me")
+def license_me(user: dict = Depends(auth.get_current_user)):
+    return _sanitize_user(user)
+
+
+@app.post("/api/license-users")
+def create_license_user(payload: LicenseUserIn, user: dict = Depends(auth.require_role(auth.ROLE_SUPER_ADMIN, auth.ROLE_COMPANY_ADMIN))):
+    if user["role"] == auth.ROLE_COMPANY_ADMIN:
+        if payload.role not in (auth.ROLE_OPERATOR, auth.ROLE_VIEWER):
+            raise HTTPException(403, "Company admins can only create operator/viewer accounts")
+        company_id = user["company_id"]
+    else:
+        if payload.role not in auth.ALL_ROLES:
+            raise HTTPException(400, "Invalid role")
+        company_id = payload.company_id
+
+    temp_password = payload.password or user_db.generate_temp_password()
+    created = user_db.create_license_user(
+        payload.email, payload.name, auth.hash_password(temp_password), payload.role, company_id,
+    )
+    _audit(user, "create_user", "user", created["uuid"], f"role={payload.role}")
+    result = _sanitize_user(created)
+    if not payload.password:
+        result["temp_password"] = temp_password  # shown once — not retrievable again
+    return result
+
+
+@app.get("/api/license-users")
+def list_license_users_endpoint(user: dict = Depends(auth.require_role(auth.ROLE_SUPER_ADMIN, auth.ROLE_COMPANY_ADMIN))):
+    company_id = user["company_id"] if user["role"] == auth.ROLE_COMPANY_ADMIN else None
+    return [_sanitize_user(u) for u in user_db.list_license_users(company_id)]
+
+
+@app.post("/api/companies")
+def create_company(payload: CompanyIn, user: dict = Depends(auth.require_role(auth.ROLE_SUPER_ADMIN))):
+    company = license_db.create_company(payload.name)
+    _audit(user, "create_company", "company", company["id"], payload.name)
+    return company
+
+
+@app.get("/api/companies")
+def list_companies_endpoint(user: dict = Depends(auth.get_current_user)):
+    if user["role"] == auth.ROLE_SUPER_ADMIN:
+        return license_db.list_companies()
+    company = license_db.get_company(user["company_id"]) if user.get("company_id") else None
+    return [company] if company else []
+
+
+@app.post("/api/licenses")
+def create_license(payload: LicenseCreateIn, user: dict = Depends(auth.require_role(auth.ROLE_SUPER_ADMIN))):
+    if payload.max_cameras < 0:
+        raise HTTPException(400, "max_cameras can't be negative")
+    lic = license_db.create_license(
+        payload.company_id, payload.max_cameras, payload.device_bind_enabled, payload.label,
+    )
+    _audit(user, "create_license", "license", lic["id"], f"company={payload.company_id}")
+    return _serialize_license(lic)
+
+
+@app.get("/api/licenses")
+def list_licenses_endpoint(
+    status: str | None = None, search: str = "", limit: int = 50, offset: int = 0,
+    user: dict = Depends(auth.get_current_user),
+):
+    if status and status not in license_db.ALL_STATUSES:
+        raise HTTPException(400, f"status must be one of {license_db.ALL_STATUSES}")
+    company_id = None if user["role"] == auth.ROLE_SUPER_ADMIN else user.get("company_id")
+    rows, total = license_db.list_licenses(company_id, status, search, limit, offset)
+    return {"items": [_serialize_license(r) for r in rows], "total": total, "limit": limit, "offset": offset}
+
+
+def _get_license_or_404(license_id: str) -> dict:
+    lic = license_db.get_license(license_id)
+    if lic is None:
+        raise HTTPException(404, "License not found")
+    return lic
+
+
+def _require_license_access(license_id: str, user: dict) -> dict:
+    lic = _get_license_or_404(license_id)
+    if user["role"] != auth.ROLE_SUPER_ADMIN and lic["company_id"] != user.get("company_id"):
+        raise HTTPException(403, "This license belongs to a different company")
+    return lic
+
+
+@app.get("/api/licenses/analytics")
+def license_analytics(user: dict = Depends(auth.require_role(auth.ROLE_SUPER_ADMIN))):
+    online_ids = {c["id"] for c in camera_db.list_cameras() if pipeline_manager.is_live(c["id"])}
+    return license_db.get_analytics(online_camera_count=len(online_ids))
+
+
+# Must stay BELOW /api/licenses/analytics (and any other static-suffix
+# /api/licenses/<segment> route) — FastAPI matches path routes in
+# declaration order, and this dynamic {license_id} route would otherwise
+# swallow "analytics" as if it were a license id.
+@app.get("/api/licenses/{license_id}")
+def get_license_endpoint(license_id: str, user: dict = Depends(auth.get_current_user)):
+    return _serialize_license(_require_license_access(license_id, user))
+
+
+@app.put("/api/licenses/{license_id}")
+def update_license_endpoint(
+    license_id: str, payload: LicenseUpdateIn, user: dict = Depends(auth.require_role(auth.ROLE_SUPER_ADMIN)),
+):
+    _get_license_or_404(license_id)
+    lic = license_db.update_license(
+        license_id, label=payload.label, max_cameras=payload.max_cameras,
+        device_bind_enabled=payload.device_bind_enabled,
+    )
+    _audit(user, "update_license", "license", license_id)
+    return _serialize_license(lic)
+
+
+@app.post("/api/licenses/{license_id}/revoke")
+def revoke_license_endpoint(license_id: str, user: dict = Depends(auth.require_role(auth.ROLE_SUPER_ADMIN))):
+    _get_license_or_404(license_id)
+    lic = license_db.set_license_status(license_id, license_db.STATUS_SUSPENDED)
+    _audit(user, "revoke_license", "license", license_id)
+    return _serialize_license(lic)
+
+
+@app.post("/api/licenses/{license_id}/enable")
+def enable_license_endpoint(license_id: str, user: dict = Depends(auth.require_role(auth.ROLE_SUPER_ADMIN))):
+    _get_license_or_404(license_id)
+    lic = license_db.set_license_status(license_id, license_db.STATUS_ACTIVE)
+    _audit(user, "enable_license", "license", license_id)
+    return _serialize_license(lic)
+
+
+@app.post("/api/licenses/{license_id}/disable")
+def disable_license_endpoint(license_id: str, user: dict = Depends(auth.require_role(auth.ROLE_SUPER_ADMIN))):
+    _get_license_or_404(license_id)
+    lic = license_db.set_license_status(license_id, license_db.STATUS_INACTIVE)
+    _audit(user, "disable_license", "license", license_id)
+    return _serialize_license(lic)
+
+
+@app.get("/api/licenses/{license_id}/qr")
+def get_license_qr(license_id: str, user: dict = Depends(auth.get_current_user)):
+    lic = _require_license_access(license_id, user)
+    token = license_qr.build_qr_token(lic["license_key"])
+    png = license_qr.render_qr_png(token)
+    return Response(content=png, media_type="image/png")
+
+
+@app.get("/api/licenses/{license_id}/qr-token")
+def get_license_qr_token(license_id: str, user: dict = Depends(auth.get_current_user)):
+    lic = _require_license_access(license_id, user)
+    return {"qr_token": license_qr.build_qr_token(lic["license_key"])}
+
+
+@app.get("/api/licenses/{license_id}/cameras")
+def list_license_cameras(license_id: str, user: dict = Depends(auth.get_current_user)):
+    _require_license_access(license_id, user)
+    return license_db.list_cameras_for_license(license_id)
+
+
+@app.post("/api/licenses/{license_id}/cameras")
+def assign_license_cameras(
+    license_id: str, payload: CameraIdsIn, user: dict = Depends(auth.require_role(auth.ROLE_SUPER_ADMIN)),
+):
+    lic = _get_license_or_404(license_id)
+    already = license_db.count_cameras_for_license(license_id)
+    new_ids = [c for c in payload.camera_ids if not license_db.is_camera_assigned(license_id, c)]
+    if already + len(new_ids) > lic["max_cameras"]:
+        raise HTTPException(
+            400,
+            f"This license allows {lic['max_cameras']} camera(s); {already} already assigned, "
+            f"can't add {len(new_ids)} more.",
+        )
+    added = license_db.assign_cameras(license_id, payload.camera_ids)
+    _audit(user, "assign_cameras", "license", license_id, f"camera_ids={payload.camera_ids}")
+    return {"added": added, "cameras": license_db.list_cameras_for_license(license_id)}
+
+
+@app.post("/api/licenses/{license_id}/cameras/remove")
+def remove_license_cameras(
+    license_id: str, payload: CameraIdsIn, user: dict = Depends(auth.require_role(auth.ROLE_SUPER_ADMIN)),
+):
+    _get_license_or_404(license_id)
+    license_db.remove_cameras(license_id, payload.camera_ids)
+    _audit(user, "remove_cameras", "license", license_id, f"camera_ids={payload.camera_ids}")
+    return {"cameras": license_db.list_cameras_for_license(license_id)}
+
+
+@app.get("/api/audit-logs")
+def get_audit_logs(limit: int = 100, offset: int = 0, user: dict = Depends(auth.require_role(auth.ROLE_SUPER_ADMIN))):
+    rows, total = license_db.list_audit_logs(limit, offset)
+    return {"items": rows, "total": total, "limit": limit, "offset": offset}
+
+
+def _get_or_create_license_viewer(company_id: str) -> dict:
+    """The QR/code IS the credential for an end user — activating one
+    shouldn't require someone to also have a separately admin-created
+    email/password account. Reuses one viewer-role account per company
+    (deterministic email, empty password_hash so it can never sign in
+    through the normal login form) rather than minting a new user row on
+    every activation."""
+    email = f"license-access+{company_id}@deco-vision.local"
+    existing = user_db.get_user_by_email(email)
+    if existing:
+        return existing
+    company = license_db.get_company(company_id)
+    name = f"{company['name']} — Camera Access" if company else "Camera Access"
+    return user_db.create_license_user(email, name, "", auth.ROLE_VIEWER, company_id)
+
+
+@app.post("/api/licenses/activate")
+@limiter.limit(config.AUTH_RATE_LIMIT)
+def activate_license(request: Request, payload: ActivateIn):
+    if not payload.code and not payload.qr_token:
+        raise HTTPException(400, "Provide a license code or a QR token")
+
+    if payload.qr_token:
+        try:
+            license_key = license_qr.decode_qr_token(payload.qr_token)
+        except Exception:
+            raise HTTPException(400, "This QR code is invalid or has expired")
+    else:
+        license_key = payload.code.strip().upper()
+
+    lic = license_db.get_license_by_key(license_key)
+    if lic is None:
+        _audit(None, "activation_failed", "license", "", f"key={license_key} reason=not_found")
+        raise HTTPException(404, "Invalid license")
+    if lic["status"] == license_db.STATUS_SUSPENDED:
+        _audit(None, "activation_failed", "license", lic["id"], "reason=revoked")
+        raise HTTPException(403, "This license has been revoked")
+    if lic["status"] == license_db.STATUS_INACTIVE:
+        _audit(None, "activation_failed", "license", lic["id"], "reason=disabled")
+        raise HTTPException(403, "This license is currently disabled")
+
+    if lic["device_bind_enabled"]:
+        if not payload.device_fingerprint:
+            raise HTTPException(400, "This license requires device binding — device_fingerprint is required")
+        binding = license_db.get_binding(lic["id"])
+        if binding is None:
+            license_db.bind_device(lic["id"], payload.device_fingerprint)
+        elif binding["device_fingerprint"] != payload.device_fingerprint:
+            _audit(None, "activation_failed", "license", lic["id"], "reason=device_mismatch")
+            raise HTTPException(403, "This license is already activated on a different device")
+
+    viewer = _get_or_create_license_viewer(lic["company_id"])
+    token, jti = auth.create_access_token(viewer)
+    license_db.create_session(viewer["uuid"], jti, time.time() + config.JWT_ACCESS_TOKEN_MINUTES * 60)
+
+    _audit(viewer, "activation_success", "license", lic["id"])
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "user": _sanitize_user(viewer),
+        "license": _serialize_license(lic),
+        "cameras": license_db.list_cameras_for_license(lic["id"]),
+    }
+
+
+@app.get("/api/my-license")
+def my_license(user: dict = Depends(auth.get_current_user)):
+    """The Client Dashboard's data source: this user's company license
+    (assumes one active license per company, the common case for this
+    module's scope), assigned cameras with live status, and the derived
+    slot math the UI needs (allowed / assigned / in use / remaining)."""
+    if not user.get("company_id"):
+        raise HTTPException(404, "No company is associated with this account")
+    rows, _ = license_db.list_licenses(company_id=user["company_id"], status=None, limit=1000, offset=0)
+    active = [r for r in rows if r["status"] == license_db.STATUS_ACTIVE]
+    lic = active[0] if active else (rows[0] if rows else None)
+    if lic is None:
+        raise HTTPException(404, "No license found for this company")
+
+    cameras = license_db.list_cameras_for_license(lic["id"])
+    for cam in cameras:
+        cam["live"] = pipeline_manager.is_live(cam["id"])
+    in_use = sum(1 for c in cameras if c["live"])
+
+    return {
+        "license": _serialize_license(lic),
+        "cameras": cameras,
+        "total_allowed": lic["max_cameras"],
+        "assigned": len(cameras),
+        "in_use": in_use,
+        "remaining": max(0, lic["max_cameras"] - len(cameras)),
+    }
 
 
 if __name__ == "__main__":

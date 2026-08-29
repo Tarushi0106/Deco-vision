@@ -160,7 +160,7 @@ export default function Dashboard() {
         <StatTile
           label="Active Alerts"
           value={stats ? stats.active_alerts : '—'}
-          sub="fall + intrusion + zone, unresolved"
+          sub="intrusion + zone, unresolved"
         />
         <StatTile
           label="Detections Today"

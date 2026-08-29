@@ -740,9 +740,11 @@ class PipelineManager:
         for direction in result.get("footfall_events", []):
             face_db.log_footfall(camera_id, direction)
 
-        for _track_id in result.get("fall_events", []):
-            alerts_db.log_alert(camera_id, "fall", "Person down detected")
-            logger.warning("Camera %s: fall detected", camera_id)
+        # Fall-detection alerting disabled per explicit request — it was
+        # firing repeatedly (false positives) on the busy "exit" camera,
+        # which is also used for footfall counting. Pose detection still
+        # runs (person_tracker.py) for footfall's midline-crossing count;
+        # only the "fall" alert itself is suppressed.
 
         if result.get("person_count", 0) > 0 and self._is_within_restricted_window():
             if not alerts_db.recent_open_alert(camera_id, "intrusion", INTRUSION_ALERT_COOLDOWN_SECONDS):

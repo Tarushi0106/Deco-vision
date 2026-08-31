@@ -4,6 +4,50 @@ import './pages.css'
 
 const ADD_PERSON_URL = `${API_BASE}/api/people`
 
+// Phone camera photos routinely land at 3-6MB, well past nginx's upload
+// size limit in front of the backend — that request never reaches FastAPI's
+// own validation, so it fails as an opaque network/parse error instead of a
+// readable message. Downscaling + re-encoding here keeps every upload well
+// under that ceiling regardless of what the camera produced.
+const MAX_UPLOAD_DIMENSION = 1600
+const UPLOAD_JPEG_QUALITY = 0.85
+const SKIP_COMPRESSION_BELOW_BYTES = 800_000
+
+async function compressPhotoForUpload(file) {
+  if (!file.type.startsWith('image/') || file.size <= SKIP_COMPRESSION_BELOW_BYTES) {
+    return file
+  }
+  const objectUrl = URL.createObjectURL(file)
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const el = new Image()
+      el.onload = () => resolve(el)
+      el.onerror = () => reject(new Error('Could not read this image file'))
+      el.src = objectUrl
+    })
+    const scale = Math.min(1, MAX_UPLOAD_DIMENSION / Math.max(img.width, img.height))
+    const canvas = document.createElement('canvas')
+    canvas.width = Math.round(img.width * scale)
+    canvas.height = Math.round(img.height * scale)
+    canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height)
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/jpeg', UPLOAD_JPEG_QUALITY))
+    // if canvas encoding fails for some reason, fall back to the original
+    // file rather than blocking the upload entirely
+    return blob ? new File([blob], file.name.replace(/\.\w+$/, '.jpg'), { type: 'image/jpeg' }) : file
+  } finally {
+    URL.revokeObjectURL(objectUrl)
+  }
+}
+
+// A proxy/server error (e.g. nginx rejecting an oversized upload) returns an
+// HTML error page, not JSON — res.json() would throw its own opaque parse
+// error in that case, hiding what actually went wrong.
+async function parseUploadResponse(res) {
+  const data = await res.json().catch(() => null)
+  if (!res.ok) throw new Error(data?.detail || `Upload failed (server said: ${res.status})`)
+  return data
+}
+
 function AddPersonModal({ onClose, onAdded }) {
   const [name, setName] = useState('')
   const [file, setFile] = useState(null)
@@ -13,13 +57,12 @@ function AddPersonModal({ onClose, onAdded }) {
     e.preventDefault()
     if (!name || !file) return
     setStatus({ loading: true })
-    const form = new FormData()
-    form.append('name', name)
-    form.append('photo', file)
     try {
+      const form = new FormData()
+      form.append('name', name)
+      form.append('photo', await compressPhotoForUpload(file))
       const res = await fetch(ADD_PERSON_URL, { method: 'POST', body: form })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.detail || 'Request failed')
+      const data = await parseUploadResponse(res)
       setStatus({ loading: false, result: data })
       onAdded()
     } catch (err) {
@@ -80,10 +123,9 @@ function EditPersonModal({ person, onClose, onSaved }) {
       if (file) {
         const form = new FormData()
         form.append('name', newName)
-        form.append('photo', file)
+        form.append('photo', await compressPhotoForUpload(file))
         const res = await fetch(ADD_PERSON_URL, { method: 'POST', body: form })
-        const data = await res.json()
-        if (!res.ok) throw new Error(data.detail || 'Request failed')
+        await parseUploadResponse(res)
       }
       setStatus({ loading: false, done: true })
       onSaved()

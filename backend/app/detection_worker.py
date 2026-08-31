@@ -16,6 +16,7 @@ settings) stays in the main process, which already owns those modules;
 this worker is pure compute and knows nothing about SQLite.
 """
 
+import logging
 import queue
 import time
 
@@ -24,6 +25,10 @@ import numpy as np
 import onnxruntime
 from insightface.app.common import Face
 
+from . import config
+
+logger = logging.getLogger("dashboard.recognition_pipeline")
+
 POSE_INTERVAL_SECONDS = 20.0  # pose is heavier than face rec; runs on its own slower cadence.
 # Raised from 5.0 -> 20.0: on CPU, pose (YOLOv8n-pose) + face rec both running
 # in this single worker process per "detect" call could take longer than the
@@ -31,7 +36,7 @@ POSE_INTERVAL_SECONDS = 20.0  # pose is heavier than face rec; runs on its own s
 # recognized names lag several seconds behind real time. Running pose less
 # often keeps the worker caught up so face-rec results stay near real-time.
 
-DEFAULT_DET_THRESH = 0.65
+DEFAULT_DET_THRESH = config.RECOGNITION_DET_THRESH_DEFAULT
 # Per-camera detection-confidence floor, overriding DEFAULT_DET_THRESH. One
 # global threshold can't fit every camera: measured real faces score 0.78-0.87
 # on camera 1 (Entry/Exit, a close head-on view — a high floor cuts off the
@@ -53,7 +58,7 @@ DEFAULT_DET_THRESH = 0.65
 # frame (x < ~0.35), well outside the gate line's x-range (~0.43-0.70), so it
 # has no path to spuriously trigger a gate crossing even if a phantom
 # detection slips through here.
-CAMERA_DET_THRESH = {
+CAMERA_DET_THRESH = config.CAMERA_DET_THRESH_OVERRIDES or {
     1: 0.5,  # Entry/Exit: doorway crossing is far from camera and backlit
     2: 0.45,  # Technical section: wide-angle, many small/distant faces
 }
@@ -101,7 +106,7 @@ CAMERA_DET_THRESH = {
 # room this wide. Not applied globally: cameras 1/3 don't have this problem
 # and shouldn't pay this cost. See CAMERA_DETECTION_MAX_DIM below.
 DETECTION_DOWNSCALE_MAX_DIM = 640
-CAMERA_DETECTION_MAX_DIM = {
+CAMERA_DETECTION_MAX_DIM = config.CAMERA_DETECTION_MAX_DIM_OVERRIDES or {
     2: 1280,  # Technical section: wide-angle room, up to ~8 people — see measurement above
 }
 # Accuracy prioritized over update speed per explicit request. Measured on a
@@ -114,9 +119,9 @@ CAMERA_DETECTION_MAX_DIM = {
 # cheap-pass match skips its recheck, so the budget only ever goes to
 # genuinely uncertain faces — this mainly costs more when MANY people are
 # simultaneously unmatched, not per person in frame.
-MAX_FULL_RES_RECHECKS = 8
-RECHECK_CROP_PADDING = 0.8  # extra margin around a face's bbox, as a fraction of its own size
-RECHECK_DET_THRESH = 0.3  # lenient: an isolated single-face crop needs less context to detect than a full scene
+MAX_FULL_RES_RECHECKS = config.RECOGNITION_MAX_FULL_RES_RECHECKS
+RECHECK_CROP_PADDING = config.RECOGNITION_RECHECK_CROP_PADDING  # extra margin around a face's bbox, as a fraction of its own size
+RECHECK_DET_THRESH = config.RECOGNITION_RECHECK_DET_THRESH  # lenient: an isolated single-face crop needs less context to detect than a full scene
 
 
 def _lean_recognize_crop(recognizer, crop):
@@ -250,6 +255,10 @@ def run_worker(
     embed_request_queue: "queue.Queue",
     max_cpu_cores: int,
 ) -> None:
+    # Runs in its own OS process (see this module's docstring) — it never
+    # inherits main.py's logging.basicConfig call, so without this, every
+    # logger.* call below would silently go nowhere.
+    logging.basicConfig(level=getattr(logging, config.LOG_LEVEL.upper(), logging.INFO))
     _cap_inference_threads(max_cpu_cores)
 
     # imported here, after the onnxruntime patch above is in place, so every
@@ -306,21 +315,41 @@ def run_worker(
 
         if kind == "detect":
             camera_id = item["camera_id"]
+            received_at = time.time()
+            # queue_wait_ms: time this frame sat in the worker's input queue
+            # before being picked up — a growing value here (not processing
+            # duration) is the signature of a camera being starved by its own
+            # or another camera's backlog, distinct from recognition itself
+            # being slow. enqueued_at is set by pipeline.py's _sender_loop.
+            queue_wait_ms = round((received_at - item.get("enqueued_at", received_at)) * 1000, 1)
             frame = cv2.imdecode(np.frombuffer(item["jpeg"], np.uint8), cv2.IMREAD_COLOR)
             if frame is None:
+                logger.warning("camera=%s stage=frame_decode_failed queue_wait_ms=%s", camera_id, queue_wait_ms)
                 continue
+            logger.debug("camera=%s stage=frame_received queue_wait_ms=%s", camera_id, queue_wait_ms)
 
             det_thresh = CAMERA_DET_THRESH.get(camera_id, DEFAULT_DET_THRESH)
             detection_max_dim = CAMERA_DETECTION_MAX_DIM.get(camera_id, DETECTION_DOWNSCALE_MAX_DIM)
+            recognize_start = time.time()
+            faces = _detect_and_recognize(recognizer, frame, det_thresh, detection_max_dim)
+            recognize_ms = round((time.time() - recognize_start) * 1000, 1)
             result = {
                 "camera_id": camera_id,
-                "faces": _detect_and_recognize(recognizer, frame, det_thresh, detection_max_dim),
+                "faces": faces,
                 # Pixel size of THIS frame — desk_tracker.py needs it to turn
                 # a face bbox back into the 0..1 fraction desk zones are
                 # stored in; cheap (two ints) so always included rather than
                 # gated behind whether any camera currently has zones.
                 "frame_size": [frame.shape[1], frame.shape[0]],
             }
+            if faces:
+                for f in faces:
+                    logger.debug(
+                        "camera=%s stage=recognized name=%s score=%s bbox=%s recognize_ms=%s",
+                        camera_id, f["name"], f["score"], f["bbox"], recognize_ms,
+                    )
+            else:
+                logger.debug("camera=%s stage=no_faces_detected recognize_ms=%s", camera_id, recognize_ms)
 
             now = time.time()
             if now - last_pose_at.get(camera_id, 0) >= POSE_INTERVAL_SECONDS:

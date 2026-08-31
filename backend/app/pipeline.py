@@ -41,6 +41,7 @@ from .gate_tracker import GateTracker
 from .video_source import RtspSource, WebcamSource
 
 logger = logging.getLogger("dashboard.pipeline")
+recognition_logger = logging.getLogger("dashboard.recognition_pipeline")
 
 JPEG_QUALITY = 80
 # Measured this session: pre-downscaling to 640px here before sending to the
@@ -65,9 +66,9 @@ STALE_SOURCE_TIMEOUT_SECONDS = 5  # force-reconnect a capture source that's stop
 # Backing off exponentially means a real outage gets retried patiently instead
 # of continuously re-triggering/extending a device-side lockout; a successful
 # reconnect resets it back to the base delay immediately.
-RECONNECT_BASE_DELAY_SECONDS = 3
-RECONNECT_MAX_DELAY_SECONDS = 60
-DEFAULT_DETECTION_FPS = 1  # how often frames are sent to the worker for face recognition; user-configurable
+RECONNECT_BASE_DELAY_SECONDS = config.CAMERA_RECONNECT_BASE_DELAY_SECONDS
+RECONNECT_MAX_DELAY_SECONDS = config.CAMERA_RECONNECT_MAX_DELAY_SECONDS
+DEFAULT_DETECTION_FPS = config.DEFAULT_DETECTION_FPS  # how often frames are sent to the worker for face recognition; user-configurable
 SETTINGS_POLL_INTERVAL_SECONDS = 2  # how often the sender thread re-reads detection_fps from settings
 # onnxruntime (face rec) and YOLO both default to spawning threads across every
 # logical CPU per inference call. Measured this session: that let the worker
@@ -75,7 +76,7 @@ SETTINGS_POLL_INTERVAL_SECONDS = 2  # how often the sender thread re-reads detec
 # API process, and the rest of the machine — the "everything is slow" symptom,
 # distinct from recognition-result lag. Pinning the worker to a minority of
 # cores caps its footprint regardless of how many threads it spawns internally.
-WORKER_MAX_CPU_CORES = 4
+WORKER_MAX_CPU_CORES = config.DETECTION_WORKER_MAX_CPU_CORES
 # Must comfortably exceed the worker's worst-case single-frame processing
 # time, or every embed request (enrollment, camera Allow List sync) times
 # out and gets silently misreported as "no face detected" — the worker only
@@ -83,7 +84,7 @@ WORKER_MAX_CPU_CORES = 4
 # multi-person camera's detect cycle (see detection_worker.py's
 # MAX_FULL_RES_RECHECKS comment) can run longer than the old 10s budget
 # while multiple live cameras keep it fed.
-EMBED_REQUEST_TIMEOUT_SECONDS = 25
+EMBED_REQUEST_TIMEOUT_SECONDS = config.DETECTION_EMBED_TIMEOUT_SECONDS
 # how long an after-hours intrusion alert stays "fresh" before it's allowed
 # to fire again for the same camera — otherwise it would refire every sample
 INTRUSION_ALERT_COOLDOWN_SECONDS = 300
@@ -92,7 +93,8 @@ INTRUSION_ALERT_COOLDOWN_SECONDS = 300
 ZONE_ALERT_COOLDOWN_SECONDS = 300
 # don't log a new detection_event for the same person on the same camera
 # more often than this - avoids flooding the table while someone stands in frame
-DETECTION_LOG_COOLDOWN_SECONDS = 30
+DETECTION_LOG_COOLDOWN_SECONDS = config.DETECTION_LOG_COOLDOWN_SECONDS
+RECOGNITION_MIN_CONSECUTIVE_HITS = config.RECOGNITION_MIN_CONSECUTIVE_HITS
 # recognition clips (Analytics "Clips" column): one continuous clip per
 # presence — recording starts the moment a person is first recognized and
 # keeps going, at full capture rate, for as long as they keep showing up in
@@ -134,6 +136,10 @@ class CameraPipeline:
         self._running = False
         self._thread: threading.Thread | None = None
         self._last_logged: dict[str, float] = {}
+        # Consecutive-hit streak per name, gating detection_event logging (not
+        # the live overlay) — see RECOGNITION_MIN_CONSECUTIVE_HITS. Reset to 0
+        # for any name absent from the current detection cycle.
+        self._consecutive_hits: dict[str, int] = {}
         self._clip_buffer: deque[tuple[float, bytes]] = deque()
         self._clip_buffer_lock = threading.Lock()
         # Resizing+encoding clip video is real per-frame CPU work — measured this session:
@@ -197,12 +203,32 @@ class CameraPipeline:
                 if name == "Unknown":
                     continue
                 self._last_detection[name] = now
+        self._update_consecutive_hits(detections)
         self._log_new_detections(detections, now)
+        recognition_logger.debug(
+            "camera=%s stage=result_stored names=%s",
+            self.camera_id, [d["name"] for d in detections if d["name"] != "Unknown"],
+        )
+
+    def _update_consecutive_hits(self, detections: list[dict]) -> None:
+        """Tracks how many detection cycles in a row each name has appeared
+        for, gating detection_event logging below — a name absent from THIS
+        cycle resets to 0 rather than decaying gradually, since each cycle
+        already represents a full detection_fps sampling interval (default
+        1s), not a single video frame."""
+        seen_this_cycle = {det["name"] for det in detections if det["name"] != "Unknown"}
+        for name in seen_this_cycle:
+            self._consecutive_hits[name] = self._consecutive_hits.get(name, 0) + 1
+        for name in list(self._consecutive_hits):
+            if name not in seen_this_cycle:
+                del self._consecutive_hits[name]
 
     def _log_new_detections(self, detections: list[dict], now: float) -> None:
         for det in detections:
             name = det["name"]
             if name == "Unknown":
+                continue
+            if self._consecutive_hits.get(name, 0) < RECOGNITION_MIN_CONSECUTIVE_HITS:
                 continue
             last = self._last_logged.get(name, 0)
             if now - last < DETECTION_LOG_COOLDOWN_SECONDS:
@@ -736,9 +762,12 @@ class PipelineManager:
                 if input_queue is None:
                     continue
                 try:
-                    input_queue.put_nowait({"type": "detect", "camera_id": camera_id, "jpeg": jpeg})
+                    input_queue.put_nowait(
+                        {"type": "detect", "camera_id": camera_id, "jpeg": jpeg, "enqueued_at": now}
+                    )
+                    recognition_logger.debug("camera=%s stage=frame_selected sent_to_worker=1", camera_id)
                 except queue.Full:
-                    pass
+                    recognition_logger.debug("camera=%s stage=frame_selected sent_to_worker=0 reason=queue_full", camera_id)
 
             time.sleep(interval)
 
@@ -751,6 +780,10 @@ class PipelineManager:
                 result = self._result_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
+            if "faces" in result:
+                recognition_logger.debug(
+                    "camera=%s stage=response_received face_count=%s", result["camera_id"], len(result["faces"]),
+                )
             self._dispatch_result(result)
 
     def _dispatch_result(self, result: dict) -> None:

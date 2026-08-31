@@ -2,7 +2,7 @@ import numpy as np
 import onnxruntime
 from insightface.app import FaceAnalysis
 
-from . import face_db
+from . import config, face_db
 
 # Lowered from 0.35: most enrolled people (32 of 36 at last count) only have
 # 1-2 low-quality photos pulled from a camera's onboard Allow List, not a
@@ -22,7 +22,7 @@ from . import face_db
 # without (as far as measured) crossing into that noise band — the other
 # faces in the same live frame that really were unrecognized scored
 # 0.15-0.21, well below even this new floor.
-SIMILARITY_THRESHOLD = 0.30
+SIMILARITY_THRESHOLD = config.RECOGNITION_SIMILARITY_THRESHOLD
 
 
 class FaceRecognizer:
@@ -78,7 +78,10 @@ class FaceRecognizer:
         # surfacing as a wrong name on an empty patch of wall. Raised to keep
         # full margin below real faces while cutting off that low-confidence
         # band the phantoms lived in.
-        self._app.prepare(ctx_id=0 if use_cuda else -1, det_size=(640, 640), det_thresh=0.65)
+        # Immediately overridden per-frame by detection_worker.py's per-camera
+        # CAMERA_DET_THRESH before every detect() call — this constructor-time
+        # value only matters as the initial default before the first frame.
+        self._app.prepare(ctx_id=0 if use_cuda else -1, det_size=(640, 640), det_thresh=config.RECOGNITION_DET_THRESH_DEFAULT)
         self._reload_enrolled()
 
     def _reload_enrolled(self) -> None:

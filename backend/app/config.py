@@ -1,3 +1,4 @@
+import json
 import os
 import secrets
 from pathlib import Path
@@ -148,3 +149,102 @@ AUTH_RATE_LIMIT = os.getenv("AUTH_RATE_LIMIT", "10/minute")
 # detection_fps) doesn't fragment one sitting into several; short enough
 # that a real "got up and left" registers as Away within a reasonable time.
 DESK_SESSION_GRACE_SECONDS = int(os.getenv("DESK_SESSION_GRACE_SECONDS", "20"))
+
+# --- Recognition pipeline tuning (all environment-overridable) ----------
+# These were previously hardcoded constants scattered across detection_worker.py
+# / pipeline.py / recognizer.py, each tuned against a specific real camera this
+# session (see the git history / inline comments in those files for the exact
+# measurements behind each default below). Centralizing them here as env vars
+# means retuning for a different camera, a different physical install, or
+# different deployment hardware never requires editing the recognition code
+# itself. The defaults below reproduce exactly what was already running —
+# setting no env vars changes no behavior.
+
+# Cosine-similarity floor for a face embedding to count as a recognized match
+# (recognizer.py). Below this, a face is reported as "Unknown" regardless of
+# whose embedding it's closest to.
+RECOGNITION_SIMILARITY_THRESHOLD = float(os.getenv("RECOGNITION_SIMILARITY_THRESHOLD", "0.30"))
+
+# Face-detector confidence floor used when no per-camera override applies
+# (detection_worker.py's CAMERA_DET_THRESH still takes priority for cameras
+# 1/2 — see CAMERA_DET_THRESH_JSON below to override those too).
+RECOGNITION_DET_THRESH_DEFAULT = float(os.getenv("RECOGNITION_DET_THRESH_DEFAULT", "0.65"))
+
+# Optional JSON object mapping camera_id -> detection threshold, e.g.
+# '{"1": 0.5, "2": 0.45}', to override detection_worker.py's measured
+# per-camera defaults without touching code. Unset (the default) keeps those
+# measured values exactly as they are.
+_camera_det_thresh_json = os.getenv("CAMERA_DET_THRESH_JSON")
+CAMERA_DET_THRESH_OVERRIDES = (
+    {int(k): float(v) for k, v in json.loads(_camera_det_thresh_json).items()} if _camera_det_thresh_json else None
+)
+
+# Optional JSON object mapping camera_id -> detection resolution (longer side,
+# px), e.g. '{"2": 1280}', overriding detection_worker.py's
+# CAMERA_DETECTION_MAX_DIM. Unset keeps the measured per-camera defaults.
+_camera_max_dim_json = os.getenv("CAMERA_DETECTION_MAX_DIM_JSON")
+CAMERA_DETECTION_MAX_DIM_OVERRIDES = (
+    {int(k): int(v) for k, v in json.loads(_camera_max_dim_json).items()} if _camera_max_dim_json else None
+)
+
+# How many of a frame's largest not-yet-matched faces get a second, full-
+# resolution recognition pass (detection_worker.py) — the expensive step that
+# fixes small/distant faces scoring far lower than their true similarity.
+RECOGNITION_MAX_FULL_RES_RECHECKS = int(os.getenv("RECOGNITION_MAX_FULL_RES_RECHECKS", "8"))
+RECOGNITION_RECHECK_DET_THRESH = float(os.getenv("RECOGNITION_RECHECK_DET_THRESH", "0.3"))
+RECOGNITION_RECHECK_CROP_PADDING = float(os.getenv("RECOGNITION_RECHECK_CROP_PADDING", "0.8"))
+
+# How many consecutive detection cycles the SAME name must appear on a camera
+# before it's logged as a detection_event (attendance/analytics) — filters out
+# a one-off spurious match (embedding noise on a single frame) without
+# touching what the live overlay shows immediately. 1 (the default) reproduces
+# the previous behavior exactly: any single hit logs, same as before this
+# setting existed. Raise it to require the match to repeat before it's
+# recorded; keep DETECTION_LOG_COOLDOWN_SECONDS below as the separate
+# duplicate-suppression window for an already-confirmed, continuously-present
+# person.
+RECOGNITION_MIN_CONSECUTIVE_HITS = int(os.getenv("RECOGNITION_MIN_CONSECUTIVE_HITS", "1"))
+
+# Once a name has been logged, don't log it again for the same camera more
+# often than this — avoids flooding detection_events while someone stands
+# continuously in frame.
+DETECTION_LOG_COOLDOWN_SECONDS = int(os.getenv("DETECTION_LOG_COOLDOWN_SECONDS", "30"))
+
+# How long a synchronous embedding request (enrollment / camera Allow List
+# sync) waits for the detection worker to respond before giving up. Must
+# comfortably exceed the worker's worst-case single-frame processing time on
+# whatever hardware this is running on, or a slow (but eventually successful)
+# detection gets wrongly reported as "no face detected".
+DETECTION_EMBED_TIMEOUT_SECONDS = float(os.getenv("DETECTION_EMBED_TIMEOUT_SECONDS", "25"))
+
+# RTSP reconnect backoff (pipeline.py): starts at the base delay, doubles on
+# each consecutive failure up to the max, resets to base on a successful
+# reconnect. Prevents a real outage from hammering the camera's own login
+# endpoint (some devices self-lockout after repeated rapid auth failures).
+CAMERA_RECONNECT_BASE_DELAY_SECONDS = float(os.getenv("CAMERA_RECONNECT_BASE_DELAY_SECONDS", "3"))
+CAMERA_RECONNECT_MAX_DELAY_SECONDS = float(os.getenv("CAMERA_RECONNECT_MAX_DELAY_SECONDS", "60"))
+
+# Total CPU core budget for the whole detection subsystem (all per-camera
+# worker processes combined), split proportionally by relative cost — see
+# PipelineManager._worker_core_allocation. Should be tuned to the actual
+# deployment machine's core count, not left at a value measured on a
+# different (e.g. local dev) machine — see the deployment note on this in
+# recognition_config's module docstring below.
+DETECTION_WORKER_MAX_CPU_CORES = int(os.getenv("DETECTION_WORKER_MAX_CPU_CORES", "4"))
+
+# Default face-recognition sampling rate (frames/sec sent to the detection
+# worker) before any /api/settings override — that DB-backed "detection_fps"
+# setting (see pipeline.py's _sender_loop) already lets this be changed live
+# from the UI without a restart; this env var only changes the fallback used
+# before that setting has ever been saved.
+DEFAULT_DETECTION_FPS = float(os.getenv("DEFAULT_DETECTION_FPS", "1"))
+
+# Root log level for both the main API process (main.py) and each per-camera
+# detection worker process (detection_worker.py runs in a separate OS
+# process — see pipeline.py's module docstring — so it configures its own
+# logging independently; this one env var controls both). The recognition
+# pipeline's per-frame stage tracing (frame received -> sent to worker ->
+# recognized -> stored) logs at DEBUG specifically so it stays silent by
+# default and can be switched on for a session without a code change when
+# actively diagnosing an accuracy/latency issue.
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")

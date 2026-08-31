@@ -39,7 +39,10 @@ from .pipeline import pipeline_manager
 
 ENROLLMENT_PHOTOS_DIR = Path(__file__).resolve().parent.parent / "data" / "enrollment_photos"
 
-logging.basicConfig(level=getattr(logging, config.LOG_LEVEL.upper(), logging.INFO))
+logging.basicConfig(
+    level=getattr(logging, config.LOG_LEVEL.upper(), logging.INFO),
+    format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+)
 logger = logging.getLogger("dashboard")
 
 app = FastAPI()

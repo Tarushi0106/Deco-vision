@@ -258,7 +258,10 @@ def run_worker(
     # Runs in its own OS process (see this module's docstring) — it never
     # inherits main.py's logging.basicConfig call, so without this, every
     # logger.* call below would silently go nowhere.
-    logging.basicConfig(level=getattr(logging, config.LOG_LEVEL.upper(), logging.INFO))
+    logging.basicConfig(
+        level=getattr(logging, config.LOG_LEVEL.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+    )
     _cap_inference_threads(max_cpu_cores)
 
     # imported here, after the onnxruntime patch above is in place, so every

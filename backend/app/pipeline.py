@@ -35,7 +35,7 @@ except ImportError:
 
 from . import alerts_db, camera_db, clips_db, config, face_db, footfall_gate_db, zones_db
 from .desk_tracker import DeskTracker
-from .detection_worker import run_worker
+from .detection_worker import CAMERA_DETECTION_MAX_DIM, run_worker
 from .footfall_counter import FootfallCounter, resolve_footfall_camera_ids
 from .gate_tracker import GateTracker
 from .video_source import RtspSource, WebcamSource
@@ -471,20 +471,44 @@ class PipelineManager:
         self._pipelines: dict[int, CameraPipeline] = {}
         self._conn_keys: dict[int, tuple] = {}
 
-        self._input_queue: multiprocessing.Queue = multiprocessing.Queue(maxsize=10)
+        # One detection-worker PROCESS PER CAMERA (keyed by camera_id), not one
+        # shared worker for every camera — see _start_worker. A single shared
+        # worker measured this session: it processes one "detect" item at a
+        # time, so one camera's expensive frame (e.g. a wide multi-person room
+        # at higher detection resolution, needing several costly per-face
+        # full-res rechecks — see detection_worker.py's MAX_FULL_RES_RECHECKS)
+        # can take 8-15+ seconds, during which every OTHER camera's frames
+        # pile up behind it and get silently dropped once its input queue
+        # fills (maxsize=10) — that camera then barely gets recognized at
+        # all, not because matching is wrong but because its frames rarely
+        # reach the worker. Giving each camera its own process+queue means
+        # one camera's cost can never block another's — and this scales UP
+        # on real deployment hardware (more cores/a GPU), unlike the old
+        # design which stayed serialized no matter how much hardware was
+        # available.
+        self._input_queues: dict[int, multiprocessing.Queue] = {}
+        self._worker_processes: dict[int, multiprocessing.Process] = {}
         self._result_queue: multiprocessing.Queue = multiprocessing.Queue(maxsize=50)
-        # Separate from _input_queue on purpose: embed requests (enrollment) are rare
-        # and time-sensitive (the caller is waiting synchronously, see
-        # compute_embedding's EMBED_REQUEST_TIMEOUT_SECONDS deadline below), while
-        # _input_queue carries a constant stream of "detect" frames. Sharing one FIFO
-        # meant an embed request could sit behind a backlog of detect frames long
-        # enough to blow past its own timeout — the worker would eventually process
-        # it and find the face just fine, but the caller had already given up and
-        # reported "no face detected", even though detection itself never failed.
-        # This is why every camera Allow List sync and manual enrollment was failing.
+        # Separate from the per-camera input queues on purpose: embed requests
+        # (enrollment) are rare and time-sensitive (the caller is waiting
+        # synchronously, see compute_embedding's EMBED_REQUEST_TIMEOUT_SECONDS
+        # deadline below), while each input queue carries a constant stream of
+        # "detect" frames. Sharing one FIFO meant an embed request could sit
+        # behind a backlog of detect frames long enough to blow past its own
+        # timeout — the worker would eventually process it and find the face
+        # just fine, but the caller had already given up and reported "no face
+        # detected", even though detection itself never failed. This is why
+        # every camera Allow List sync and manual enrollment was failing.
+        # Shared across every per-camera worker process below — whichever one
+        # polls first (each checks this queue before its own input queue, same
+        # priority as before) handles it; harmless with multiple consumers.
         self._embed_request_queue: multiprocessing.Queue = multiprocessing.Queue(maxsize=5)
         self._embed_response_queue: multiprocessing.Queue = multiprocessing.Queue()
-        self._worker_process: multiprocessing.Process | None = None
+        # Round-robins which logical CPU(s) each new worker is pinned to (see
+        # _pin_worker_cpu_affinity) so multiple per-camera workers don't all
+        # collide on the same core(s) — each slicing from the same start would
+        # defeat the point of separate processes.
+        self._next_core_offset = 0
 
         # Unique footfall (people counting) — see footfall_counter.py. Lives
         # here, in the main process, because its in-memory dedup cache needs
@@ -518,20 +542,51 @@ class PipelineManager:
     def _should_be_live(cam: dict) -> bool:
         return bool(cam["is_configured"] and cam["status"] == "active" and cam["live_feed_enabled"])
 
-    def _pin_worker_cpu_affinity(self) -> None:
+    def _pin_worker_cpu_affinity(self, pid: int, cores: int) -> None:
         if psutil is None:
             logger.warning("psutil not installed — detection worker can use all CPU cores")
             return
         try:
-            proc = psutil.Process(self._worker_process.pid)
-            available = proc.cpu_affinity()
-            proc.cpu_affinity(available[:WORKER_MAX_CPU_CORES])
-            logger.info(
-                "Detection worker pinned to %d of %d CPU cores",
-                min(WORKER_MAX_CPU_CORES, len(available)), len(available),
-            )
+            available = psutil.Process().cpu_affinity()
+            assigned = [available[(self._next_core_offset + i) % len(available)] for i in range(cores)]
+            self._next_core_offset = (self._next_core_offset + cores) % len(available)
+            psutil.Process(pid).cpu_affinity(assigned)
+            logger.info("Detection worker (pid %s) pinned to CPU core(s) %s", pid, assigned)
         except Exception as e:
             logger.warning("Could not set detection worker CPU affinity: %s", e)
+
+    def _worker_core_allocation(self, camera_ids: list[int]) -> dict[int, int]:
+        """WORKER_MAX_CPU_CORES is the TOTAL budget for the whole detection
+        subsystem, split across however many per-camera workers are active —
+        weighted by relative cost, not evenly. Measured live: an even
+        1-core-each split still left the camera tuned for
+        CAMERA_DETECTION_MAX_DIM (higher-resolution detection for a wide
+        multi-person room — several times more expensive per frame than a
+        default camera) taking 100-200+ seconds per full detect+recognize
+        cycle (gaps measured directly from its own detection_events), even
+        though it was no longer literally starved by other cameras like
+        before — an even split just moved the bottleneck from "shared queue"
+        to "too few cores for this specific camera's cost". Weighting that
+        camera 2x is what actually restores a reasonable cycle time; a
+        default-tuned camera never needed more than its even share to begin
+        with."""
+        if not camera_ids:
+            return {}
+        weights = {cid: (2 if cid in CAMERA_DETECTION_MAX_DIM else 1) for cid in camera_ids}
+        total_weight = sum(weights.values())
+        raw = {cid: WORKER_MAX_CPU_CORES * w / total_weight for cid, w in weights.items()}
+        allocation = {cid: max(1, int(v)) for cid, v in raw.items()}
+        # floor()'ing each share can under-allocate the total budget by a few
+        # cores — hand those out one at a time to whichever camera(s) lost the
+        # most to flooring, so the full budget is actually used.
+        leftover = WORKER_MAX_CPU_CORES - sum(allocation.values())
+        by_remainder = sorted(camera_ids, key=lambda cid: raw[cid] - int(raw[cid]), reverse=True)
+        i = 0
+        while leftover > 0 and by_remainder:
+            allocation[by_remainder[i % len(by_remainder)]] += 1
+            leftover -= 1
+            i += 1
+        return allocation
 
     def _refresh_footfall_cameras(self) -> None:
         resolved = resolve_footfall_camera_ids(camera_db.list_cameras())
@@ -565,24 +620,10 @@ class PipelineManager:
         self._desk_tracker = DeskTracker()
         self._gate_tracker = GateTracker(footfall_gate_db)
 
-        self._worker_process = multiprocessing.Process(
-            target=run_worker,
-            args=(
-                self._input_queue,
-                self._result_queue,
-                self._embed_response_queue,
-                self._embed_request_queue,
-                WORKER_MAX_CPU_CORES,
-            ),
-            daemon=True,
-        )
-        self._worker_process.start()
-        logger.info("Detection worker process started (pid %s)", self._worker_process.pid)
-        self._pin_worker_cpu_affinity()
-
-        for cam in camera_db.list_cameras():
-            if self._should_be_live(cam):
-                self._start_camera(cam["id"])
+        live_cameras = [cam for cam in camera_db.list_cameras() if self._should_be_live(cam)]
+        allocation = self._worker_core_allocation([cam["id"] for cam in live_cameras])
+        for cam in live_cameras:
+            self._start_camera(cam["id"], allocation[cam["id"]])
 
         self._running = True
         self._sender_thread = threading.Thread(target=self._sender_loop, daemon=True)
@@ -596,9 +637,8 @@ class PipelineManager:
             self._sender_thread.join(timeout=5)
         if self._receiver_thread:
             self._receiver_thread.join(timeout=5)
-        if self._worker_process is not None:
-            self._worker_process.terminate()
-            self._worker_process.join(timeout=5)
+        for camera_id in list(self._worker_processes):
+            self._stop_worker(camera_id)
         for pipeline in self._pipelines.values():
             pipeline.stop()
         self._pipelines.clear()
@@ -610,13 +650,38 @@ class PipelineManager:
             return None
         return (cam["host"], cam["port"], cam["user"], cam["password"], cam["stream_path"])
 
-    def _start_camera(self, camera_id: int) -> None:
+    def _start_worker(self, camera_id: int, cores: int) -> None:
+        input_queue: multiprocessing.Queue = multiprocessing.Queue(maxsize=10)
+        worker = multiprocessing.Process(
+            target=run_worker,
+            args=(input_queue, self._result_queue, self._embed_response_queue, self._embed_request_queue, cores),
+            daemon=True,
+        )
+        worker.start()
+        self._input_queues[camera_id] = input_queue
+        self._worker_processes[camera_id] = worker
+        logger.info("Camera %s: detection worker process started (pid %s)", camera_id, worker.pid)
+        self._pin_worker_cpu_affinity(worker.pid, cores)
+
+    def _stop_worker(self, camera_id: int) -> None:
+        worker = self._worker_processes.pop(camera_id, None)
+        if worker is not None:
+            worker.terminate()
+            worker.join(timeout=5)
+        self._input_queues.pop(camera_id, None)
+
+    def _start_camera(self, camera_id: int, worker_cores: int = WORKER_MAX_CPU_CORES) -> None:
         if camera_id in self._pipelines:
             return
         pipeline = CameraPipeline(camera_id)
         pipeline.start()
         self._pipelines[camera_id] = pipeline
         self._conn_keys[camera_id] = self._connection_key(camera_id)
+        # Not restarted on a plain reconnect (see refresh_cameras) — the worker
+        # process holds no RTSP connection state, only the capture pipeline
+        # above does, so an already-running worker for this camera stays put.
+        if camera_id not in self._worker_processes:
+            self._start_worker(camera_id, worker_cores)
 
     def refresh_cameras(self) -> None:
         """Call after camera CRUD changes to start/stop pipelines accordingly.
@@ -634,14 +699,17 @@ class PipelineManager:
             if cam is None or not self._should_be_live(cam):
                 self._pipelines.pop(camera_id).stop()
                 self._conn_keys.pop(camera_id, None)
+                self._stop_worker(camera_id)
             elif self._connection_key(camera_id) != self._conn_keys.get(camera_id):
                 logger.info("Camera %s: connection details changed, reconnecting", camera_id)
                 self._pipelines.pop(camera_id).stop()
                 self._conn_keys.pop(camera_id, None)
 
+        live_ids = [cam["id"] for cam in cameras.values() if self._should_be_live(cam)]
+        allocation = self._worker_core_allocation(live_ids)
         for cam in cameras.values():
             if self._should_be_live(cam):
-                self._start_camera(cam["id"])
+                self._start_camera(cam["id"], allocation[cam["id"]])
 
     def _sender_loop(self) -> None:
         """Feeds the detection worker JPEG bytes at the user-configurable
@@ -664,8 +732,11 @@ class PipelineManager:
                 jpeg = pipeline.get_latest_jpeg()
                 if jpeg is None:
                     continue
+                input_queue = self._input_queues.get(camera_id)
+                if input_queue is None:
+                    continue
                 try:
-                    self._input_queue.put_nowait({"type": "detect", "camera_id": camera_id, "jpeg": jpeg})
+                    input_queue.put_nowait({"type": "detect", "camera_id": camera_id, "jpeg": jpeg})
                 except queue.Full:
                     pass
 
@@ -839,8 +910,9 @@ class PipelineManager:
         return None
 
     def reload_faces(self) -> None:
-        self._input_queue.put({"type": "reload_faces"})
-        logger.info("Signaled detection worker to reload enrolled faces")
+        for input_queue in self._input_queues.values():
+            input_queue.put({"type": "reload_faces"})
+        logger.info("Signaled %d detection worker(s) to reload enrolled faces", len(self._input_queues))
 
     def get_latest_jpeg(self, camera_id: int) -> bytes | None:
         pipeline = self._pipelines.get(camera_id)

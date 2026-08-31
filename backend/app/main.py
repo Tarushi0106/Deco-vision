@@ -11,6 +11,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import requests
 from fastapi import (
     Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile, WebSocket, WebSocketDisconnect,
 )
@@ -33,7 +34,7 @@ from . import (
     license_db, license_qr, scheduler, user_db, zones_db,
 )
 from . import onvif_client, pipeline, replay_prefetch
-from .camera_client import camera_client, get_camera_client, sync_face_to_all_devices
+from .camera_client import get_camera_client, sync_face_to_all_devices
 from .pipeline import pipeline_manager
 
 ENROLLMENT_PHOTOS_DIR = Path(__file__).resolve().parent.parent / "data" / "enrollment_photos"
@@ -847,10 +848,16 @@ def get_clip_video(clip_id: int):
 
 
 @app.get("/api/debug/snaped-faces")
-def debug_snaped_faces():
+def debug_snaped_faces(camera_id: int = 1):
+    cam = camera_db.get_camera_connection(camera_id)
+    if cam is None or not cam["host"]:
+        raise HTTPException(404, f"Camera {camera_id} has no connection details")
+    client = get_camera_client(cam["host"], cam["user"], cam["password"], cam["admin_port"])
     today = datetime.now().strftime("%Y-%m-%d")
-    result = camera_client.search_snaped_faces(f"{today} 00:00:00", f"{today} 23:59:59")
-    return result
+    try:
+        return client.search_snaped_faces(f"{today} 00:00:00", f"{today} 23:59:59")
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(502, f"Could not reach camera {camera_id}'s admin API: {e}")
 
 
 @app.get("/api/faces")

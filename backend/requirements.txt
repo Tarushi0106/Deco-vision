@@ -5,7 +5,7 @@ numpy
 websockets
 python-dotenv
 insightface
-onnxruntime
+onnxruntime-gpu
 requests
 python-multipart
 ultralytics

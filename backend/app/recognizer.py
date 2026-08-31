@@ -1,4 +1,5 @@
 import numpy as np
+import onnxruntime
 from insightface.app import FaceAnalysis
 
 from . import face_db
@@ -39,7 +40,25 @@ class FaceRecognizer:
         # available cores, finish fast) and controlling total impact via
         # DETECTION_INTERVAL_SECONDS/PERSON_ANALYSIS_INTERVAL_SECONDS
         # (how often it's called) instead, in pipeline.py.
-        self._app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+        # CUDAExecutionProvider only shows up in get_available_providers() when
+        # the onnxruntime-gpu package is installed (plain onnxruntime, what
+        # this repo's CPU-only dev/test machines use, never lists it) — so this
+        # stays exactly CPU-only (ctx_id=-1, same as before) everywhere except a
+        # box actually set up with onnxruntime-gpu + real NVIDIA drivers. Even
+        # there, onnxruntime falls back to the next provider in the list on its
+        # own if CUDA init fails, so listing it here can't break a machine that
+        # turns out not to actually have a usable GPU at runtime. NOT the same
+        # DmlExecutionProvider path measured above as much slower — that's the
+        # Intel iGPU provider; this is NVIDIA CUDA, never benchmarked here.
+        use_cuda = "CUDAExecutionProvider" in onnxruntime.get_available_providers()
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if use_cuda else ["CPUExecutionProvider"]
+        # Only "detection" and "recognition" are ever read (see detection_worker.py's
+        # _lean_get/_lean_recognize_crop, which call det_model.detect() and the
+        # recognition model directly, bypassing FaceAnalysis.get() specifically to
+        # skip landmark_3d_68/landmark_2d_106/genderage) — not loading them at all
+        # saves both memory and startup time, which matters more once each camera
+        # gets its own worker process (see pipeline.py) each loading a full copy.
+        self._app = FaceAnalysis(name="buffalo_l", providers=providers, allowed_modules=["detection", "recognition"])
         # Measured on the live Entry/Exit camera: real faces score 0.78-0.87
         # det_score, but at the old 0.5 threshold this office's busy patterned
         # wall graphics/glass reflections occasionally clear the bar as a
@@ -49,7 +68,7 @@ class FaceRecognizer:
         # surfacing as a wrong name on an empty patch of wall. Raised to keep
         # full margin below real faces while cutting off that low-confidence
         # band the phantoms lived in.
-        self._app.prepare(ctx_id=-1, det_size=(640, 640), det_thresh=0.65)
+        self._app.prepare(ctx_id=0 if use_cuda else -1, det_size=(640, 640), det_thresh=0.65)
         self._reload_enrolled()
 
     def _reload_enrolled(self) -> None:

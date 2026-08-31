@@ -71,7 +71,7 @@ Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/Deco-vision/backend
 Environment="PATH=/home/ubuntu/Deco-vision/backend/venv/bin"
-ExecStart=/home/ubuntu/Deco-vision/backend/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8811 --workers 2
+ExecStart=/home/ubuntu/Deco-vision/backend/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8811
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal

@@ -117,10 +117,10 @@ export default function CameraTile({
         drawZonesOverlay(overlayCtx, zonesRef.current)
         drawDraftPolygon(overlayCtx, draftPointsRef.current)
         overlayCtx.lineWidth = 2
-        overlayCtx.font = 'bold 12px sans-serif'
+        overlayCtx.font = 'bold 9px sans-serif'
         overlayCtx.textBaseline = 'bottom'
 
-        const LABEL_HEIGHT = 16
+        const LABEL_HEIGHT = 12
         const placedLabels = []
         const overlaps = (a, b) => a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y
 
@@ -155,7 +155,7 @@ export default function CameraTile({
           overlayCtx.fillStyle = labelBg
           overlayCtx.fillRect(candidate.x, candidate.y, candidate.w, candidate.h)
           overlayCtx.fillStyle = 'white'
-          overlayCtx.fillText(label, candidate.x + 4, candidate.y + LABEL_HEIGHT - 3)
+          overlayCtx.fillText(label, candidate.x + 3, candidate.y + LABEL_HEIGHT - 2)
         }
       }
     }

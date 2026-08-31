@@ -12,7 +12,17 @@ from . import face_db
 # by a few hundredths. Genuinely wrong/coincidental matches observed this
 # session topped out around 0.28, so 0.32 recovers cases like Satyendra's
 # without (as far as measured) letting those coincidental ones through.
-SIMILARITY_THRESHOLD = 0.32
+#
+# Lowered again from 0.32: on the wide-angle "Main gate" camera, a real
+# enrolled person ("Aarti") standing farther from the camera scored 0.307
+# live — correctly matched moments earlier (0.414) from a different
+# angle/distance, so this isn't a wrong-person match, just a smaller/
+# noisier face crop. Still comfortably above the 0.28 false-positive
+# ceiling measured above, so this recovers distant-face cases like hers
+# without (as far as measured) crossing into that noise band — the other
+# faces in the same live frame that really were unrecognized scored
+# 0.15-0.21, well below even this new floor.
+SIMILARITY_THRESHOLD = 0.30
 
 
 class FaceRecognizer:

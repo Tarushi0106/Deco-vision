@@ -937,6 +937,23 @@ def remove_person(name: str):
     }
 
 
+@app.delete("/api/people/{name}/photos/{filename}")
+def remove_person_photo(name: str, filename: str):
+    """Removes a single enrollment sample without touching the rest of a
+    person's photos — previously the only way to drop one bad photo was
+    deleting the whole person and re-uploading everything else."""
+    deleted = face_db.delete_face_photo(name, filename)
+    if not deleted:
+        raise HTTPException(404, "No such photo for this person")
+    (ENROLLMENT_PHOTOS_DIR / filename).unlink(missing_ok=True)
+    remaining = face_db.count_faces(name)
+    if remaining == 0:
+        zones_db.remove_person_from_zones(name)
+    pipeline_manager.reload_faces()
+    logger.info("Removed photo %s from %s (%d sample(s) remain)", filename, name, remaining)
+    return {"name": name, "filename": filename, "remaining_samples": remaining}
+
+
 def _sync_people_from_camera() -> dict:
     synced, skipped = 0, 0
     failed = []

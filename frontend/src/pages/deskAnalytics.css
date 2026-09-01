@@ -1,13 +1,17 @@
 .desk-analytics-grid {
   display: grid;
-  grid-template-columns: 1.2fr 1fr;
+  /* first column sizes to its content (the zone editor below, pinned to
+     half the viewport width) instead of an arbitrary fr split -- a small
+     camera view made precise click-and-drag desk marking hard to get right */
+  grid-template-columns: auto 1fr;
   gap: 1rem;
   align-items: start;
 }
 
 .desk-zone-editor {
   position: relative;
-  width: 100%;
+  width: 75vw;
+  max-width: 100%;
   aspect-ratio: 16 / 9;
   background: #0d0f14;
   border-radius: 8px;

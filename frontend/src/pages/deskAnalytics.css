@@ -1,12 +1,46 @@
 .desk-analytics-grid {
   display: grid;
-  grid-template-columns: 1.2fr 1fr;
+  /* Equal halves: camera and report the same width, not the 2fr/1fr split
+     used elsewhere -- explicit request for this page specifically. */
+  grid-template-columns: 1fr 1fr;
   gap: 1rem;
-  align-items: start;
+  /* stretch (not start): both columns share this row's full height, so a
+     short camera panel doesn't leave the report panel to define its own,
+     taller height -- see the height cap below, which is the actual "no
+     page scroll" mechanism. */
+  align-items: stretch;
+  /* --topbar-height (theme.css) + .page-content's own padding (layout.css)
+     + this tab's toolbar-sub line above the grid + a margin of safety --
+     caps the WHOLE row to always fit inside one viewport. Anything that
+     would overflow a column at this height scrolls inside that column
+     instead (see .desk-analytics-scroll), never the page itself. */
+  height: calc(100vh - var(--topbar-height) - 9rem);
+}
+
+/* See the identical rule on .dashboard-main-grid in pages.css -- a <canvas>'s
+   JS-set pixel width otherwise overrides this grid's own 2fr/1fr split. */
+.desk-analytics-grid > * {
+  min-width: 0;
+}
+
+/* Both grid columns: fixed-height card, header/camera/description stay put,
+   only .desk-analytics-scroll below (the zone list / report table) grows
+   and scrolls internally within whatever height is left. */
+.desk-analytics-col {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.desk-analytics-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .desk-zone-editor {
   position: relative;
+  /* Fills its grid column, same as CameraTile's .camera-tile-video. */
   width: 100%;
   aspect-ratio: 16 / 9;
   background: #0d0f14;

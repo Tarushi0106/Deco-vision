@@ -205,7 +205,7 @@ function ZoneManager() {
   }
 
   return (
-    <div className="card panel">
+    <div className="card panel desk-analytics-col">
       <div className="panel-header">
         <h3>Desk Zones</h3>
         <select value={cameraId ?? ''} onChange={(e) => setCameraId(Number(e.target.value))}>
@@ -229,7 +229,7 @@ function ZoneManager() {
       {error && <div className="form-message error">{error}</div>}
 
       {zones.length > 0 && (
-        <div className="desk-zone-list">
+        <div className="desk-zone-list desk-analytics-scroll">
           {zones.map((z, i) => (
             <div key={z.id} className="desk-zone-list-row">
               <span className="dot" style={{ background: ZONE_COLORS[i % ZONE_COLORS.length] }} />
@@ -259,50 +259,50 @@ function ReportView() {
   }, [date])
 
   return (
-    <div className="card panel">
+    <div className="card panel desk-analytics-col">
       <div className="panel-header">
         <h3>Desk Time Report</h3>
         <input type="date" value={date} max={todayStr()} onChange={(e) => setDate(e.target.value)} />
       </div>
       {error && <div className="form-message error">{error}</div>}
-      <table>
-        <thead>
-          <tr>
-            <th>Employee</th>
-            <th>Current Desk</th>
-            <th>Current Status</th>
-            <th>Total Desk Time</th>
-            <th>Total Time Away</th>
-            <th>Movements</th>
-            <th>First Session</th>
-            <th>Last Session</th>
-          </tr>
-        </thead>
-        <tbody>
-          {!report || report.employees.length === 0 ? (
+      <div className="desk-analytics-scroll">
+        <table>
+          <thead>
             <tr>
-              <td colSpan={8} className="empty-state">No employees enrolled yet.</td>
+              <th>Employee</th>
+              <th>Current Desk</th>
+              <th>Current Status</th>
+              <th>Total Desk Time</th>
+              <th>Total Time Away</th>
+              <th>First Session</th>
+              <th>Last Session</th>
             </tr>
-          ) : (
-            report.employees.map((e) => (
-              <tr key={e.employee_name}>
-                <td>{e.employee_name}</td>
-                <td>{e.current_desk || '—'}</td>
-                <td>
-                  <span className={`pill ${STATUS_PILL_CLASS[e.current_status]}`}>
-                    {STATUS_LABEL[e.current_status]}
-                  </span>
-                </td>
-                <td>{formatDuration(e.desk_seconds)}</td>
-                <td>{formatDuration(e.away_seconds)}</td>
-                <td>{e.movements}</td>
-                <td>{formatTime(e.first_session)}</td>
-                <td>{formatTime(e.last_session)}</td>
+          </thead>
+          <tbody>
+            {!report || report.employees.length === 0 ? (
+              <tr>
+                <td colSpan={7} className="empty-state">No employees enrolled yet.</td>
               </tr>
-            ))
-          )}
-        </tbody>
-      </table>
+            ) : (
+              report.employees.map((e) => (
+                <tr key={e.employee_name}>
+                  <td>{e.employee_name}</td>
+                  <td>{e.current_desk || '—'}</td>
+                  <td>
+                    <span className={`pill ${STATUS_PILL_CLASS[e.current_status]}`}>
+                      {STATUS_LABEL[e.current_status]}
+                    </span>
+                  </td>
+                  <td>{formatDuration(e.desk_seconds)}</td>
+                  <td>{formatDuration(e.away_seconds)}</td>
+                  <td>{formatTime(e.first_session)}</td>
+                  <td>{formatTime(e.last_session)}</td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
     </div>
   )
 }

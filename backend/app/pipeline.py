@@ -38,6 +38,7 @@ from .desk_tracker import DeskTracker
 from .detection_worker import CAMERA_DETECTION_MAX_DIM, run_worker
 from .footfall_counter import FootfallCounter, resolve_footfall_camera_ids
 from .gate_tracker import GateTracker
+from .recognition_stabilizer import RecognitionStabilizer
 from .video_source import RtspSource, WebcamSource
 
 logger = logging.getLogger("dashboard.pipeline")
@@ -153,6 +154,10 @@ class CameraPipeline:
         # the live overlay) — see RECOGNITION_MIN_CONSECUTIVE_HITS. Reset to 0
         # for any name absent from the current detection cycle.
         self._consecutive_hits: dict[str, int] = {}
+        # None (the default) means stabilization is off, in which case
+        # set_detections() below skips it entirely -- zero behavior change
+        # from before this feature existed.
+        self._stabilizer = RecognitionStabilizer() if config.RECOGNITION_STABILIZATION_ENABLED else None
         self._clip_buffer: deque[tuple[float, bytes]] = deque()
         self._clip_buffer_lock = threading.Lock()
         # Resizing+encoding clip video is real per-frame CPU work — measured this session:
@@ -225,6 +230,13 @@ class CameraPipeline:
             self._last_detection[SMOKE_CLIP_SUBJECT] = now
 
     def set_detections(self, detections: list[dict]) -> None:
+        # Scoped here deliberately: zone-violation and footfall/desk logic in
+        # PipelineManager._dispatch_result already ran against the RAW
+        # per-frame match before this is called, so temporal smoothing never
+        # delays a security-relevant decision -- it only affects what's
+        # displayed live and what gets logged as a detection_event.
+        if self._stabilizer is not None:
+            detections = self._stabilizer.stabilize(detections)
         with self._lock:
             self._latest_detections = detections
         now = time.time()
@@ -857,24 +869,34 @@ class PipelineManager:
         if pipeline is None:
             return
 
+        # Hoisted to method scope (not just the "faces" block below) so the
+        # pose-based footfall_events fallback further down can also see it —
+        # a camera with a gate line configured must never ALSO log crossings
+        # from the old, much-less-reliable pose-based midline tracker, or
+        # the same real crossing could be counted twice.
+        gate_active = False
+
         if "faces" in result:
             frame_w, frame_h = result.get("frame_size", (0, 0))
 
             # Footfall gate-line crossing (see gate_tracker.py) needs the
-            # embedding, so it runs BEFORE the pop below strips it. Returns
-            # True iff this camera has a gate line configured at all — in
-            # that case it already called footfall_counter.process() itself,
-            # exactly once per actual crossing, so the fallback below must
-            # not ALSO count every frame a face happens to be visible.
-            gate_active = False
+            # embedding, so it runs BEFORE the pop below strips it. gate_active
+            # is True iff this camera has a gate line configured at all — in
+            # that case it already called footfall_counter.process() itself
+            # for "in" crossings, so the whole-frame fallback below must not
+            # ALSO count every frame a face happens to be visible. gate_events
+            # is "in"/"out" per actual crossing (both directions), logged the
+            # same way person_tracker.py's pose-based crossings already are.
             if (
                 self._gate_tracker is not None
                 and self._footfall_counter is not None
                 and camera_id in self._footfall_camera_ids
             ):
-                gate_active = self._gate_tracker.process_frame(
+                gate_active, gate_events = self._gate_tracker.process_frame(
                     camera_id, result["faces"], frame_w, frame_h, self._footfall_counter,
                 )
+                for direction in gate_events:
+                    face_db.log_footfall(camera_id, direction)
 
             for face in result["faces"]:
                 # Pop rather than leave in place: this same dict is stored as
@@ -906,8 +928,14 @@ class PipelineManager:
             frame_w, frame_h = result.get("frame_size", (0, 0))
             self._desk_tracker.process_pose_frame(camera_id, result["people"], frame_w, frame_h)
 
-        for direction in result.get("footfall_events", []):
-            face_db.log_footfall(camera_id, direction)
+        # Skipped when a gate line is active for this camera -- gate_tracker
+        # already logged both directions above from the same frame's faces,
+        # far more reliably (1s cadence vs pose's 20s); logging this too
+        # would double-count the same real crossing on cameras that have
+        # both a gate line and pose-based tracking running.
+        if not gate_active:
+            for direction in result.get("footfall_events", []):
+                face_db.log_footfall(camera_id, direction)
 
         if "fire_smoke" in result:
             pipeline.set_fire_smoke(result["fire_smoke"])

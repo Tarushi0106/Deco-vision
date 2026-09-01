@@ -80,16 +80,28 @@ class GateTracker:
         return 1 if cross > 0 else (-1 if cross < 0 else 0)
 
     def process_frame(self, camera_id: int, faces: list[dict], frame_width: int, frame_height: int,
-                       footfall_counter, now: float | None = None) -> bool:
-        """Returns True if a gate line is configured for this camera (i.e.
-        gate-crossing mode is active) — the caller uses this to decide
-        whether to fall back to the old whole-frame behavior for a
-        footfall-enabled camera that doesn't have a line drawn yet."""
+                       footfall_counter, now: float | None = None) -> tuple[bool, list[str]]:
+        """Returns (gate_active, footfall_events). gate_active is True if a
+        gate line is configured for this camera (i.e. gate-crossing mode is
+        active) — the caller uses this to decide whether to fall back to the
+        old whole-frame behavior for a footfall-enabled camera that doesn't
+        have a line drawn yet. footfall_events is a list of "in"/"out"
+        strings, same convention as person_tracker.py's pose-based crossing
+        — the caller logs each via face_db.log_footfall so the Footfall
+        page's in/out totals reflect gate crossings in both directions, not
+        just entries.
+
+        Only an "in" crossing (into gate["entry_sign"]'s side) also feeds
+        footfall_counter.process() (the unique-visitor dedup count) — an
+        "out" crossing is the same physical person leaving, not a new
+        visitor, so it must never bump that count, only the directional
+        in/out one."""
         gate = self._gates_by_camera.get(camera_id)
         if gate is None:
-            return False
+            return False, []
+        events: list[str] = []
         if not frame_width or not frame_height:
-            return True
+            return True, events
         now = now if now is not None else time.time()
 
         tracks = self._tracks_by_camera.setdefault(camera_id, {})
@@ -128,11 +140,15 @@ class GateTracker:
 
             if best_tid is not None:
                 track = tracks[best_tid]
-                if track["side"] and track["side"] != side and side == gate["entry_sign"]:
-                    footfall_counter.process(camera_id, embedding, name=name, now=now)
+                if track["side"] and track["side"] != side:
+                    if side == gate["entry_sign"]:
+                        footfall_counter.process(camera_id, embedding, name=name, now=now)
+                        events.append("in")
+                    else:
+                        events.append("out")
                     logger.info(
-                        "Gate: crossing detected on camera %s (%s)",
-                        camera_id, name or "unrecognized",
+                        "Gate: %s crossing detected on camera %s (%s)",
+                        events[-1], camera_id, name or "unrecognized",
                     )
                 track["cx"], track["cy"], track["side"], track["last_seen"] = cx, cy, side, now
                 # A confident name strengthens an until-now-anonymous track;
@@ -143,4 +159,4 @@ class GateTracker:
                 self._next_track_id += 1
                 tracks[self._next_track_id] = {"cx": cx, "cy": cy, "side": side, "last_seen": now, "name": name}
 
-        return True
+        return True, events

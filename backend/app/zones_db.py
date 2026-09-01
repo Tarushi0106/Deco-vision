@@ -4,6 +4,7 @@ detected inside the polygon raises a "zone_intrusion" alert (see pipeline.py
 PipelineManager._check_zone_violations). Mirrors camera_db.py's pattern.
 """
 
+import contextlib
 import json
 import sqlite3
 from pathlib import Path
@@ -11,9 +12,26 @@ from pathlib import Path
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "app.db"
 
 
-def get_connection() -> sqlite3.Connection:
+@contextlib.contextmanager
+def get_connection():
+    """Closed on exit — see alerts_db.get_connection for why this matters
+    (sqlite3's own `with conn:` never closes the connection, which leaked
+    a file descriptor per call and eventually exhausted the process's
+    open-file limit). This module's own list_zones() is called on every
+    detection cycle for every camera (see pipeline.py's
+    _check_zone_violations) — by far the highest-frequency caller of any
+    get_connection() in this codebase, so this was the leak that actually
+    exhausted the process's fd limit in practice, confirmed live via
+    `OSError: [Errno 24] Too many open files` and the resulting
+    `sqlite3.OperationalError: unable to open database file` breaking
+    every DB-backed endpoint until the next restart."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def init_db() -> None:

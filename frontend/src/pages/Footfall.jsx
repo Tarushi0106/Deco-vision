@@ -350,7 +350,7 @@ function GateEditor() {
   }
 
   return (
-    <div className="card panel" style={{ marginBottom: '1rem' }}>
+    <div className="card panel">
       <div className="panel-header">
         <h3>Entry Gate Line</h3>
         <select value={cameraId ?? ''} onChange={(e) => setCameraId(Number(e.target.value))}>
@@ -443,8 +443,6 @@ export default function Footfall() {
 
       {error && <div className="form-message error">{error}</div>}
 
-      <GateEditor />
-
       <div className="stat-grid">
         <StatTile label="Unique Footfall" value={report ? report.total : '—'} sub={`on ${date}`} />
         <StatTile
@@ -461,19 +459,27 @@ export default function Footfall() {
         <StatTile label="Cameras Reporting" value={report ? report.by_camera.length : '—'} sub="with at least one visit" />
       </div>
 
-      <div className="footfall-charts-grid">
-        <div className="card panel">
-          <div className="panel-header">
-            <h3>Footfall by Hour</h3>
-          </div>
-          {report ? <HourlyBarChart hourly={report.hourly} /> : <div className="empty-state">Loading…</div>}
-        </div>
+      {/* Same camera+panel split as the Intrusion page (.dashboard-main-grid) --
+          the gate camera fills the left half, analytics charts stack in the
+          right half, instead of the camera and charts being separate
+          full-width rows. */}
+      <div className="dashboard-main-grid">
+        <GateEditor />
 
-        <div className="card panel">
-          <div className="panel-header">
-            <h3>Footfall by Camera</h3>
+        <div className="footfall-analytics-stack">
+          <div className="card panel">
+            <div className="panel-header">
+              <h3>Footfall by Hour</h3>
+            </div>
+            {report ? <HourlyBarChart hourly={report.hourly} /> : <div className="empty-state">Loading…</div>}
           </div>
-          {report ? <CameraBarChart byCamera={report.by_camera} /> : <div className="empty-state">Loading…</div>}
+
+          <div className="card panel">
+            <div className="panel-header">
+              <h3>Footfall by Camera</h3>
+            </div>
+            {report ? <CameraBarChart byCamera={report.by_camera} /> : <div className="empty-state">Loading…</div>}
+          </div>
         </div>
       </div>
 

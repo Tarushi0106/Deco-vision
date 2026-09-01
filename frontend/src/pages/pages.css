@@ -343,6 +343,70 @@
   font-weight: 600;
 }
 
+/* Live Alerts (Dashboard) / Smoke Alerts (Smoke Detection) — a card list
+   instead of a wide multi-column table, since both panels sit in the
+   narrower half of a 2fr/1fr grid: a table's type/camera/message/time/
+   Resolve columns don't fit that width without clipping. Height-capped and
+   scrollable (like .clips-list) so a long alert backlog doesn't push the
+   rest of the page down. */
+.alerts-list {
+  max-height: 420px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.alerts-list-row {
+  padding: 0.65rem 0.85rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.alerts-list-row:last-child {
+  border-bottom: none;
+}
+
+.alerts-list-top {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.4rem;
+}
+
+.alerts-list-top .pill {
+  flex: 0 0 auto;
+}
+
+/* A pill (fixed width) + camera name (flexible) + time (fixed) sharing one
+   row will overflow the panel the moment the camera name is long — flex
+   items default to min-width:auto, which refuses to shrink below its own
+   text's intrinsic width instead of wrapping. Letting the name take the
+   remaining space and truncate (not the row overflow sideways) is what
+   keeps the time/Resolve button from being pushed off-panel. */
+.alerts-list-camera {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  font-size: 0.85rem;
+}
+
+.alerts-list-time {
+  flex: 0 0 auto;
+  font-size: 0.78rem;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+.alerts-list-message {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  margin-bottom: 0.5rem;
+  word-break: break-word;
+}
+
 .zone-form {
   margin-top: 0.75rem;
 }

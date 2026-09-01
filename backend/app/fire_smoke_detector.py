@@ -70,7 +70,15 @@ SMOKE_TREND_HISTORY = 10  # samples of masked-area used to judge growth (split i
 # Second-half average masked area must be at least this many times the
 # first-half average (or the plume must have appeared from ~nothing) before
 # the signal counts as "actually growing" rather than just "present".
-SMOKE_GROWTH_RATIO = 1.5
+# Raised from 1.5 -> 2.2: confirmed live (2026-09-01, "exit" and "Technical
+# section") that ordinary desk-area brightness/motion drift (see
+# SMOKE_MAX_REGION_MEAN_SATURATION's laptop-screen note below) could still
+# clear a 1.5x growth bar over SMOKE_TREND_HISTORY's window even after every
+# other fix in this file — it doesn't take a real expanding plume to
+# gradually out-grow its own noisy baseline by 50%. Real smoke, once it's
+# actually present, keeps compounding well past that; a stationary desk
+# scene's drift plateaus much sooner.
+SMOKE_GROWTH_RATIO = 2.2
 # Confirmed live: a person walking straight TOWARD the camera (an entry/exit
 # doorway's whole reason to exist) is solid, can wear pale/low-saturation
 # clothing, and genuinely grows in apparent size in place — passing the
@@ -82,7 +90,15 @@ SMOKE_GROWTH_RATIO = 1.5
 # window (SMOKE_TREND_HISTORY above, effectively ~10s at 1 sample/sec) lets
 # a brief walk-through's confirmation run out before it ever reaches this
 # bar, while persisting real smoke still clears it, just a bit slower.
-SMOKE_CONSECUTIVE_SAMPLES = 4  # require the (already growth-confirmed) signal to hold across several more samples before alerting
+# Raised from 4 -> 8 alongside SMOKE_GROWTH_RATIO above — same 2026-09-01
+# "exit"/"Technical section" false positives kept re-clearing the growth bar
+# every ~2 minute cooldown cycle, meaning the confirmed-growing state itself
+# wasn't transient, just wrong. Doubling how long that state has to hold
+# before alerting costs real smoke ~4 more seconds of detection latency but
+# gives a wrongly-confirmed desk scene twice as long to fall back out of
+# "growing" (it fluctuates; an actual fire/smoke source doesn't) before ever
+# reaching the alert.
+SMOKE_CONSECUTIVE_SAMPLES = 8  # require the (already growth-confirmed) signal to hold across several more samples before alerting
 # Confirmed live: a person shifting posture at a desk (real motion) against
 # their own low-saturation clothing/desk/monitor surroundings can satisfy the
 # growth check above too — over a several-second window, ordinary fidgeting
@@ -94,7 +110,14 @@ SMOKE_CONSECUTIVE_SAMPLES = 4  # require the (already growth-confirmed) signal t
 # dilated, fills most of its own bounding box; a person's fragmented motion
 # (head moves, hand moves, chair creaks) dilates into disjoint patches that
 # a bounding box spans loosely, with much emptier space in between.
-SMOKE_MIN_FILL_RATIO = 0.55  # contour area / bounding-box area
+# Raised from 0.55 -> 0.68: the 2026-09-01 "Technical section" false
+# positive (see cam2_false_positive_crop.jpg) was a desk corner spanning a
+# dark chair-back silhouette, a lit laptop, and the white desk edge between
+# them — three separate objects loosely dilating into one bounding box, not
+# one solid mass. That combination still cleared 0.55; a genuinely diffuse
+# smoke cloud fills its own box far more completely than a bounding box
+# drawn around several distinct desk objects does.
+SMOKE_MIN_FILL_RATIO = 0.68  # contour area / bounding-box area
 # A person WALKING (not just fidgeting in place) is solid, can be in light/
 # low-saturation clothing, and genuinely grows in apparent size as they
 # approach the camera — passing both the fill-ratio and growth checks above.

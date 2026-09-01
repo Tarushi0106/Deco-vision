@@ -28,11 +28,10 @@
   --viz-cat-4: #c98500;
 }
 
-.footfall-charts-grid {
-  display: grid;
-  grid-template-columns: 1.3fr 1fr;
+.footfall-analytics-stack {
+  display: flex;
+  flex-direction: column;
   gap: 1rem;
-  align-items: start;
 }
 
 .viz-chart-wrap {

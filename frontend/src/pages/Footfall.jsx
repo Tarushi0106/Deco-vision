@@ -350,53 +350,44 @@ function GateEditor() {
   }
 
   return (
-    <div className="dashboard-main-grid" style={{ marginBottom: '1rem' }}>
-      <div className="card panel">
-        <div className="panel-header">
-          <h3>Entry Gate Line</h3>
-          <select value={cameraId ?? ''} onChange={(e) => setCameraId(Number(e.target.value))}>
-            {cameras.map((c) => (
-              <option key={c.id} value={c.id}>{c.name}</option>
-            ))}
-          </select>
-        </div>
-
-        {camera ? (
-          <div className="footfall-gate-editor" ref={containerRef} onClick={handleClick}>
-            <canvas ref={canvasRef} className="footfall-gate-video" />
-            <canvas ref={overlayRef} className="footfall-gate-overlay" />
-            {status !== 'live' && (
-              <div className="camera-tile-offline">{status === 'offline' ? 'Camera offline' : 'Connecting…'}</div>
-            )}
-          </div>
-        ) : (
-          <div className="empty-state">No cameras configured.</div>
-        )}
-
-        {pendingPoint && (
-          <div className="stat-tile-sub" style={{ marginTop: '0.5rem' }}>Click the second point to finish the line…</div>
-        )}
-        {error && <div className="form-message error">{error}</div>}
+    <div className="card panel">
+      <div className="panel-header">
+        <h3>Entry Gate Line</h3>
+        <select value={cameraId ?? ''} onChange={(e) => setCameraId(Number(e.target.value))}>
+          {cameras.map((c) => (
+            <option key={c.id} value={c.id}>{c.name}</option>
+          ))}
+        </select>
+      </div>
+      <div className="stat-tile-sub" style={{ marginBottom: '0.6rem' }}>
+        Click two points on the feed to draw a line across the gate. Someone tracked crossing it in the arrow's
+        direction counts as a unique footfall entry — even if their face isn't recognized, since the crossing itself
+        is what triggers the count, not a face match.
       </div>
 
-      <div className="card panel">
-        <div className="panel-header">
-          <h3>Gate on this camera</h3>
+      {camera ? (
+        <div className="footfall-gate-editor" ref={containerRef} onClick={handleClick}>
+          <canvas ref={canvasRef} className="footfall-gate-video" />
+          <canvas ref={overlayRef} className="footfall-gate-overlay" />
+          {status !== 'live' && (
+            <div className="camera-tile-offline">{status === 'offline' ? 'Camera offline' : 'Connecting…'}</div>
+          )}
         </div>
-        <div className="stat-tile-sub" style={{ marginBottom: '0.6rem' }}>
-          Click two points on the feed to draw a line across the gate. Someone tracked crossing it in the arrow's
-          direction counts as a unique footfall entry — even if their face isn't recognized, since the crossing
-          itself is what triggers the count, not a face match.
+      ) : (
+        <div className="empty-state">No cameras configured.</div>
+      )}
+
+      {pendingPoint && (
+        <div className="stat-tile-sub" style={{ marginTop: '0.5rem' }}>Click the second point to finish the line…</div>
+      )}
+      {error && <div className="form-message error">{error}</div>}
+
+      {gate && (
+        <div className="footfall-gate-actions">
+          <button className="btn btn-outline" onClick={handleFlip}>Flip Direction</button>
+          <button className="btn btn-outline" onClick={handleRemove}>Remove Gate</button>
         </div>
-        {gate ? (
-          <div className="footfall-gate-actions">
-            <button className="btn btn-outline" onClick={handleFlip}>Flip Direction</button>
-            <button className="btn btn-outline" onClick={handleRemove}>Remove Gate</button>
-          </div>
-        ) : (
-          <div className="empty-state">No gate line yet — draw one on the left.</div>
-        )}
-      </div>
+      )}
     </div>
   )
 }
@@ -452,8 +443,6 @@ export default function Footfall() {
 
       {error && <div className="form-message error">{error}</div>}
 
-      <GateEditor />
-
       <div className="stat-grid">
         <StatTile label="Unique Footfall" value={report ? report.total : '—'} sub={`on ${date}`} />
         <StatTile
@@ -470,19 +459,27 @@ export default function Footfall() {
         <StatTile label="Cameras Reporting" value={report ? report.by_camera.length : '—'} sub="with at least one visit" />
       </div>
 
-      <div className="footfall-charts-grid">
-        <div className="card panel">
-          <div className="panel-header">
-            <h3>Footfall by Hour</h3>
-          </div>
-          {report ? <HourlyBarChart hourly={report.hourly} /> : <div className="empty-state">Loading…</div>}
-        </div>
+      {/* Same camera+panel split as the Intrusion page (.dashboard-main-grid) --
+          the gate camera fills the left half, analytics charts stack in the
+          right half, instead of the camera and charts being separate
+          full-width rows. */}
+      <div className="dashboard-main-grid">
+        <GateEditor />
 
-        <div className="card panel">
-          <div className="panel-header">
-            <h3>Footfall by Camera</h3>
+        <div className="footfall-analytics-stack">
+          <div className="card panel">
+            <div className="panel-header">
+              <h3>Footfall by Hour</h3>
+            </div>
+            {report ? <HourlyBarChart hourly={report.hourly} /> : <div className="empty-state">Loading…</div>}
           </div>
-          {report ? <CameraBarChart byCamera={report.by_camera} /> : <div className="empty-state">Loading…</div>}
+
+          <div className="card panel">
+            <div className="panel-header">
+              <h3>Footfall by Camera</h3>
+            </div>
+            {report ? <CameraBarChart byCamera={report.by_camera} /> : <div className="empty-state">Loading…</div>}
+          </div>
         </div>
       </div>
 

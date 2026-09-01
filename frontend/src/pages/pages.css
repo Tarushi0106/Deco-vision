@@ -319,6 +319,7 @@
    rest of the page down. */
 .alerts-list {
   max-height: 420px;
+  overflow-x: hidden;
   overflow-y: auto;
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -340,13 +341,28 @@
   margin-bottom: 0.4rem;
 }
 
+.alerts-list-top .pill {
+  flex: 0 0 auto;
+}
+
+/* A pill (fixed width) + camera name (flexible) + time (fixed) sharing one
+   row will overflow the panel the moment the camera name is long — flex
+   items default to min-width:auto, which refuses to shrink below its own
+   text's intrinsic width instead of wrapping. Letting the name take the
+   remaining space and truncate (not the row overflow sideways) is what
+   keeps the time/Resolve button from being pushed off-panel. */
 .alerts-list-camera {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-weight: 600;
   font-size: 0.85rem;
 }
 
 .alerts-list-time {
-  margin-left: auto;
+  flex: 0 0 auto;
   font-size: 0.78rem;
   color: var(--text-faint);
   white-space: nowrap;

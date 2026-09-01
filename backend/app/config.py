@@ -239,6 +239,29 @@ DETECTION_WORKER_MAX_CPU_CORES = int(os.getenv("DETECTION_WORKER_MAX_CPU_CORES",
 # before that setting has ever been saved.
 DEFAULT_DETECTION_FPS = float(os.getenv("DEFAULT_DETECTION_FPS", "1"))
 
+# --- Temporal identity stabilization (recognition_stabilizer.py) --------
+# Every detection cycle matches faces independently -- nothing carries
+# identity between cycles by default, so a single noisy frame can flip a
+# confidently-recognized person to "Unknown" or a different name for one
+# cycle, then flip back (the classic "Rahul, Unknown, Amit, Rahul" flicker).
+# This tracks faces frame-to-frame by bounding-box overlap and only reports
+# a name once it has a clear majority across the recent window, holding
+# onto a stable identity through brief single-frame dips.
+#
+# Disabled by default (window=1, min_votes=1 is a no-op: every single vote
+# already "wins" its window of size 1) so this ships without changing
+# existing behavior; set RECOGNITION_STABILIZATION_ENABLED=true to turn it on.
+RECOGNITION_STABILIZATION_ENABLED = os.getenv("RECOGNITION_STABILIZATION_ENABLED", "false").lower() == "true"
+RECOGNITION_STABILIZATION_WINDOW = int(os.getenv("RECOGNITION_STABILIZATION_WINDOW", "5"))
+RECOGNITION_STABILIZATION_MIN_VOTES = int(os.getenv("RECOGNITION_STABILIZATION_MIN_VOTES", "3"))
+# Two detections across consecutive cycles are considered the same physical
+# face if their boxes overlap at least this much (Intersection-over-Union).
+RECOGNITION_TRACK_IOU_THRESHOLD = float(os.getenv("RECOGNITION_TRACK_IOU_THRESHOLD", "0.3"))
+# How long a track survives with no matching detection before it's dropped
+# (person left frame, or was fully occluded/undetected for a while) -- a few
+# detection cycles' worth at the default detection_fps.
+RECOGNITION_TRACK_TIMEOUT_SECONDS = float(os.getenv("RECOGNITION_TRACK_TIMEOUT_SECONDS", "5"))
+
 # How often the sender loop checks whether each camera's detection worker
 # process is still alive, and respawns it if not. Detection worker crashes
 # (confirmed live: a native-level crash with no Python exception, no OOM,

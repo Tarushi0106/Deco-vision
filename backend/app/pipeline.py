@@ -38,6 +38,7 @@ from .desk_tracker import DeskTracker
 from .detection_worker import CAMERA_DETECTION_MAX_DIM, run_worker
 from .footfall_counter import FootfallCounter, resolve_footfall_camera_ids
 from .gate_tracker import GateTracker
+from .recognition_stabilizer import RecognitionStabilizer
 from .video_source import RtspSource, WebcamSource
 
 logger = logging.getLogger("dashboard.pipeline")
@@ -141,6 +142,10 @@ class CameraPipeline:
         # the live overlay) — see RECOGNITION_MIN_CONSECUTIVE_HITS. Reset to 0
         # for any name absent from the current detection cycle.
         self._consecutive_hits: dict[str, int] = {}
+        # None (the default) means stabilization is off, in which case
+        # set_detections() below skips it entirely -- zero behavior change
+        # from before this feature existed.
+        self._stabilizer = RecognitionStabilizer() if config.RECOGNITION_STABILIZATION_ENABLED else None
         self._clip_buffer: deque[tuple[float, bytes]] = deque()
         self._clip_buffer_lock = threading.Lock()
         # Resizing+encoding clip video is real per-frame CPU work — measured this session:
@@ -195,6 +200,13 @@ class CameraPipeline:
             return list(self._latest_detections)
 
     def set_detections(self, detections: list[dict]) -> None:
+        # Scoped here deliberately: zone-violation and footfall/desk logic in
+        # PipelineManager._dispatch_result already ran against the RAW
+        # per-frame match before this is called, so temporal smoothing never
+        # delays a security-relevant decision -- it only affects what's
+        # displayed live and what gets logged as a detection_event.
+        if self._stabilizer is not None:
+            detections = self._stabilizer.stabilize(detections)
         with self._lock:
             self._latest_detections = detections
         now = time.time()

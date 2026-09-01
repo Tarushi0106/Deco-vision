@@ -102,25 +102,21 @@ export default function SmokeDetection() {
           {alerts.length === 0 ? (
             <div className="empty-state">No active smoke alerts.</div>
           ) : (
-            <table>
-              <tbody>
-                {alerts.map((alert) => (
-                  <tr key={alert.id}>
-                    <td>
-                      <span className="pill pill-danger">SMOKE</span>
-                    </td>
-                    <td>{alert.camera_name}</td>
-                    <td>{alert.message}</td>
-                    <td>{timeAgo(alert.ts)}</td>
-                    <td>
-                      <button className="btn btn-outline" onClick={() => handleResolve(alert.id)}>
-                        Resolve
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            <div className="alerts-list">
+              {alerts.map((alert) => (
+                <div key={alert.id} className="alerts-list-row">
+                  <div className="alerts-list-top">
+                    <span className="pill pill-danger">SMOKE</span>
+                    <span className="alerts-list-camera">{alert.camera_name}</span>
+                    <span className="alerts-list-time">{timeAgo(alert.ts)}</span>
+                  </div>
+                  <div className="alerts-list-message">{alert.message}</div>
+                  <button className="btn btn-outline" onClick={() => handleResolve(alert.id)}>
+                    Resolve
+                  </button>
+                </div>
+              ))}
+            </div>
           )}
         </div>
 

@@ -273,7 +273,6 @@ function ReportView() {
             <th>Current Status</th>
             <th>Total Desk Time</th>
             <th>Total Time Away</th>
-            <th>Movements</th>
             <th>First Session</th>
             <th>Last Session</th>
           </tr>
@@ -281,7 +280,7 @@ function ReportView() {
         <tbody>
           {!report || report.employees.length === 0 ? (
             <tr>
-              <td colSpan={8} className="empty-state">No employees enrolled yet.</td>
+              <td colSpan={7} className="empty-state">No employees enrolled yet.</td>
             </tr>
           ) : (
             report.employees.map((e) => (
@@ -295,7 +294,6 @@ function ReportView() {
                 </td>
                 <td>{formatDuration(e.desk_seconds)}</td>
                 <td>{formatDuration(e.away_seconds)}</td>
-                <td>{e.movements}</td>
                 <td>{formatTime(e.first_session)}</td>
                 <td>{formatTime(e.last_session)}</td>
               </tr>

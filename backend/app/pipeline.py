@@ -869,24 +869,34 @@ class PipelineManager:
         if pipeline is None:
             return
 
+        # Hoisted to method scope (not just the "faces" block below) so the
+        # pose-based footfall_events fallback further down can also see it —
+        # a camera with a gate line configured must never ALSO log crossings
+        # from the old, much-less-reliable pose-based midline tracker, or
+        # the same real crossing could be counted twice.
+        gate_active = False
+
         if "faces" in result:
             frame_w, frame_h = result.get("frame_size", (0, 0))
 
             # Footfall gate-line crossing (see gate_tracker.py) needs the
-            # embedding, so it runs BEFORE the pop below strips it. Returns
-            # True iff this camera has a gate line configured at all — in
-            # that case it already called footfall_counter.process() itself,
-            # exactly once per actual crossing, so the fallback below must
-            # not ALSO count every frame a face happens to be visible.
-            gate_active = False
+            # embedding, so it runs BEFORE the pop below strips it. gate_active
+            # is True iff this camera has a gate line configured at all — in
+            # that case it already called footfall_counter.process() itself
+            # for "in" crossings, so the whole-frame fallback below must not
+            # ALSO count every frame a face happens to be visible. gate_events
+            # is "in"/"out" per actual crossing (both directions), logged the
+            # same way person_tracker.py's pose-based crossings already are.
             if (
                 self._gate_tracker is not None
                 and self._footfall_counter is not None
                 and camera_id in self._footfall_camera_ids
             ):
-                gate_active = self._gate_tracker.process_frame(
+                gate_active, gate_events = self._gate_tracker.process_frame(
                     camera_id, result["faces"], frame_w, frame_h, self._footfall_counter,
                 )
+                for direction in gate_events:
+                    face_db.log_footfall(camera_id, direction)
 
             for face in result["faces"]:
                 # Pop rather than leave in place: this same dict is stored as
@@ -918,8 +928,14 @@ class PipelineManager:
             frame_w, frame_h = result.get("frame_size", (0, 0))
             self._desk_tracker.process_pose_frame(camera_id, result["people"], frame_w, frame_h)
 
-        for direction in result.get("footfall_events", []):
-            face_db.log_footfall(camera_id, direction)
+        # Skipped when a gate line is active for this camera -- gate_tracker
+        # already logged both directions above from the same frame's faces,
+        # far more reliably (1s cadence vs pose's 20s); logging this too
+        # would double-count the same real crossing on cameras that have
+        # both a gate line and pose-based tracking running.
+        if not gate_active:
+            for direction in result.get("footfall_events", []):
+                face_db.log_footfall(camera_id, direction)
 
         if "fire_smoke" in result:
             pipeline.set_fire_smoke(result["fire_smoke"])

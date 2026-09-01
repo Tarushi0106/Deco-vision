@@ -350,44 +350,53 @@ function GateEditor() {
   }
 
   return (
-    <div className="card panel" style={{ marginBottom: '1rem' }}>
-      <div className="panel-header">
-        <h3>Entry Gate Line</h3>
-        <select value={cameraId ?? ''} onChange={(e) => setCameraId(Number(e.target.value))}>
-          {cameras.map((c) => (
-            <option key={c.id} value={c.id}>{c.name}</option>
-          ))}
-        </select>
-      </div>
-      <div className="stat-tile-sub" style={{ marginBottom: '0.6rem' }}>
-        Click two points on the feed to draw a line across the gate. Someone tracked crossing it in the arrow's
-        direction counts as a unique footfall entry — even if their face isn't recognized, since the crossing itself
-        is what triggers the count, not a face match.
-      </div>
-
-      {camera ? (
-        <div className="footfall-gate-editor" ref={containerRef} onClick={handleClick}>
-          <canvas ref={canvasRef} className="footfall-gate-video" />
-          <canvas ref={overlayRef} className="footfall-gate-overlay" />
-          {status !== 'live' && (
-            <div className="camera-tile-offline">{status === 'offline' ? 'Camera offline' : 'Connecting…'}</div>
-          )}
+    <div className="dashboard-main-grid" style={{ marginBottom: '1rem' }}>
+      <div className="card panel">
+        <div className="panel-header">
+          <h3>Entry Gate Line</h3>
+          <select value={cameraId ?? ''} onChange={(e) => setCameraId(Number(e.target.value))}>
+            {cameras.map((c) => (
+              <option key={c.id} value={c.id}>{c.name}</option>
+            ))}
+          </select>
         </div>
-      ) : (
-        <div className="empty-state">No cameras configured.</div>
-      )}
 
-      {pendingPoint && (
-        <div className="stat-tile-sub" style={{ marginTop: '0.5rem' }}>Click the second point to finish the line…</div>
-      )}
-      {error && <div className="form-message error">{error}</div>}
+        {camera ? (
+          <div className="footfall-gate-editor" ref={containerRef} onClick={handleClick}>
+            <canvas ref={canvasRef} className="footfall-gate-video" />
+            <canvas ref={overlayRef} className="footfall-gate-overlay" />
+            {status !== 'live' && (
+              <div className="camera-tile-offline">{status === 'offline' ? 'Camera offline' : 'Connecting…'}</div>
+            )}
+          </div>
+        ) : (
+          <div className="empty-state">No cameras configured.</div>
+        )}
 
-      {gate && (
-        <div className="footfall-gate-actions">
-          <button className="btn btn-outline" onClick={handleFlip}>Flip Direction</button>
-          <button className="btn btn-outline" onClick={handleRemove}>Remove Gate</button>
+        {pendingPoint && (
+          <div className="stat-tile-sub" style={{ marginTop: '0.5rem' }}>Click the second point to finish the line…</div>
+        )}
+        {error && <div className="form-message error">{error}</div>}
+      </div>
+
+      <div className="card panel">
+        <div className="panel-header">
+          <h3>Gate on this camera</h3>
         </div>
-      )}
+        <div className="stat-tile-sub" style={{ marginBottom: '0.6rem' }}>
+          Click two points on the feed to draw a line across the gate. Someone tracked crossing it in the arrow's
+          direction counts as a unique footfall entry — even if their face isn't recognized, since the crossing
+          itself is what triggers the count, not a face match.
+        </div>
+        {gate ? (
+          <div className="footfall-gate-actions">
+            <button className="btn btn-outline" onClick={handleFlip}>Flip Direction</button>
+            <button className="btn btn-outline" onClick={handleRemove}>Remove Gate</button>
+          </div>
+        ) : (
+          <div className="empty-state">No gate line yet — draw one on the left.</div>
+        )}
+      </div>
     </div>
   )
 }

@@ -74,6 +74,16 @@ Environment="PATH=/home/ubuntu/Deco-vision/backend/venv/bin"
 ExecStart=/home/ubuntu/Deco-vision/backend/venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8811
 Restart=on-failure
 RestartSec=10
+# Defense-in-depth alongside the get_connection() fd-leak fixes in
+# zones_db.py/license_db.py (confirmed live: those two modules' old
+# get_connection() never closed its sqlite3.Connection, and zones_db's
+# list_zones() runs on every detection cycle for every camera -- by far
+# the highest-frequency caller in this app -- which exhausted the default
+# 1024 fd soft limit and broke every DB-backed endpoint with "unable to
+# open database file" until a restart). Raised well past anything this
+# app's real usage should ever approach, as headroom against any future
+# leak rather than a fix in itself.
+LimitNOFILE=65536
 StandardOutput=journal
 StandardError=journal
 

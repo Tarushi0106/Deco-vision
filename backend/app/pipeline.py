@@ -912,12 +912,20 @@ class PipelineManager:
         if "fire_smoke" in result:
             pipeline.set_fire_smoke(result["fire_smoke"])
 
+        # Smoke alerting (and the clip it would trigger) disabled per explicit
+        # request — the color/motion heuristic (fire_smoke_detector.py) kept
+        # firing on "exit" and "Technical section" with no real smoke
+        # present, the same false-positive pattern as fall detection below.
+        # Fire alerting is untouched; only "smoke" is suppressed here. The
+        # detector itself, the Smoke Detection page, and the overlay-free
+        # dashboard flash all stay in place for whenever real smoke shows up
+        # and this is re-enabled — only the noisy alert path is off.
         for event_type in result.get("fire_smoke_events", []):
+            if event_type == "smoke":
+                continue
             if not alerts_db.recent_open_alert(camera_id, event_type, FIRE_SMOKE_ALERT_COOLDOWN_SECONDS):
                 alerts_db.log_alert(camera_id, event_type, f"Possible {event_type} detected on camera")
                 logger.warning("Camera %s: possible %s detected", camera_id, event_type)
-            if event_type == "smoke":
-                pipeline.note_smoke_event()
 
         # Fall-detection alerting disabled per explicit request — it was
         # firing repeatedly (false positives) on the busy "exit" camera,

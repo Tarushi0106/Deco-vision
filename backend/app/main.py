@@ -322,8 +322,12 @@ def get_desk_analytics_report(date: str | None = None):
     the Attendance roster), with desk/away totals + movement count from
     desk_db (real tracked sessions, not estimates), plus their live
     current-desk/current-status from the running DeskTracker — which is
-    only meaningful for TODAY; a past date always reports "unknown" there,
-    since there's no "current" moment to speak of in history."""
+    only meaningful for TODAY; a past date always reports "away" there
+    (and no current desk), since there's no "current" moment to speak of
+    in history. Also used for today whenever an enrolled employee simply
+    hasn't been observed at any desk zone yet -- reported as "away" rather
+    than a separate "unknown" status, since from the report's perspective
+    both cases mean the same thing: not confirmed at their desk right now."""
     report = desk_db.get_daily_report(date)
     by_employee = {e["employee_name"]: e for e in report["employees"]}
 
@@ -342,7 +346,7 @@ def get_desk_analytics_report(date: str | None = None):
             "movements": e["movements"] if e else 0,
             "first_session": e["first_session"] if e else None,
             "last_session": e["last_session"] if e else None,
-            "current_status": status["status"] if status else "unknown",
+            "current_status": status["status"] if status else "away",
             "current_desk": status["zone_label"] if status else None,
         })
     employees.sort(key=lambda e: -e["desk_seconds"])

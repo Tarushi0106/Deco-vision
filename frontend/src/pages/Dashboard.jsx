@@ -15,7 +15,13 @@ function StatTile({ label, value, sub }) {
   )
 }
 
-const ALERT_TYPE_LABELS = { fall: 'FALL', intrusion: 'INTRUSION', zone_intrusion: 'ZONE INTRUSION' }
+const ALERT_TYPE_LABELS = {
+  fall: 'FALL',
+  intrusion: 'INTRUSION',
+  zone_intrusion: 'ZONE INTRUSION',
+  fire: 'FIRE',
+  smoke: 'SMOKE',
+}
 
 function timeAgo(ts) {
   const seconds = Math.floor(Date.now() / 1000 - ts)
@@ -23,52 +29,6 @@ function timeAgo(ts) {
   const mins = Math.floor(seconds / 60)
   if (mins < 60) return `${mins}m ago`
   return `${Math.floor(mins / 60)}h ago`
-}
-
-function IntrusionWindowCard() {
-  const [start, setStart] = useState('')
-  const [end, setEnd] = useState('')
-  const [status, setStatus] = useState(null)
-
-  useEffect(() => {
-    api.getSettings().then((s) => {
-      setStart(s.restricted_start || '')
-      setEnd(s.restricted_end || '')
-    }).catch(() => {})
-  }, [])
-
-  const handleSave = async (e) => {
-    e.preventDefault()
-    setStatus({ loading: true })
-    try {
-      await api.updateSettings({ restricted_start: start, restricted_end: end })
-      setStatus({ loading: false, saved: true })
-    } catch (err) {
-      setStatus({ loading: false, error: err.message })
-    }
-  }
-
-  return (
-    <div className="card panel">
-      <div className="panel-header">
-        <h3>Intrusion Window</h3>
-      </div>
-      <form onSubmit={handleSave} className="form-row" style={{ alignItems: 'center', gap: '0.5rem' }}>
-        <label style={{ marginRight: '0.5rem' }}>From</label>
-        <input type="time" value={start} onChange={(e) => setStart(e.target.value)} />
-        <label style={{ margin: '0 0.5rem' }}>To</label>
-        <input type="time" value={end} onChange={(e) => setEnd(e.target.value)} />
-        <button type="submit" className="btn btn-primary" style={{ marginLeft: '0.75rem' }} disabled={status?.loading}>
-          Save
-        </button>
-      </form>
-      <div className="stat-tile-sub" style={{ marginTop: '0.5rem' }}>
-        Anybody seen on any camera in this window raises an intrusion alert. Leave blank to disable.
-        {status?.saved && ' Saved.'}
-        {status?.error && ` ${status.error}`}
-      </div>
-    </div>
-  )
 }
 
 function DetectionRateCard() {
@@ -248,7 +208,6 @@ export default function Dashboard() {
           )}
         </div>
 
-        <IntrusionWindowCard />
         <DetectionRateCard />
       </div>
 

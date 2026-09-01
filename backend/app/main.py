@@ -1030,7 +1030,10 @@ async def detections_feed(websocket: WebSocket, camera_id: int):
         return
     try:
         while True:
-            await websocket.send_json({"faces": pipeline_manager.get_latest_detections(camera_id)})
+            await websocket.send_json({
+                "faces": pipeline_manager.get_latest_detections(camera_id),
+                "fire_smoke": pipeline_manager.get_latest_fire_smoke(camera_id),
+            })
             await asyncio.sleep(DETECTIONS_INTERVAL)
     except (WebSocketDisconnect, ConnectionResetError, RuntimeError):
         logger.info("detections_feed client disconnected (camera %s)", camera_id)

@@ -28,6 +28,11 @@ function playAlertBeep() {
   }
 }
 
+// Scope of this flashing banner, per explicit request: fire/smoke/intrusion
+// only — zone_intrusion and fall stay visible in Dashboard's Live Alerts
+// table but don't trigger the flash+beep here.
+const FLASH_ALERT_TYPES = new Set(['fire', 'smoke', 'intrusion'])
+
 // Self-contained: polls its own alert feed and beeps + shows a pulsing red
 // banner on any NEW unresolved alert. Drop it into any page — it doesn't
 // need the host page's own alerts state (Dashboard's alerts table, e.g.,
@@ -40,7 +45,8 @@ export default function AlertBanner() {
     const load = () => {
       api
         .listAlerts({ resolved: false })
-        .then((fresh) => {
+        .then((all) => {
+          const fresh = all.filter((a) => FLASH_ALERT_TYPES.has(a.type))
           if (seenAlertIds.current === null) {
             seenAlertIds.current = new Set(fresh.map((a) => a.id))
           } else if (fresh.some((a) => !seenAlertIds.current.has(a.id))) {

@@ -88,6 +88,9 @@ EMBED_REQUEST_TIMEOUT_SECONDS = config.DETECTION_EMBED_TIMEOUT_SECONDS
 # how long an after-hours intrusion alert stays "fresh" before it's allowed
 # to fire again for the same camera — otherwise it would refire every sample
 INTRUSION_ALERT_COOLDOWN_SECONDS = 300
+# shorter than INTRUSION/ZONE's 300s — a real fire/smoke event should keep
+# re-alerting more often than that, not go quiet for 5 minutes at a time
+FIRE_SMOKE_ALERT_COOLDOWN_SECONDS = 120
 # same idea, but scoped per zone + detected identity (see recent_open_alert) —
 # a different unauthorized person in the same zone still alerts immediately
 ZONE_ALERT_COOLDOWN_SECONDS = 300
@@ -96,6 +99,14 @@ ZONE_ALERT_COOLDOWN_SECONDS = 300
 DETECTION_LOG_COOLDOWN_SECONDS = config.DETECTION_LOG_COOLDOWN_SECONDS
 RECOGNITION_MIN_CONSECUTIVE_HITS = config.RECOGNITION_MIN_CONSECUTIVE_HITS
 WORKER_HEALTH_CHECK_INTERVAL_SECONDS = config.WORKER_HEALTH_CHECK_INTERVAL_SECONDS
+# Pseudo "person_name" used to piggyback smoke events onto the exact same
+# presence/clip-session machinery built for face recognition (_last_detection,
+# _active_clip_sessions, _update_clip_sessions et al. below) — a smoke event
+# is just another named "presence" as far as that machinery cares, so no new
+# recording path is needed. Kept out of get_active_clip_people's result (see
+# PipelineManager) so it never shows up disguised as a real person on the
+# People/Analytics "recording now" UI.
+SMOKE_CLIP_SUBJECT = "Smoke Alert"
 # recognition clips (Analytics "Clips" column): one continuous clip per
 # presence — recording starts the moment a person is first recognized and
 # keeps going, at full capture rate, for as long as they keep showing up in
@@ -134,6 +145,7 @@ class CameraPipeline:
         self._lock = threading.Lock()
         self._latest_jpeg: bytes | None = None
         self._latest_detections: list[dict] = []
+        self._latest_fire_smoke: list[dict] = []
         self._running = False
         self._thread: threading.Thread | None = None
         self._last_logged: dict[str, float] = {}
@@ -193,6 +205,24 @@ class CameraPipeline:
     def get_latest_detections(self) -> list[dict]:
         with self._lock:
             return list(self._latest_detections)
+
+    def get_latest_fire_smoke(self) -> list[dict]:
+        with self._lock:
+            return list(self._latest_fire_smoke)
+
+    def set_fire_smoke(self, boxes: list[dict]) -> None:
+        with self._lock:
+            self._latest_fire_smoke = boxes
+
+    def note_smoke_event(self) -> None:
+        """Called once per detect cycle a "smoke" event fires (see
+        PipelineManager._dispatch_result). Records SMOKE_CLIP_SUBJECT as
+        "seen" right now, which is all _update_clip_sessions needs to open/
+        keep-alive/close a real recorded clip around the event — the same
+        presence-window logic a recognized person's clip already uses."""
+        now = time.time()
+        with self._presence_lock:
+            self._last_detection[SMOKE_CLIP_SUBJECT] = now
 
     def set_detections(self, detections: list[dict]) -> None:
         with self._lock:
@@ -879,6 +909,16 @@ class PipelineManager:
         for direction in result.get("footfall_events", []):
             face_db.log_footfall(camera_id, direction)
 
+        if "fire_smoke" in result:
+            pipeline.set_fire_smoke(result["fire_smoke"])
+
+        for event_type in result.get("fire_smoke_events", []):
+            if not alerts_db.recent_open_alert(camera_id, event_type, FIRE_SMOKE_ALERT_COOLDOWN_SECONDS):
+                alerts_db.log_alert(camera_id, event_type, f"Possible {event_type} detected on camera")
+                logger.warning("Camera %s: possible %s detected", camera_id, event_type)
+            if event_type == "smoke":
+                pipeline.note_smoke_event()
+
         # Fall-detection alerting disabled per explicit request — it was
         # firing repeatedly (false positives) on the busy "exit" camera,
         # which is also used for footfall counting. Pose detection still
@@ -990,6 +1030,10 @@ class PipelineManager:
         pipeline = self._pipelines.get(camera_id)
         return pipeline.get_latest_detections() if pipeline else []
 
+    def get_latest_fire_smoke(self, camera_id: int) -> list[dict]:
+        pipeline = self._pipelines.get(camera_id)
+        return pipeline.get_latest_fire_smoke() if pipeline else []
+
     def is_live(self, camera_id: int) -> bool:
         return camera_id in self._pipelines
 
@@ -1001,6 +1045,8 @@ class PipelineManager:
         result = []
         for camera_id, pipeline in self._pipelines.items():
             for name in pipeline.get_active_names():
+                if name == SMOKE_CLIP_SUBJECT:
+                    continue
                 result.append({
                     "person_name": name,
                     "camera_id": camera_id,

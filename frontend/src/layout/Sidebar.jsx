@@ -19,6 +19,7 @@ const NAV_GROUPS = [
       { to: '/people', label: 'People' },
       { to: '/cameras', label: 'Camera Management' },
       { to: '/intrusion', label: 'Intrusion' },
+      { to: '/smoke-detection', label: 'Smoke Detection' },
       { to: '/sites', label: 'Site Management' },
       { to: '/attendance', label: 'Attendance' },
       { to: '/analytics', label: 'Workforce Analytics' },

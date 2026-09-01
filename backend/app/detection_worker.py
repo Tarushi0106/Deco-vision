@@ -19,6 +19,7 @@ this worker is pure compute and knows nothing about SQLite.
 import logging
 import queue
 import time
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -28,6 +29,21 @@ from insightface.app.common import Face
 from . import config
 
 logger = logging.getLogger("dashboard.recognition_pipeline")
+
+# Fire/smoke detection (fire_smoke_detector.py) is a color/motion heuristic,
+# not a trained model — every real false positive found so far (static
+# walls/glass/floors, a person fidgeting at a desk) needed an actual frame
+# to diagnose; guessing at synthetic reproductions wastes time and doesn't
+# always match the real failure. Saving the exact analyzed frame whenever an
+# alert actually fires means the NEXT false positive comes with real
+# evidence instead of another guessing round.
+FIRE_SMOKE_DEBUG_DIR = Path(__file__).resolve().parent.parent / "data" / "fire_smoke_debug"
+# fire_smoke_detector's events now re-fire every cycle for as long as a
+# condition stays confirmed (real fire/smoke should keep re-alerting, not
+# go silent after one shot — see pipeline.FIRE_SMOKE_ALERT_COOLDOWN_SECONDS),
+# so this needs its own throttle or a persisting event would write a debug
+# frame to disk roughly once a second forever.
+FIRE_SMOKE_DEBUG_SAVE_INTERVAL_SECONDS = 60
 
 POSE_INTERVAL_SECONDS = 20.0  # pose is heavier than face rec; runs on its own slower cadence.
 # Raised from 5.0 -> 20.0: on CPU, pose (YOLOv8n-pose) + face rec both running
@@ -108,6 +124,23 @@ CAMERA_DET_THRESH = config.CAMERA_DET_THRESH_OVERRIDES or {
 DETECTION_DOWNSCALE_MAX_DIM = 640
 CAMERA_DETECTION_MAX_DIM = config.CAMERA_DETECTION_MAX_DIM_OVERRIDES or {
     2: 1280,  # Technical section: wide-angle room, up to ~8 people — see measurement above
+}
+
+# Confirmed real false positives (2026-08-31, see backend/data/fire_smoke_debug/
+# cam1_smoke_*.jpg — auto-saved by _save_fire_smoke_debug_frame below): the
+# same physical white pillar/doorway-frame beside camera 1's backlit glass
+# entrance was flagged as "smoke" twice, a minute apart. That exact spot sits
+# right next to a large glass door/window with constantly shifting natural
+# light — real, gradual brightness drift there looks exactly like a slowly
+# growing achromatic haze to a color/motion heuristic (fire_smoke_detector.py
+# has no model, just color+motion math), and no amount of global threshold
+# tuning can fix that without risking missing real smoke elsewhere. Statically
+# excluded here, camera-specific, the same way CAMERA_DET_THRESH/
+# CAMERA_DETECTION_MAX_DIM above are camera-specific corrections for a
+# real, observed per-camera condition. Fractional (0..1) [x1,y1,x2,y2],
+# independent of the camera's actual frame resolution.
+CAMERA_FIRE_SMOKE_IGNORE_REGIONS: dict[int, list[list[float]]] = {
+    1: [[0.17, 0.08, 0.37, 0.93]],  # pillar/doorway-frame beside the entrance glass door
 }
 # Accuracy prioritized over update speed per explicit request. Measured on a
 # real 6-person Technical section frame: rechecking only the largest 3 faces
@@ -216,6 +249,27 @@ def _detect_and_recognize(recognizer, frame, det_thresh: float, detection_max_di
     return results
 
 
+def _save_fire_smoke_debug_frame(camera_id: int, frame, boxes: list[dict]) -> None:
+    """Saves the exact analyzed frame (with the confirmed box(es) drawn on
+    it) whenever a fire/smoke alert actually fires — see FIRE_SMOKE_DEBUG_DIR
+    above. Best-effort only: a failure here should never take down the
+    detect loop over a debug artifact."""
+    try:
+        FIRE_SMOKE_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        annotated = frame.copy()
+        for box in boxes:
+            x1, y1, x2, y2 = box["bbox"]
+            color = (0, 0, 255) if box["type"] == "fire" else (200, 0, 150)
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 3)
+            cv2.putText(annotated, box["type"].upper(), (x1, max(20, y1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+        types = "_".join(sorted({b["type"] for b in boxes})) or "unknown"
+        path = FIRE_SMOKE_DEBUG_DIR / f"cam{camera_id}_{types}_{int(time.time())}.jpg"
+        cv2.imwrite(str(path), annotated)
+    except Exception:
+        pass
+
+
 def _cap_inference_threads(max_cpu_cores: int) -> None:
     """Pins internal thread-pool sizes to the same core budget as the
     process's OS-level CPU affinity (see PipelineManager._pin_worker_cpu_affinity).
@@ -266,6 +320,7 @@ def run_worker(
 
     # imported here, after the onnxruntime patch above is in place, so every
     # model these construct picks up the capped thread pool
+    from .fire_smoke_detector import FireSmokeTracker
     from .person_tracker import PersonTracker
     from .pose_detector import PoseDetector
     from .recognizer import FaceRecognizer
@@ -273,7 +328,14 @@ def run_worker(
     recognizer = FaceRecognizer()
     pose_detector = PoseDetector()
     trackers: dict[int, PersonTracker] = {}
+    fire_smoke_trackers: dict[int, FireSmokeTracker] = {}
     last_pose_at: dict[int, float] = {}
+    # fire_smoke_detector's events now keep firing every cycle for as long as
+    # a condition stays confirmed (see FireSmokeTracker's docstring) so a
+    # real, ongoing event keeps re-alerting instead of going silent after
+    # one shot. Debug-frame saving needs its own throttle on top of that, or
+    # a persisting event would write a new file to disk every ~1s forever.
+    last_debug_save_at: dict[tuple[int, str], float] = {}
 
     while True:
         # Checked first, non-blocking, every iteration: embed (enrollment) requests
@@ -353,6 +415,28 @@ def run_worker(
                     )
             else:
                 logger.debug("camera=%s stage=no_faces_detected recognize_ms=%s", camera_id, recognize_ms)
+
+            # Cheap (no NN) — runs every detect cycle rather than being
+            # gated to POSE_INTERVAL_SECONDS, so a real fire/smoke event
+            # gets caught as fast as face recognition does. Every already
+            # -detected face is excluded from consideration (see
+            # fire_smoke_detector.FACE_EXCLUDE_*_PAD) — a person moving at
+            # their desk otherwise reads as a "growing" smoke-colored blob.
+            fs_tracker = fire_smoke_trackers.setdefault(camera_id, FireSmokeTracker())
+            face_boxes = [f["bbox"] for f in result["faces"]]
+            frame_h, frame_w = frame.shape[:2]
+            ignore_boxes = [
+                [int(x1 * frame_w), int(y1 * frame_h), int(x2 * frame_w), int(y2 * frame_h)]
+                for x1, y1, x2, y2 in CAMERA_FIRE_SMOKE_IGNORE_REGIONS.get(camera_id, [])
+            ]
+            fire_smoke = fs_tracker.update(frame, exclude_boxes=face_boxes + ignore_boxes)
+            result["fire_smoke"] = fire_smoke["boxes"]
+            result["fire_smoke_events"] = fire_smoke["events"]
+            for event_type in fire_smoke["events"]:
+                debug_key = (camera_id, event_type)
+                if time.time() - last_debug_save_at.get(debug_key, 0) >= FIRE_SMOKE_DEBUG_SAVE_INTERVAL_SECONDS:
+                    last_debug_save_at[debug_key] = time.time()
+                    _save_fire_smoke_debug_frame(camera_id, frame, fire_smoke["boxes"])
 
             now = time.time()
             if now - last_pose_at.get(camera_id, 0) >= POSE_INTERVAL_SECONDS:

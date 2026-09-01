@@ -168,3 +168,127 @@
   font-size: 0.85rem;
   margin-bottom: 0.75rem;
 }
+
+/* --- AdminGate ------------------------------------------------------ */
+
+.license-admin-gate {
+  text-align: center;
+}
+
+.license-admin-gate-icon {
+  font-size: 2rem;
+  margin-bottom: 0.25rem;
+}
+
+.license-admin-gate h2 {
+  margin: 0 0 0.35rem;
+}
+
+.license-admin-gate-message {
+  margin-bottom: 1rem;
+}
+
+.license-admin-gate form {
+  text-align: left;
+}
+
+.license-activate-disclosure-toggle {
+  background: none;
+  border: none;
+  color: var(--brand);
+  font-size: 0.82rem;
+  cursor: pointer;
+  padding: 0.4rem 0;
+  margin-top: 0.75rem;
+  text-align: left;
+}
+
+.license-activate-disclosure {
+  margin-top: 0.5rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border);
+  text-align: left;
+}
+
+/* --- Feature checklists (LicenseFeaturesModal, CameraFeaturesModal) -- */
+
+.license-feature-checklist {
+  max-height: 320px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.license-feature-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.5rem;
+  border-radius: 6px;
+}
+
+.license-feature-row:hover {
+  background: var(--surface-2);
+}
+
+.license-feature-row-locked {
+  opacity: 0.55;
+}
+
+/* --- Camera permissions grid (CameraPermissionsModal) ---------------- */
+
+.license-permissions-modal {
+  width: 560px;
+  max-width: 92vw;
+}
+
+.license-permissions-grid {
+  max-height: 420px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.license-permissions-row {
+  padding: 0.6rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.license-permissions-user {
+  margin-bottom: 0.4rem;
+  font-weight: 600;
+  font-size: 0.9rem;
+}
+
+.license-permissions-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+}
+
+.license-permissions-toggle {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 0.82rem;
+  font-weight: 400;
+  color: var(--text-muted);
+}
+
+/* --- Client self-service camera grid (ClientLicenseView) ------------- */
+
+.license-client-camera {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+.license-client-camera-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}

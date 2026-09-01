@@ -8,6 +8,7 @@
   --brand: #2f6fed;
   --brand-dark: #1b3fae;
   --brand-bg: #eef3ff;
+  --surface-2: #f6f7f9;
   --success: #1a7f4b;
   --success-bg: #e6f7ee;
   --danger: #c62828;
@@ -26,6 +27,7 @@
   --text-muted: #9aa3b5;
   --text-faint: #6b7385;
   --brand-bg: rgba(47, 111, 237, 0.16);
+  --surface-2: #1c212c;
   --success-bg: rgba(26, 127, 75, 0.18);
   --danger-bg: rgba(198, 40, 40, 0.18);
 }

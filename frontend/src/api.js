@@ -97,7 +97,9 @@ async function licenseReq(path, options = {}) {
   }
   if (!res.ok) {
     const body = await res.json().catch(() => ({}))
-    throw new Error(body.detail || `Request failed: ${res.status}`)
+    const err = new Error(body.detail || `Request failed: ${res.status}`)
+    err.status = res.status
+    throw err
   }
   const contentType = res.headers.get('content-type') || ''
   return contentType.includes('application/json') ? res.json() : res.blob()
@@ -141,4 +143,18 @@ export const licenseApi = {
 
   activate: (data) => licenseReq('/api/licenses/activate', { method: 'POST', body: JSON.stringify(data) }),
   myLicense: () => licenseReq('/api/my-license'),
+
+  featureCatalog: () => licenseReq('/api/feature-catalog'),
+  getLicenseFeatures: (id) => licenseReq(`/api/licenses/${id}/features`),
+  setLicenseFeatures: (id, keys) =>
+    licenseReq(`/api/licenses/${id}/features`, { method: 'PUT', body: JSON.stringify({ feature_keys: keys }) }),
+
+  listLicenseCamerasDetailed: (id) => licenseReq(`/api/licenses/${id}/cameras/detailed`),
+  getCameraFeatures: (id) => licenseReq(`/api/cameras/${id}/features`),
+  setCameraFeatures: (id, keys) =>
+    licenseReq(`/api/cameras/${id}/features`, { method: 'PUT', body: JSON.stringify({ feature_keys: keys }) }),
+
+  getCameraPermissions: (id) => licenseReq(`/api/cameras/${id}/permissions`),
+  setCameraPermission: (id, userUuid, perms) =>
+    licenseReq(`/api/cameras/${id}/permissions/${userUuid}`, { method: 'PUT', body: JSON.stringify(perms) }),
 }

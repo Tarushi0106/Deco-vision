@@ -1,227 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
-import { api, licenseApi } from '../api'
-import { clearLicenseSession, getDeviceFingerprint, getLicenseUser, setLicenseSession } from '../licenseAuth'
-import './pages.css'
-import './licenseManagement.css'
-
-// Cameras are sold outright, not leased — licenses never expire and are
-// never "renewed"; the only way off "active" is an explicit admin action
-// (disable or revoke), so there's no "expired" status to show here.
-const STATUS_LABELS = { active: 'Active', inactive: 'Inactive', suspended: 'Suspended' }
-const STATUS_PILL_CLASS = {
-  active: 'pill-success', inactive: 'pill-neutral', suspended: 'pill-danger',
-}
-
-function StatusPill({ status }) {
-  return <span className={`pill ${STATUS_PILL_CLASS[status] || 'pill-neutral'}`}>{STATUS_LABELS[status] || status}</span>
-}
-
-function StatTile({ label, value, sub }) {
-  return (
-    <div className="stat-tile card">
-      <div className="stat-tile-label">{label}</div>
-      <div className="stat-tile-value">{value}</div>
-      {sub && <div className="stat-tile-sub">{sub}</div>}
-    </div>
-  )
-}
-
-function UsageBar({ label, percent }) {
-  return (
-    <div className="usage-bar">
-      <div className="usage-bar-header">
-        <span>{label}</span>
-        <span>{percent}%</span>
-      </div>
-      <div className="usage-bar-track">
-        <div className="usage-bar-fill" style={{ width: `${Math.min(100, percent)}%` }} />
-      </div>
-    </div>
-  )
-}
-
-// ---------------------------------------------------------------------
-
-function AdminLoginForm({ onLoggedIn }) {
-  const [email, setEmail] = useState('')
-  const [password, setPassword] = useState('')
-  const [error, setError] = useState(null)
-  const [loading, setLoading] = useState(false)
-
-  const handleSubmit = async (e) => {
-    e.preventDefault()
-    setError(null)
-    setLoading(true)
-    try {
-      // Backend now normalizes email case/whitespace too, but trimming
-      // here as well avoids a confusing round-trip for the common case
-      // (leading/trailing space from a copy-paste).
-      const result = await licenseApi.login(email.trim(), password)
-      setLicenseSession(result.access_token, result.user)
-      onLoggedIn(result.user)
-    } catch (err) {
-      setError(err.message)
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  return (
-    <form onSubmit={handleSubmit}>
-      <label>
-        Email
-        <input
-          type="email"
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-          autoCapitalize="none"
-          autoCorrect="off"
-          spellCheck={false}
-          autoComplete="username"
-          required
-          autoFocus
-        />
-      </label>
-      <label>
-        Password
-        <input
-          type="password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          autoCapitalize="none"
-          autoCorrect="off"
-          spellCheck={false}
-          autoComplete="current-password"
-          required
-        />
-      </label>
-      {error && <div className="form-message error">{error}</div>}
-      <button type="submit" className="btn btn-primary" disabled={loading}>
-        {loading ? 'Signing in…' : 'Sign in'}
-      </button>
-    </form>
-  )
-}
-
-// For an end user handed a license code or QR — the code IS their
-// credential (see main.py's activate_license, which now provisions/reuses
-// a viewer account and returns a real session), no separately admin-
-// created email/password needed.
-function ActivateForm({ onLoggedIn }) {
-  const [code, setCode] = useState('')
-  const [error, setError] = useState(null)
-  const [loading, setLoading] = useState(false)
-
-  const handleSubmit = async (e) => {
-    e.preventDefault()
-    setError(null)
-    setLoading(true)
-    try {
-      const result = await licenseApi.activate({
-        code: code.trim().toUpperCase(),
-        device_fingerprint: getDeviceFingerprint(),
-      })
-      setLicenseSession(result.access_token, result.user)
-      onLoggedIn(result.user)
-    } catch (err) {
-      setError(err.message)
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  return (
-    <form onSubmit={handleSubmit}>
-      <label>
-        License code
-        <input
-          value={code}
-          onChange={(e) => setCode(e.target.value)}
-          placeholder="XXXX-XXXX-XXXX-XXXX"
-          autoCapitalize="none"
-          autoCorrect="off"
-          spellCheck={false}
-          required
-          autoFocus
-        />
-      </label>
-      {error && <div className="form-message error">{error}</div>}
-      <button type="submit" className="btn btn-primary" disabled={loading}>
-        {loading ? 'Activating…' : 'Activate'}
-      </button>
-    </form>
-  )
-}
-
-function LoginGate({ onLoggedIn }) {
-  const [tab, setTab] = useState('activate')
-
-  return (
-    <div className="license-login-gate">
-      <div className="card license-login-card">
-        <h2>License &amp; Camera Access</h2>
-        <div className="tab-switcher" style={{ marginBottom: '1rem' }}>
-          <button
-            type="button"
-            className={`btn ${tab === 'activate' ? 'btn-primary' : 'btn-outline'}`}
-            onClick={() => setTab('activate')}
-          >
-            Activate License
-          </button>
-          <button
-            type="button"
-            className={`btn ${tab === 'admin' ? 'btn-primary' : 'btn-outline'}`}
-            onClick={() => setTab('admin')}
-          >
-            Admin Sign In
-          </button>
-        </div>
-        {tab === 'activate' ? (
-          <>
-            <p className="page-toolbar-sub">Enter the license code you were given, or scanned from its QR code.</p>
-            <ActivateForm onLoggedIn={onLoggedIn} />
-          </>
-        ) : (
-          <>
-            <p className="page-toolbar-sub">For Super Admins and Company Admins managing licenses.</p>
-            <AdminLoginForm onLoggedIn={onLoggedIn} />
-          </>
-        )}
-      </div>
-    </div>
-  )
-}
-
-// ---------------------------------------------------------------------
-
-function AnalyticsPanel() {
-  const [stats, setStats] = useState(null)
-
-  useEffect(() => {
-    licenseApi.analytics().then(setStats).catch(() => {})
-  }, [])
-
-  if (!stats) return <div className="empty-state">Loading analytics…</div>
-
-  return (
-    <div className="license-analytics">
-      <div className="stat-grid">
-        <StatTile label="Total Licenses" value={stats.total_licenses} />
-        <StatTile label="Active" value={stats.active_licenses} />
-        <StatTile label="Total Cameras" value={stats.total_cameras} />
-        <StatTile label="Cameras Assigned" value={stats.cameras_assigned} />
-        <StatTile label="Cameras Online" value={stats.cameras_online} />
-        <StatTile label="Cameras Offline" value={stats.cameras_offline} />
-      </div>
-      <div className="card panel license-usage-panel">
-        <UsageBar label="License capacity in use" percent={stats.license_usage_percent} />
-        <UsageBar label="Cameras assigned vs. total" percent={stats.camera_usage_percent} />
-      </div>
-    </div>
-  )
-}
-
-// ---------------------------------------------------------------------
+import { api, licenseApi } from '../../api'
+import { StatusPill } from './shared'
+import LicenseFeaturesModal from './modals/LicenseFeaturesModal'
 
 function QrModal({ license, onClose }) {
   const [imgUrl, setImgUrl] = useState(null)
@@ -261,8 +41,6 @@ function QrModal({ license, onClose }) {
     </div>
   )
 }
-
-// ---------------------------------------------------------------------
 
 function CameraAssignModal({ license, allCameras, onClose, onChanged }) {
   const [assigned, setAssigned] = useState(null) // Set of camera ids currently assigned (server truth)
@@ -341,8 +119,6 @@ function CameraAssignModal({ license, allCameras, onClose, onChanged }) {
   )
 }
 
-// ---------------------------------------------------------------------
-
 function LicenseFormModal({ companies, license, onClose, onSaved }) {
   const isEdit = Boolean(license)
   const [companyId, setCompanyId] = useState(license?.company_id || companies[0]?.id || '')
@@ -412,9 +188,12 @@ function LicenseFormModal({ companies, license, onClose, onSaved }) {
   )
 }
 
-// ---------------------------------------------------------------------
-
-function LicensesPanel() {
+// super_admin's full cross-company license CRUD — companies list, license
+// table, and every per-license action. Unchanged in substance from the
+// pre-redesign version; only new addition is the "Features" action +
+// LicenseFeaturesModal (license-level AI feature checklist, super_admin-
+// only per PUT /api/licenses/{id}/features).
+export default function LicensesPanel() {
   const [licenses, setLicenses] = useState([])
   const [total, setTotal] = useState(0)
   const [companies, setCompanies] = useState([])
@@ -429,6 +208,7 @@ function LicensesPanel() {
   const [editLicense, setEditLicense] = useState(null)
   const [qrLicense, setQrLicense] = useState(null)
   const [assignLicense, setAssignLicense] = useState(null)
+  const [featuresLicense, setFeaturesLicense] = useState(null)
   const [newCompanyName, setNewCompanyName] = useState('')
 
   const companiesById = useMemo(() => Object.fromEntries(companies.map((c) => [c.id, c.name])), [companies])
@@ -528,6 +308,7 @@ function LicensesPanel() {
                   <td className="license-actions-cell">
                     <button type="button" className="btn btn-outline" onClick={() => setEditLicense(lic)}>Edit</button>
                     <button type="button" className="btn btn-outline" onClick={() => setAssignLicense(lic)}>Cameras</button>
+                    <button type="button" className="btn btn-outline" onClick={() => setFeaturesLicense(lic)}>Features</button>
                     <button type="button" className="btn btn-outline" onClick={() => setQrLicense(lic)}>QR</button>
                     {lic.status === 'inactive' ? (
                       <button type="button" className="btn btn-outline" onClick={() => handleAction('enable', lic)}>Enable</button>
@@ -564,96 +345,8 @@ function LicensesPanel() {
       {assignLicense && (
         <CameraAssignModal license={assignLicense} allCameras={allCameras} onClose={() => setAssignLicense(null)} onChanged={load} />
       )}
-    </div>
-  )
-}
-
-// ---------------------------------------------------------------------
-
-function ClientLicenseView() {
-  const [data, setData] = useState(null)
-  const [error, setError] = useState(null)
-
-  useEffect(() => {
-    licenseApi.myLicense().then(setData).catch((err) => setError(err.message))
-  }, [])
-
-  if (error) return <div className="form-message error">{error}</div>
-  if (!data) return <div className="empty-state">Loading your license…</div>
-
-  const { license, cameras } = data
-
-  return (
-    <div>
-      <div className="stat-grid">
-        <StatTile label="License Status" value={<StatusPill status={license.status} />} />
-        <StatTile label="Total Allowed" value={data.total_allowed} />
-        <StatTile label="Assigned" value={data.assigned} />
-        <StatTile label="Currently In Use" value={data.in_use} sub="cameras live right now" />
-        <StatTile label="Remaining Slots" value={data.remaining} />
-      </div>
-
-      <div className="card" style={{ marginTop: '1rem' }}>
-        <div className="panel-header"><h3>Assigned Cameras</h3></div>
-        <table>
-          <thead>
-            <tr><th>Camera</th><th>Site</th><th>Live Status</th></tr>
-          </thead>
-          <tbody>
-            {cameras.length === 0 ? (
-              <tr><td colSpan={3} className="empty-state">No cameras assigned to your license yet.</td></tr>
-            ) : (
-              cameras.map((cam) => (
-                <tr key={cam.id}>
-                  <td>{cam.name}</td>
-                  <td>{cam.site}</td>
-                  <td>
-                    <span className={`pill ${cam.live ? 'pill-success' : 'pill-neutral'}`}>
-                      <span className={`dot ${cam.live ? 'dot-success' : 'dot-neutral'}`} /> {cam.live ? 'Live' : 'Offline'}
-                    </span>
-                  </td>
-                </tr>
-              ))
-            )}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  )
-}
-
-// ---------------------------------------------------------------------
-
-export default function LicenseManagement() {
-  const [user, setUser] = useState(getLicenseUser())
-
-  if (!user) return <LoginGate onLoggedIn={setUser} />
-
-  const handleLogout = async () => {
-    try { await licenseApi.logout() } catch { /* sign out locally regardless */ }
-    clearLicenseSession()
-    setUser(null)
-  }
-
-  return (
-    <div>
-      <div className="page-toolbar">
-        <div>
-          <h2>License &amp; Camera Access</h2>
-          <div className="page-toolbar-sub">
-            Signed in as {user.name} ({user.role.replace('_', ' ')})
-          </div>
-        </div>
-        <button type="button" className="btn btn-outline" onClick={handleLogout}>Sign out</button>
-      </div>
-
-      {user.role === 'super_admin' ? (
-        <>
-          <AnalyticsPanel />
-          <LicensesPanel />
-        </>
-      ) : (
-        <ClientLicenseView />
+      {featuresLicense && (
+        <LicenseFeaturesModal license={featuresLicense} onClose={() => setFeaturesLicense(null)} onSaved={load} />
       )}
     </div>
   )

@@ -1064,6 +1064,9 @@ def _serialize_license(lic: dict) -> dict:
     out = dict(lic)
     out["cameras_assigned"] = license_db.count_cameras_for_license(lic["id"])
     out["cameras_remaining"] = max(0, lic["max_cameras"] - out["cameras_assigned"])
+    out["enabled_features"] = license_db.list_license_features(lic["id"])
+    out["feature_count"] = len(license_db.ALL_FEATURES)
+    out["non_expiring"] = (lic["expires_at"] - time.time()) > license_db.NON_EXPIRING_HORIZON_SECONDS
     return out
 
 
@@ -1105,6 +1108,22 @@ class ActivateIn(BaseModel):
     code: str | None = None
     qr_token: str | None = None
     device_fingerprint: str | None = None
+
+
+class LicenseFeaturesIn(BaseModel):
+    feature_keys: list[str]
+
+
+class CameraFeaturesIn(BaseModel):
+    feature_keys: list[str]
+
+
+class CameraPermissionIn(BaseModel):
+    live_view: bool = False
+    playback: bool = False
+    analytics: bool = False
+    events: bool = False
+    camera_settings: bool = False
 
 
 def _sanitize_user(user: dict) -> dict:
@@ -1321,6 +1340,92 @@ def remove_license_cameras(
     return {"cameras": license_db.list_cameras_for_license(license_id)}
 
 
+@app.get("/api/licenses/{license_id}/cameras/detailed")
+def list_license_cameras_detailed(license_id: str, user: dict = Depends(auth.get_current_user)):
+    _require_license_access(license_id, user)
+    return license_db.list_cameras_for_license_detailed(license_id)
+
+
+@app.get("/api/licenses/{license_id}/features")
+def get_license_features(license_id: str, user: dict = Depends(auth.get_current_user)):
+    _require_license_access(license_id, user)
+    return {"feature_keys": license_db.list_license_features(license_id)}
+
+
+@app.put("/api/licenses/{license_id}/features")
+def put_license_features(
+    license_id: str, payload: LicenseFeaturesIn, user: dict = Depends(auth.require_role(auth.ROLE_SUPER_ADMIN)),
+):
+    _get_license_or_404(license_id)
+    invalid = [k for k in payload.feature_keys if k not in license_db.ALL_FEATURES]
+    if invalid:
+        raise HTTPException(400, f"Unknown feature key(s): {invalid}")
+    keys = license_db.set_license_features(license_id, payload.feature_keys)
+    _audit(user, "update_license_features", "license", license_id, f"features={keys}")
+    return {"feature_keys": keys}
+
+
+@app.get("/api/feature-catalog")
+def get_feature_catalog(user: dict = Depends(auth.get_current_user)):
+    return [{"key": k, "label": license_db.FEATURE_LABELS[k]} for k in license_db.ALL_FEATURES]
+
+
+def _require_camera_license_access(camera_id: int, user: dict) -> dict:
+    """Resolves the license a camera is assigned to and enforces the same
+    company scoping as _require_license_access — 404 if the camera isn't
+    assigned to any license (the orthogonality rule: features/permissions
+    can't exist on an unassigned camera), 403 if it belongs to a
+    different company than a non-super_admin caller."""
+    lic = license_db.get_license_for_camera(camera_id)
+    if lic is None:
+        raise HTTPException(404, "This camera isn't assigned to any license")
+    if user["role"] != auth.ROLE_SUPER_ADMIN and lic["company_id"] != user.get("company_id"):
+        raise HTTPException(403, "This camera belongs to a different company")
+    return lic
+
+
+@app.get("/api/cameras/{camera_id}/features")
+def get_camera_features_endpoint(camera_id: int, user: dict = Depends(auth.get_current_user)):
+    _require_camera_license_access(camera_id, user)
+    return {"feature_keys": license_db.get_camera_features(camera_id)}
+
+
+@app.put("/api/cameras/{camera_id}/features")
+def put_camera_features(
+    camera_id: int, payload: CameraFeaturesIn,
+    user: dict = Depends(auth.require_role(auth.ROLE_SUPER_ADMIN, auth.ROLE_COMPANY_ADMIN)),
+):
+    lic = _require_camera_license_access(camera_id, user)
+    invalid = license_db.set_camera_features(lic["id"], camera_id, payload.feature_keys)
+    if invalid:
+        raise HTTPException(400, f"These features aren't included in your license: {invalid}")
+    _audit(user, "update_camera_features", "camera", str(camera_id), f"features={payload.feature_keys}")
+    return {"feature_keys": license_db.get_camera_features(camera_id)}
+
+
+@app.get("/api/cameras/{camera_id}/permissions")
+def get_camera_permissions_endpoint(
+    camera_id: int, user: dict = Depends(auth.require_role(auth.ROLE_SUPER_ADMIN, auth.ROLE_COMPANY_ADMIN)),
+):
+    lic = _require_camera_license_access(camera_id, user)
+    company_users = user_db.list_license_users(lic["company_id"])
+    return license_db.list_camera_permissions(camera_id, company_users)
+
+
+@app.put("/api/cameras/{camera_id}/permissions/{user_uuid}")
+def put_camera_permission(
+    camera_id: int, user_uuid: str, payload: CameraPermissionIn,
+    user: dict = Depends(auth.require_role(auth.ROLE_SUPER_ADMIN, auth.ROLE_COMPANY_ADMIN)),
+):
+    lic = _require_camera_license_access(camera_id, user)
+    target = user_db.get_user_by_uuid(user_uuid)
+    if target is None or target.get("company_id") != lic["company_id"]:
+        raise HTTPException(404, "User not found in this license's company")
+    row = license_db.set_camera_permission(user_uuid, camera_id, payload.model_dump())
+    _audit(user, "set_camera_permission", "camera", str(camera_id), f"user={user_uuid}")
+    return row
+
+
 @app.get("/api/audit-logs")
 def get_audit_logs(limit: int = 100, offset: int = 0, user: dict = Depends(auth.require_role(auth.ROLE_SUPER_ADMIN))):
     rows, total = license_db.list_audit_logs(limit, offset)
@@ -1407,8 +1512,11 @@ def my_license(user: dict = Depends(auth.get_current_user)):
         raise HTTPException(404, "No license found for this company")
 
     cameras = license_db.list_cameras_for_license(lic["id"])
+    features_by_camera = license_db.list_camera_features_bulk([c["id"] for c in cameras])
     for cam in cameras:
         cam["live"] = pipeline_manager.is_live(cam["id"])
+        cam["enabled_features"] = features_by_camera.get(cam["id"], [])
+        cam["your_permissions"] = license_db.effective_permissions(user["uuid"], cam["id"], user["role"])
     in_use = sum(1 for c in cameras if c["live"])
 
     return {
@@ -1417,6 +1525,7 @@ def my_license(user: dict = Depends(auth.get_current_user)):
         "total_allowed": lic["max_cameras"],
         "assigned": len(cameras),
         "in_use": in_use,
+        "active": in_use,  # alias: "active cameras" is the same figure as in_use (live right now)
         "remaining": max(0, lic["max_cameras"] - len(cameras)),
     }
 

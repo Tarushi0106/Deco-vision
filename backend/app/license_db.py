@@ -27,6 +27,41 @@ STATUS_INACTIVE = "inactive"
 STATUS_SUSPENDED = "suspended"
 ALL_STATUSES = (STATUS_ACTIVE, STATUS_INACTIVE, STATUS_SUSPENDED)
 
+# Fixed catalog, not a DB table — a closed, rarely-changing set (like
+# ALL_STATUSES above). Every key traces to an existing feature already
+# built into this app (see Sidebar.jsx's nav items); adding a new one
+# later is a one-line addition here, same as adding a status would be.
+FEATURE_FACE_RECOGNITION = "face_recognition"
+FEATURE_ATTENDANCE = "attendance"
+FEATURE_FOOTFALL_ANALYTICS = "footfall_analytics"
+FEATURE_WORKFORCE_ANALYTICS = "workforce_analytics"
+FEATURE_INTRUSION_DETECTION = "intrusion_detection"
+FEATURE_SMOKE_DETECTION = "smoke_detection"
+FEATURE_CROWD_ANALYTICS = "crowd_analytics"
+FEATURE_THREAT_DETECTION = "threat_detection"
+FEATURE_VEHICLE_DETECTION = "vehicle_detection"
+ALL_FEATURES = (
+    FEATURE_FACE_RECOGNITION, FEATURE_ATTENDANCE, FEATURE_FOOTFALL_ANALYTICS,
+    FEATURE_WORKFORCE_ANALYTICS, FEATURE_INTRUSION_DETECTION, FEATURE_SMOKE_DETECTION,
+    FEATURE_CROWD_ANALYTICS, FEATURE_THREAT_DETECTION, FEATURE_VEHICLE_DETECTION,
+)
+FEATURE_LABELS = {
+    FEATURE_FACE_RECOGNITION: "Face Recognition",
+    FEATURE_ATTENDANCE: "Attendance",
+    FEATURE_FOOTFALL_ANALYTICS: "Footfall Analytics",
+    FEATURE_WORKFORCE_ANALYTICS: "Workforce Analytics",
+    FEATURE_INTRUSION_DETECTION: "Intrusion Detection",
+    FEATURE_SMOKE_DETECTION: "Smoke Detection",
+    FEATURE_CROWD_ANALYTICS: "Crowd Analytics",
+    FEATURE_THREAT_DETECTION: "Threat Detection",
+    FEATURE_VEHICLE_DETECTION: "Vehicle Detection",
+}
+
+# Camera-permission toggle names, in display order — used both as the
+# camera_permissions column list and the shape of a "permissions" dict
+# passed around between this module and main.py.
+PERMISSION_KEYS = ("live_view", "playback", "analytics", "events", "camera_settings")
+
 # Cameras are sold outright, not leased/subscribed — a license never
 # expires or needs renewing on its own; the only way out of "active" is an
 # explicit admin action (disable or revoke). expires_at still exists as a
@@ -34,6 +69,14 @@ ALL_STATUSES = (STATUS_ACTIVE, STATUS_INACTIVE, STATUS_SUSPENDED)
 # ALTER, and nothing reads it for status anymore) — new licenses just get
 # it set far enough out that it can never practically matter.
 _NEVER_EXPIRES_SECONDS = 100 * 365 * 86400
+
+# Distinct from _NEVER_EXPIRES_SECONDS above (which is what NEW licenses
+# get written with): this is the threshold the UI uses to decide whether
+# an expires_at value is "real" or just the vestigial default — anything
+# further out than 10 years is treated as non-expiring for display
+# purposes, so the Expiry stat card can say "No expiry — owned outright"
+# instead of a nonsensical ~36,500-day countdown.
+NON_EXPIRING_HORIZON_SECONDS = 10 * 365 * 86400
 
 # Ambiguity-free alphabet (no 0/O, 1/I/L) for license keys people may need
 # to type by hand off a printout, not just scan.
@@ -145,6 +188,57 @@ def init_db() -> None:
             )
             """
         )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS license_features (
+                id TEXT PRIMARY KEY,
+                license_id TEXT NOT NULL,
+                feature_key TEXT NOT NULL,
+                enabled_at REAL NOT NULL,
+                UNIQUE (license_id, feature_key),
+                FOREIGN KEY (license_id) REFERENCES licenses (id)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_license_features_license ON license_features (license_id)")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS camera_features (
+                id TEXT PRIMARY KEY,
+                license_id TEXT NOT NULL,
+                camera_id INTEGER NOT NULL,
+                feature_key TEXT NOT NULL,
+                enabled_at REAL NOT NULL,
+                UNIQUE (camera_id, feature_key),
+                FOREIGN KEY (license_id) REFERENCES licenses (id),
+                FOREIGN KEY (camera_id) REFERENCES cameras (id)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_camera_features_camera ON camera_features (camera_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_camera_features_license ON camera_features (license_id)")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS camera_permissions (
+                id TEXT PRIMARY KEY,
+                user_uuid TEXT NOT NULL,
+                camera_id INTEGER NOT NULL,
+                live_view INTEGER NOT NULL DEFAULT 0,
+                playback INTEGER NOT NULL DEFAULT 0,
+                analytics INTEGER NOT NULL DEFAULT 0,
+                events INTEGER NOT NULL DEFAULT 0,
+                camera_settings INTEGER NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL,
+                UNIQUE (user_uuid, camera_id),
+                FOREIGN KEY (camera_id) REFERENCES cameras (id)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_camera_permissions_user ON camera_permissions (user_uuid)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_camera_permissions_camera ON camera_permissions (camera_id)")
 
 
 # --- Companies ------------------------------------------------------------
@@ -286,11 +380,25 @@ def assign_cameras(license_id: str, camera_ids: list[int]) -> int:
 
 
 def remove_cameras(license_id: str, camera_ids: list[int]) -> None:
+    """Also cascades to camera_features/camera_permissions — otherwise a
+    camera unassigned from a license would leave stale feature/permission
+    grants behind, silently outliving the Camera Access row they belonged
+    to (see the "orthogonality rule" note on camera_features/
+    camera_permissions below: a camera must be assigned before either can
+    exist, so removal must clean both up)."""
     with get_connection() as conn:
         placeholders = ",".join("?" * len(camera_ids))
         conn.execute(
             f"DELETE FROM camera_assignments WHERE license_id = ? AND camera_id IN ({placeholders})",
             (license_id, *camera_ids),
+        )
+        conn.execute(
+            f"DELETE FROM camera_features WHERE license_id = ? AND camera_id IN ({placeholders})",
+            (license_id, *camera_ids),
+        )
+        conn.execute(
+            f"DELETE FROM camera_permissions WHERE camera_id IN ({placeholders})",
+            camera_ids,
         )
 
 
@@ -421,6 +529,199 @@ def list_audit_logs(limit: int = 100, offset: int = 0) -> tuple[list[dict], int]
             "SELECT * FROM audit_logs ORDER BY ts DESC LIMIT ? OFFSET ?", (limit, offset)
         ).fetchall()
     return [dict(r) for r in rows], total
+
+
+# --- License-level features ------------------------------------------------
+
+def set_license_features(license_id: str, feature_keys: list[str]) -> list[str]:
+    """Full-replace, not assign/remove — the UI saves from a single
+    checklist with no capacity cap to diff against, so "this is now the
+    enabled set" is simpler than a two-call add/remove pair. Silently
+    drops any key not in ALL_FEATURES (defensive; the endpoint validates
+    first)."""
+    keys = [k for k in feature_keys if k in ALL_FEATURES]
+    now = time.time()
+    with get_connection() as conn:
+        conn.execute("DELETE FROM license_features WHERE license_id = ?", (license_id,))
+        for key in keys:
+            conn.execute(
+                "INSERT INTO license_features (id, license_id, feature_key, enabled_at) VALUES (?, ?, ?, ?)",
+                (uuid_lib.uuid4().hex, license_id, key, now),
+            )
+    return keys
+
+
+def list_license_features(license_id: str) -> list[str]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT feature_key FROM license_features WHERE license_id = ?", (license_id,)
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+# --- Per-camera feature overrides -------------------------------------------
+#
+# A camera's enabled features must be a subset of its license's enabled
+# features (set_license_features above) — enforced here, not just at the
+# API layer, so any future caller of this module gets the same guarantee.
+# Orthogonality rule: a camera must already be in camera_assignments for
+# this license before it can have a features/permissions row — see
+# remove_cameras' cascade-delete, which is the other half of that rule.
+
+def set_camera_features(license_id: str, camera_id: int, feature_keys: list[str]) -> list[str]:
+    """Returns the subset of feature_keys NOT enabled on the license (i.e.
+    invalid). Empty list = all valid and the update was applied; a
+    non-empty list means nothing was written and the caller should reject
+    with 400 listing these keys."""
+    licensed = set(list_license_features(license_id))
+    invalid = [k for k in feature_keys if k not in licensed]
+    if invalid:
+        return invalid
+    now = time.time()
+    with get_connection() as conn:
+        conn.execute(
+            "DELETE FROM camera_features WHERE license_id = ? AND camera_id = ?", (license_id, camera_id)
+        )
+        for key in feature_keys:
+            conn.execute(
+                "INSERT INTO camera_features (id, license_id, camera_id, feature_key, enabled_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (uuid_lib.uuid4().hex, license_id, camera_id, key, now),
+            )
+    return []
+
+
+def get_camera_features(camera_id: int) -> list[str]:
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT feature_key FROM camera_features WHERE camera_id = ?", (camera_id,)
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+def list_camera_features_bulk(camera_ids: list[int]) -> dict[int, list[str]]:
+    """Avoids N+1 queries when rendering the Camera Access table."""
+    if not camera_ids:
+        return {}
+    out: dict[int, list[str]] = {cid: [] for cid in camera_ids}
+    placeholders = ",".join("?" * len(camera_ids))
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"SELECT camera_id, feature_key FROM camera_features WHERE camera_id IN ({placeholders})",
+            camera_ids,
+        ).fetchall()
+    for camera_id, feature_key in rows:
+        out[camera_id].append(feature_key)
+    return out
+
+
+# --- Per-user camera permissions --------------------------------------------
+
+def default_permissions_for_role(role: str) -> dict:
+    """The effective permissions for a user with no explicit override row
+    on a given camera — pre-fills the grid UI and is what a viewer/
+    operator's own self-service view (ClientLicenseView) shows until an
+    admin saves a real override."""
+    from . import user_db  # deferred: avoids a hard import-order dependency for a single constant lookup
+
+    if role in (user_db.ROLE_SUPER_ADMIN, user_db.ROLE_COMPANY_ADMIN):
+        return {k: True for k in PERMISSION_KEYS}
+    if role == user_db.ROLE_OPERATOR:
+        return {k: (k != "camera_settings") for k in PERMISSION_KEYS}
+    return {k: (k == "live_view") for k in PERMISSION_KEYS}  # viewer, and any unrecognized role
+
+
+def _row_to_permissions(row) -> dict:
+    return {k: bool(row[k]) for k in PERMISSION_KEYS}
+
+
+def get_camera_permission_row(user_uuid: str, camera_id: int) -> dict | None:
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM camera_permissions WHERE user_uuid = ? AND camera_id = ?", (user_uuid, camera_id)
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def effective_permissions(user_uuid: str, camera_id: int, role: str) -> dict:
+    row = get_camera_permission_row(user_uuid, camera_id)
+    return _row_to_permissions(row) if row else default_permissions_for_role(role)
+
+
+def list_camera_permissions(camera_id: int, users: list[dict]) -> list[dict]:
+    """users = the company's license-users (user_db.list_license_users).
+    One row per user: {user_uuid, name, email, role, permissions, is_override}
+    — is_override False means these are the role default, not a saved row."""
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = {
+            r["user_uuid"]: r for r in conn.execute(
+                "SELECT * FROM camera_permissions WHERE camera_id = ?", (camera_id,)
+            ).fetchall()
+        }
+    out = []
+    for u in users:
+        row = rows.get(u["uuid"])
+        perms = _row_to_permissions(row) if row else default_permissions_for_role(u["role"])
+        out.append({
+            "user_uuid": u["uuid"], "name": u["name"], "email": u["email"], "role": u["role"],
+            "permissions": perms, "is_override": row is not None,
+        })
+    return out
+
+
+def set_camera_permission(user_uuid: str, camera_id: int, perms: dict) -> dict:
+    now = time.time()
+    values = [1 if perms.get(k) else 0 for k in PERMISSION_KEYS]
+    with get_connection() as conn:
+        conn.execute(
+            f"""
+            INSERT INTO camera_permissions
+                (id, user_uuid, camera_id, {", ".join(PERMISSION_KEYS)}, updated_at)
+            VALUES (?, ?, ?, {", ".join("?" * len(PERMISSION_KEYS))}, ?)
+            ON CONFLICT (user_uuid, camera_id) DO UPDATE SET
+                {", ".join(f"{k} = excluded.{k}" for k in PERMISSION_KEYS)},
+                updated_at = excluded.updated_at
+            """,
+            (uuid_lib.uuid4().hex, user_uuid, camera_id, *values, now),
+        )
+    return get_camera_permission_row(user_uuid, camera_id)
+
+
+def list_permission_counts_bulk(camera_ids: list[int]) -> dict[int, int]:
+    """Count of users with an explicit override row where ANY flag is
+    true, per camera — "assigned users" means an admin explicitly granted
+    something on THIS camera, not "everyone in the company by default"."""
+    if not camera_ids:
+        return {}
+    out = {cid: 0 for cid in camera_ids}
+    placeholders = ",".join("?" * len(camera_ids))
+    any_true = " OR ".join(f"{k} = 1" for k in PERMISSION_KEYS)
+    with get_connection() as conn:
+        rows = conn.execute(
+            f"SELECT camera_id, COUNT(*) FROM camera_permissions "
+            f"WHERE camera_id IN ({placeholders}) AND ({any_true}) GROUP BY camera_id",
+            camera_ids,
+        ).fetchall()
+    for camera_id, count in rows:
+        out[camera_id] = count
+    return out
+
+
+def list_cameras_for_license_detailed(license_id: str) -> list[dict]:
+    """Like list_cameras_for_license, but with enabled_feature_count and
+    assigned_user_count added — kept as a SEPARATE function (not a change
+    to the original) because CameraAssignModal/ClientLicenseView already
+    depend on that function's existing shape."""
+    cameras = list_cameras_for_license(license_id)
+    camera_ids = [c["id"] for c in cameras]
+    features_by_camera = list_camera_features_bulk(camera_ids)
+    counts_by_camera = list_permission_counts_bulk(camera_ids)
+    for c in cameras:
+        c["enabled_features"] = features_by_camera.get(c["id"], [])
+        c["assigned_user_count"] = counts_by_camera.get(c["id"], 0)
+    return cameras
 
 
 # --- Analytics --------------------------------------------------------------

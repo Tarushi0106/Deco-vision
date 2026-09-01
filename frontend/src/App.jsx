@@ -11,7 +11,7 @@ import Sites from './pages/Sites'
 import Attendance from './pages/Attendance'
 import Analytics from './pages/Analytics'
 import Footfall from './pages/Footfall'
-import LicenseManagement from './pages/LicenseManagement'
+import LicenseManagement from './pages/license/LicenseManagementPage'
 import './theme.css'
 
 const PAGES = [

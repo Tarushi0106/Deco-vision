@@ -258,9 +258,15 @@ RECOGNITION_STABILIZATION_MIN_VOTES = int(os.getenv("RECOGNITION_STABILIZATION_M
 # face if their boxes overlap at least this much (Intersection-over-Union).
 RECOGNITION_TRACK_IOU_THRESHOLD = float(os.getenv("RECOGNITION_TRACK_IOU_THRESHOLD", "0.3"))
 # How long a track survives with no matching detection before it's dropped
-# (person left frame, or was fully occluded/undetected for a while) -- a few
-# detection cycles' worth at the default detection_fps.
-RECOGNITION_TRACK_TIMEOUT_SECONDS = float(os.getenv("RECOGNITION_TRACK_TIMEOUT_SECONDS", "5"))
+# (person left frame, or was fully occluded/undetected for a while).
+# Confirmed live and the actual reason this feature failed its first
+# production trial: this was left at 5s, assuming a detect cycle roughly
+# matches detection_fps's ~1s interval -- but a real per-camera cycle
+# (queue wait + recognize time) measured 24-100+ seconds on the wide-angle
+# "Main gate" camera under normal load. Every track expired before it could
+# accumulate votes, permanently forcing that camera to Unknown. Raised well
+# past that camera's worst measured cycle time.
+RECOGNITION_TRACK_TIMEOUT_SECONDS = float(os.getenv("RECOGNITION_TRACK_TIMEOUT_SECONDS", "180"))
 
 # How often the sender loop checks whether each camera's detection worker
 # process is still alive, and respawns it if not. Detection worker crashes

@@ -1,22 +1,17 @@
 .desk-analytics-grid {
   display: grid;
-  /* first column sizes to its content (the zone editor below, pinned to
-     half the viewport width) instead of an arbitrary fr split -- a small
-     camera view made precise click-and-drag desk marking hard to get right */
-  grid-template-columns: auto 1fr;
+  /* Same 2fr/1fr split as the Intrusion and Dashboard pages' camera+panel
+     layout (.dashboard-main-grid in pages.css) -- the camera fills its
+     column's natural width instead of being pinned to viewport units. */
+  grid-template-columns: 2fr 1fr;
   gap: 1rem;
   align-items: start;
 }
 
 .desk-zone-editor {
   position: relative;
-  /* Sized by viewport HEIGHT, not width -- a wide-but-short editor is what
-     actually keeps the whole page (camera + zone list + the report column
-     next to it) visible together without scrolling, on real laptop screen
-     heights. width:auto + aspect-ratio derives the width from this height. */
-  width: auto;
-  height: 42vh;
-  max-width: 100%;
+  /* Fills its grid column, same as CameraTile's .camera-tile-video. */
+  width: 100%;
   aspect-ratio: 16 / 9;
   background: #0d0f14;
   border-radius: 8px;

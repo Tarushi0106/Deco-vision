@@ -312,7 +312,6 @@ export default function Attendance() {
                 <th>Check-Out</th>
                 <th>Check-Out Camera</th>
                 <th>Time Stay</th>
-                <th>Detections</th>
                 <th>Status</th>
                 <th>Actions</th>
               </tr>
@@ -320,7 +319,7 @@ export default function Attendance() {
             <tbody>
               {pageRows.length === 0 ? (
                 <tr>
-                  <td colSpan={9} className="empty-state">
+                  <td colSpan={8} className="empty-state">
                     {report ? 'No employees enrolled yet.' : 'Loading…'}
                   </td>
                 </tr>
@@ -342,7 +341,6 @@ export default function Attendance() {
                     <td>{r.check_out ? formatTime(r.check_out) : '—'}</td>
                     <td>{r.checkout_camera_name || '—'}</td>
                     <td>{r.time_stay_seconds != null ? formatDuration(r.time_stay_seconds) : '—'}</td>
-                    <td>{r.detections}</td>
                     <td>
                       <span className={`pill ${r.present ? 'pill-success' : 'pill-danger'}`}>
                         {r.present ? 'Present' : 'Absent'}

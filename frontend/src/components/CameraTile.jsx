@@ -112,7 +112,7 @@ export default function CameraTile({
     if (showOverlay) {
       detectionsWs = new WebSocket(`${WS_PROTOCOL}://${WS_HOST}/ws/detections/${camera.id}`)
       detectionsWs.onmessage = (event) => {
-        const { faces } = JSON.parse(event.data)
+        const { faces, fire_smoke } = JSON.parse(event.data)
         overlayCtx.clearRect(0, 0, overlay.width, overlay.height)
         drawZonesOverlay(overlayCtx, zonesRef.current)
         drawDraftPolygon(overlayCtx, draftPointsRef.current)
@@ -156,6 +156,25 @@ export default function CameraTile({
           overlayCtx.fillRect(candidate.x, candidate.y, candidate.w, candidate.h)
           overlayCtx.fillStyle = 'white'
           overlayCtx.fillText(label, candidate.x + 3, candidate.y + LABEL_HEIGHT - 2)
+        }
+
+        for (const item of fire_smoke || []) {
+          // Smoke is alert-only (see AlertBanner) — no bounding box drawn, per
+          // request: a hazy/uncertain region flagged with a box on live video
+          // reads as a false-positive accusation more than a fire box does.
+          if (item.type === 'smoke') continue
+          const [x1, y1, x2, y2] = item.bbox
+          const color = item.type === 'fire' ? '#ef4444' : '#8b5cf6'
+          overlayCtx.strokeStyle = color
+          overlayCtx.lineWidth = 3
+          overlayCtx.strokeRect(x1, y1, x2 - x1, y2 - y1)
+
+          const label = item.type.toUpperCase()
+          const labelWidth = overlayCtx.measureText(label).width + 8
+          overlayCtx.fillStyle = color
+          overlayCtx.fillRect(x1, y1 - LABEL_HEIGHT, labelWidth, LABEL_HEIGHT)
+          overlayCtx.fillStyle = 'white'
+          overlayCtx.fillText(label, x1 + 4, y1 - 4)
         }
       }
     }

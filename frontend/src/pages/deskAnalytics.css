@@ -10,7 +10,12 @@
 
 .desk-zone-editor {
   position: relative;
-  width: 50vw;
+  /* Sized by viewport HEIGHT, not width -- a wide-but-short editor is what
+     actually keeps the whole page (camera + zone list + the report column
+     next to it) visible together without scrolling, on real laptop screen
+     heights. width:auto + aspect-ratio derives the width from this height. */
+  width: auto;
+  height: 42vh;
   max-width: 100%;
   aspect-ratio: 16 / 9;
   background: #0d0f14;

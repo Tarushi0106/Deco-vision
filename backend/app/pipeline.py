@@ -95,6 +95,7 @@ ZONE_ALERT_COOLDOWN_SECONDS = 300
 # more often than this - avoids flooding the table while someone stands in frame
 DETECTION_LOG_COOLDOWN_SECONDS = config.DETECTION_LOG_COOLDOWN_SECONDS
 RECOGNITION_MIN_CONSECUTIVE_HITS = config.RECOGNITION_MIN_CONSECUTIVE_HITS
+WORKER_HEALTH_CHECK_INTERVAL_SECONDS = config.WORKER_HEALTH_CHECK_INTERVAL_SECONDS
 # recognition clips (Analytics "Clips" column): one continuous clip per
 # presence — recording starts the moment a person is first recognized and
 # keeps going, at full capture rate, for as long as they keep showing up in
@@ -514,6 +515,11 @@ class PipelineManager:
         # available.
         self._input_queues: dict[int, multiprocessing.Queue] = {}
         self._worker_processes: dict[int, multiprocessing.Process] = {}
+        # cores each camera's worker was (re)started with — recorded so the
+        # health-check watchdog (see _check_worker_health) can respawn a dead
+        # worker with the same allocation it originally had, without needing
+        # to recompute _worker_core_allocation for every other live camera.
+        self._worker_cores: dict[int, int] = {}
         self._result_queue: multiprocessing.Queue = multiprocessing.Queue(maxsize=50)
         # Separate from the per-camera input queues on purpose: embed requests
         # (enrollment) are rare and time-sensitive (the caller is waiting
@@ -686,6 +692,7 @@ class PipelineManager:
         worker.start()
         self._input_queues[camera_id] = input_queue
         self._worker_processes[camera_id] = worker
+        self._worker_cores[camera_id] = cores
         logger.info("Camera %s: detection worker process started (pid %s)", camera_id, worker.pid)
         self._pin_worker_cpu_affinity(worker.pid, cores)
 
@@ -695,6 +702,29 @@ class PipelineManager:
             worker.terminate()
             worker.join(timeout=5)
         self._input_queues.pop(camera_id, None)
+        self._worker_cores.pop(camera_id, None)
+
+    def _check_worker_health(self) -> None:
+        """Detection worker crashes happen with no Python exception, no OOM,
+        and no log line at all (confirmed live: a native-level crash in a
+        library like onnxruntime/opencv bypasses Python's exception handling
+        entirely) — multiprocessing.Process has no built-in health check, so
+        a dead worker previously left its camera silently unrecognized
+        forever: the last cached detection result just never updated again,
+        indistinguishable from "nobody's in frame" from the API alone, until
+        someone noticed and manually restarted the whole backend. Runs from
+        _sender_loop on WORKER_HEALTH_CHECK_INTERVAL_SECONDS; is_alive() is
+        cheap enough to not matter added to that loop's per-tick cost."""
+        for camera_id, worker in list(self._worker_processes.items()):
+            if worker.is_alive():
+                continue
+            cores = self._worker_cores.get(camera_id, WORKER_MAX_CPU_CORES)
+            logger.error(
+                "Camera %s: detection worker (pid %s) is not running (exit code %s) — restarting it",
+                camera_id, worker.pid, worker.exitcode,
+            )
+            self._stop_worker(camera_id)
+            self._start_worker(camera_id, cores)
 
     def _start_camera(self, camera_id: int, worker_cores: int = WORKER_MAX_CPU_CORES) -> None:
         if camera_id in self._pipelines:
@@ -743,6 +773,7 @@ class PipelineManager:
         never inference, so this can't block anything downstream."""
         interval = 1 / DEFAULT_DETECTION_FPS
         last_settings_check = 0.0
+        last_health_check = 0.0
 
         while self._running:
             now = time.time()
@@ -753,6 +784,10 @@ class PipelineManager:
                     interval = 1 / fps if fps > 0 else 1 / DEFAULT_DETECTION_FPS
                 except (TypeError, ValueError):
                     interval = 1 / DEFAULT_DETECTION_FPS
+
+            if now - last_health_check >= WORKER_HEALTH_CHECK_INTERVAL_SECONDS:
+                last_health_check = now
+                self._check_worker_health()
 
             for camera_id, pipeline in list(self._pipelines.items()):
                 jpeg = pipeline.get_latest_jpeg()

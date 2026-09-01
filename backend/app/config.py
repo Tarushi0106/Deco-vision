@@ -239,6 +239,16 @@ DETECTION_WORKER_MAX_CPU_CORES = int(os.getenv("DETECTION_WORKER_MAX_CPU_CORES",
 # before that setting has ever been saved.
 DEFAULT_DETECTION_FPS = float(os.getenv("DEFAULT_DETECTION_FPS", "1"))
 
+# How often the sender loop checks whether each camera's detection worker
+# process is still alive, and respawns it if not. Detection worker crashes
+# (confirmed live: a native-level crash with no Python exception, no OOM,
+# and no log line at all — multiprocessing.Process has no built-in health
+# check or auto-restart) previously left a camera silently unrecognized
+# indefinitely, invisible from the API (the last cached result just never
+# updated again) until someone noticed and manually restarted the whole
+# backend. This closes that gap without needing a full service restart.
+WORKER_HEALTH_CHECK_INTERVAL_SECONDS = float(os.getenv("WORKER_HEALTH_CHECK_INTERVAL_SECONDS", "15"))
+
 # Root log level for both the main API process (main.py) and each per-camera
 # detection worker process (detection_worker.py runs in a separate OS
 # process — see pipeline.py's module docstring — so it configures its own

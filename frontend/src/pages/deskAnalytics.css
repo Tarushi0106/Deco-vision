@@ -8,6 +8,12 @@
   align-items: start;
 }
 
+/* See the identical rule on .dashboard-main-grid in pages.css -- a <canvas>'s
+   JS-set pixel width otherwise overrides this grid's own 2fr/1fr split. */
+.desk-analytics-grid > * {
+  min-width: 0;
+}
+
 .desk-zone-editor {
   position: relative;
   /* Fills its grid column, same as CameraTile's .camera-tile-video. */

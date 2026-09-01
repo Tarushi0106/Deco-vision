@@ -63,6 +63,15 @@
   align-items: start;
 }
 
+/* Grid items default to min-width:auto, which can't shrink below their
+   content's intrinsic size -- a <canvas> gets its actual pixel width set via
+   JS to match the video's native resolution (e.g. 1280px), which otherwise
+   silently overrides the 2fr/1fr split and lets the camera column consume
+   the whole row regardless of this grid's own column sizing. */
+.dashboard-main-grid > * {
+  min-width: 0;
+}
+
 .panel {
   padding: 1rem 1.1rem 1.25rem;
 }

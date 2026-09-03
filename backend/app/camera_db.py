@@ -46,11 +46,13 @@ def init_db() -> None:
                 stream_path TEXT DEFAULT '',
                 status TEXT DEFAULT 'inactive',
                 live_feed_enabled INTEGER DEFAULT 1,
-                admin_port INTEGER DEFAULT 443
+                admin_port INTEGER DEFAULT 443,
+                ai_enabled INTEGER DEFAULT 1
             )
             """
         )
         _migrate_admin_port(conn)
+        _migrate_ai_enabled(conn)
         _seed_if_empty(conn)
 
         conn.execute(
@@ -72,6 +74,18 @@ def _migrate_admin_port(conn: sqlite3.Connection) -> None:
     columns = {row[1] for row in conn.execute("PRAGMA table_info(cameras)")}
     if "admin_port" not in columns:
         conn.execute("ALTER TABLE cameras ADD COLUMN admin_port INTEGER DEFAULT 443")
+
+
+def _migrate_ai_enabled(conn: sqlite3.Connection) -> None:
+    """cameras table predates the display-only mode (see pipeline.py's
+    PipelineManager._start_camera) — default 1 (on) for every camera that
+    existed before this column, matching their unchanged prior behavior
+    (every camera always ran face recognition/zone/fire/smoke). Only a
+    camera explicitly added or edited with ai_enabled=0 skips the
+    detection worker entirely."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(cameras)")}
+    if "ai_enabled" not in columns:
+        conn.execute("ALTER TABLE cameras ADD COLUMN ai_enabled INTEGER DEFAULT 1")
 
 
 def _seed_if_empty(conn: sqlite3.Connection) -> None:
@@ -214,8 +228,9 @@ def get_camera_connection(camera_id: int) -> dict | None:
 def add_camera(name: str, site: str, **fields) -> int:
     with get_connection() as conn:
         cur = conn.execute(
-            """INSERT INTO cameras (name, site, cam_code, purpose, host, port, user, password, stream_path, status, live_feed_enabled, admin_port)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO cameras
+               (name, site, cam_code, purpose, host, port, user, password, stream_path, status, live_feed_enabled, admin_port, ai_enabled)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 name,
                 site,
@@ -229,6 +244,7 @@ def add_camera(name: str, site: str, **fields) -> int:
                 "active" if fields.get("host") else "inactive",
                 int(fields.get("live_feed_enabled", True)),
                 fields.get("admin_port", config.CAMERA_ADMIN_PORT),
+                int(fields.get("ai_enabled", True)),
             ),
         )
         return cur.lastrowid

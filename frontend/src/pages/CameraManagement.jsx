@@ -13,6 +13,7 @@ const BLANK = {
   password: '',
   stream_path: '/h264/ch1/sub/av_stream',
   live_feed_enabled: true,
+  ai_enabled: true,
 }
 
 function CameraFormModal({ initial, onClose, onSaved }) {
@@ -93,6 +94,19 @@ function CameraFormModal({ initial, onClose, onSaved }) {
             onChange={(e) => setForm({ ...form, live_feed_enabled: e.target.checked })}
           />
         </div>
+        <div className="form-row">
+          <label>AI Processing (face recognition, attendance, zone/fire/smoke alerts)</label>
+          <input
+            type="checkbox"
+            checked={Boolean(form.ai_enabled)}
+            onChange={(e) => setForm({ ...form, ai_enabled: e.target.checked })}
+          />
+          <div className="stat-tile-sub">
+            Off means this camera streams live video only — no face recognition, no biometric enrollment matching,
+            no attendance, no zone/fire/smoke alerts. Use for a camera without the necessary consent/authorization
+            for AI processing yet.
+          </div>
+        </div>
         {status?.error && <div className="form-message error">{status.error}</div>}
         <div className="modal-actions">
           <button type="button" className="btn btn-outline" onClick={onClose}>
@@ -152,6 +166,7 @@ export default function CameraManagement() {
               <th>Purpose</th>
               <th>Status</th>
               <th>Live Feed</th>
+              <th>AI Processing</th>
               <th>Actions</th>
             </tr>
           </thead>
@@ -168,6 +183,11 @@ export default function CameraManagement() {
                   </span>
                 </td>
                 <td>{cam.live ? 'On' : 'Off'}</td>
+                <td>
+                  <span className={`pill ${cam.ai_enabled === false ? 'pill-neutral' : 'pill-success'}`}>
+                    {cam.ai_enabled === false ? 'Display only' : 'On'}
+                  </span>
+                </td>
                 <td>
                   <button
                     className="btn btn-outline"

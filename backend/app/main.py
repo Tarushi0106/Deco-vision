@@ -83,6 +83,15 @@ class CameraIn(BaseModel):
     stream_path: str | None = "/h264/ch1/sub/av_stream"
     live_feed_enabled: bool | None = True
     admin_port: int | None = config.CAMERA_ADMIN_PORT
+    # Off means this camera streams live video only — no face recognition,
+    # zone/fire/smoke detection, attendance, or clip recording ever runs on
+    # it (see pipeline.py's PipelineManager._start_camera, which skips
+    # spawning a detection worker entirely for it, not just hiding results
+    # in the UI). Defaults on so every existing camera's behavior is
+    # unchanged; only meant to be turned off for a deployment that's
+    # explicitly display-only for this camera (e.g. no consent/legal basis
+    # yet for biometric processing on it).
+    ai_enabled: bool | None = True
 
 
 class CameraUpdate(BaseModel):
@@ -97,6 +106,7 @@ class CameraUpdate(BaseModel):
     stream_path: str | None = None
     live_feed_enabled: bool | None = None
     admin_port: int | None = None
+    ai_enabled: bool | None = None
 
 
 class SiteIn(BaseModel):

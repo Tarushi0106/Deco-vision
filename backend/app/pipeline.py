@@ -646,6 +646,12 @@ class PipelineManager:
         self._sender_thread: threading.Thread | None = None
         self._receiver_thread: threading.Thread | None = None
 
+        # camera_id -> whether its detection worker is (supposed to be)
+        # running — lets refresh_cameras() tell "ai_enabled just got toggled
+        # on an already-live camera" apart from "this camera is brand new"
+        # without restarting the video capture pipeline either way.
+        self._ai_enabled_state: dict[int, bool] = {}
+
         # (camera_id, zone_id, person_name) -> last time this identity was
         # seen inside this zone. Only ever read/written from _receiver_loop's
         # thread (via _check_zone_violations), so no lock needed — same
@@ -739,9 +745,14 @@ class PipelineManager:
         self._gate_tracker = GateTracker(footfall_gate_db)
 
         live_cameras = [cam for cam in camera_db.list_cameras() if self._should_be_live(cam)]
-        allocation = self._worker_core_allocation([cam["id"] for cam in live_cameras])
+        # Display-only cameras (ai_enabled=0) get a video pipeline but no
+        # detection worker at all (see _start_camera) — excluded here so
+        # they don't dilute WORKER_MAX_CPU_CORES's split across cameras
+        # that actually run inference.
+        ai_camera_ids = [cam["id"] for cam in live_cameras if cam.get("ai_enabled", True)]
+        allocation = self._worker_core_allocation(ai_camera_ids)
         for cam in live_cameras:
-            self._start_camera(cam["id"], allocation[cam["id"]])
+            self._start_camera(cam["id"], allocation.get(cam["id"], WORKER_MAX_CPU_CORES), cam.get("ai_enabled", True))
 
         self._running = True
         self._sender_thread = threading.Thread(target=self._sender_loop, daemon=True)
@@ -812,7 +823,8 @@ class PipelineManager:
             self._stop_worker(camera_id)
             self._start_worker(camera_id, cores)
 
-    def _start_camera(self, camera_id: int, worker_cores: int = WORKER_MAX_CPU_CORES) -> None:
+    def _start_camera(self, camera_id: int, worker_cores: int = WORKER_MAX_CPU_CORES, ai_enabled: bool = True) -> None:
+        self._ai_enabled_state[camera_id] = ai_enabled
         if camera_id in self._pipelines:
             return
         pipeline = CameraPipeline(camera_id)
@@ -822,7 +834,13 @@ class PipelineManager:
         # Not restarted on a plain reconnect (see refresh_cameras) — the worker
         # process holds no RTSP connection state, only the capture pipeline
         # above does, so an already-running worker for this camera stays put.
-        if camera_id not in self._worker_processes:
+        # Display-only cameras (ai_enabled=False) never get one at all —
+        # video still streams via the capture pipeline above, but no face
+        # recognition, zone/fire/smoke detection, or attendance logging
+        # ever runs on them; there's no detection code path to opt out of
+        # downstream, because the worker process that would run it is
+        # simply never started.
+        if ai_enabled and camera_id not in self._worker_processes:
             self._start_worker(camera_id, worker_cores)
 
     def refresh_cameras(self) -> None:
@@ -832,7 +850,10 @@ class PipelineManager:
         (host/port/user/password/stream_path) changed — otherwise editing
         just the password would leave the pipeline running on its already
         -open, old-credentials connection until that connection happened to
-        drop on its own."""
+        drop on its own. Toggling ai_enabled on an already-live camera
+        starts/stops just its detection worker, never touching the video
+        capture pipeline — so flipping a camera to/from display-only never
+        interrupts its live feed."""
         self._refresh_footfall_cameras()
         cameras = {c["id"]: c for c in camera_db.list_cameras()}
 
@@ -842,16 +863,30 @@ class PipelineManager:
                 self._pipelines.pop(camera_id).stop()
                 self._conn_keys.pop(camera_id, None)
                 self._stop_worker(camera_id)
+                self._ai_enabled_state.pop(camera_id, None)
             elif self._connection_key(camera_id) != self._conn_keys.get(camera_id):
                 logger.info("Camera %s: connection details changed, reconnecting", camera_id)
                 self._pipelines.pop(camera_id).stop()
                 self._conn_keys.pop(camera_id, None)
+            else:
+                ai_enabled = cam.get("ai_enabled", True)
+                was_enabled = self._ai_enabled_state.get(camera_id, True)
+                if ai_enabled and not was_enabled:
+                    logger.info("Camera %s: AI processing enabled, starting detection worker", camera_id)
+                    self._start_worker(camera_id, WORKER_MAX_CPU_CORES)
+                elif not ai_enabled and was_enabled:
+                    logger.info("Camera %s: AI processing disabled, stopping detection worker", camera_id)
+                    self._stop_worker(camera_id)
+                self._ai_enabled_state[camera_id] = ai_enabled
 
-        live_ids = [cam["id"] for cam in cameras.values() if self._should_be_live(cam)]
-        allocation = self._worker_core_allocation(live_ids)
-        for cam in cameras.values():
-            if self._should_be_live(cam):
-                self._start_camera(cam["id"], allocation[cam["id"]])
+        live_cameras = [cam for cam in cameras.values() if self._should_be_live(cam)]
+        ai_camera_ids = [
+            cam["id"] for cam in live_cameras if cam.get("ai_enabled", True) and cam["id"] not in self._pipelines
+        ]
+        allocation = self._worker_core_allocation(ai_camera_ids)
+        for cam in live_cameras:
+            if cam["id"] not in self._pipelines:
+                self._start_camera(cam["id"], allocation.get(cam["id"], WORKER_MAX_CPU_CORES), cam.get("ai_enabled", True))
 
     def _sender_loop(self) -> None:
         """Feeds the detection worker JPEG bytes at the user-configurable

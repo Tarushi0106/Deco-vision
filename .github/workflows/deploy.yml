@@ -32,28 +32,10 @@ jobs:
 
           ssh_opts=(-i "$key_file" -o BatchMode=yes -o StrictHostKeyChecking=no)
           remote="${EC2_USER}@${EC2_HOST}"
-          # This runner's own clock (accurate — GitHub-hosted runners are NTP-
-          # synced) is the source of truth, passed in as $2 below. Confirmed
-          # live 2026-09-03: `timedatectl set-ntp true` alone did NOT fix a
-          # ~90-minute drift on this instance (still off by the same amount
-          # after a full deploy ran it) — most likely outbound NTP (UDP 123)
-          # is blocked by the security group, so waiting on NTP to converge
-          # isn't reliable here. Force-setting from the runner's clock fixes
-          # it immediately regardless of whether NTP can ever reach out.
-          runner_epoch="$(date -u +%s)"
 
-          ssh "${ssh_opts[@]}" "$remote" bash -s -- "$APP_DIR" "$runner_epoch" <<'REMOTE'
+          ssh "${ssh_opts[@]}" "$remote" bash -s -- "$APP_DIR" <<'REMOTE'
           set -euo pipefail
           app_dir="$1"
-          runner_epoch="$2"
-
-          echo "Server clock before fix: $(date -u)"
-          sudo date -u -s "@$runner_epoch" >/dev/null
-          echo "Server clock after fix:  $(date -u)"
-          # Best-effort, in case outbound NTP does work and can keep it
-          # correct going forward — the force-set above is what actually
-          # guarantees correctness right now, this just doesn't hurt to try.
-          sudo timedatectl set-ntp true 2>/dev/null || true
 
           cd "$app_dir"
           git fetch origin main

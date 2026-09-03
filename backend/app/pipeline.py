@@ -106,10 +106,16 @@ FIRE_SMOKE_ALERT_COOLDOWN_SECONDS = 120
 # cooldown — someone continuously present never re-fires no matter how
 # long they stay, and leaving-then-returning fires immediately rather than
 # waiting out a multi-minute timer. This is how long an absence has to
-# last before it counts as "left", not "recognition missed one frame" —
-# detect cycles run ~1/sec, so this tolerates a handful of missed/occluded
-# frames without treating a still-present person as a fresh entry.
-ZONE_EXIT_GRACE_SECONDS = 8
+# last before it counts as "left", not "recognition missed one frame".
+# Originally set to 8s on the (wrong) assumption that detect cycles hit
+# every ~1s reliably — confirmed live on "Main gate camera" 2026-09-03:
+# a continuously-present, unmoving person re-triggered every ~20-30s at
+# 8s, MORE often than the old flat 300s cooldown, the opposite of the
+# point of this change. Matches PRESENCE_GRACE_SECONDS below (60s) —
+# same real measured recognition gaps (60-114s, same recognition
+# pipeline, see that constant's own comment) — but can't just reference
+# it directly, it's defined later in this file.
+ZONE_EXIT_GRACE_SECONDS = 60
 # Recognition can resolve "Unknown" -> a real name a cycle or two after a
 # zone violation first fires (detection_worker's full-res recheck can land
 # after the initial match) — this is how recent an "Unknown" alert has to

@@ -32,6 +32,8 @@ export const api = {
   updateSite: (id, data) => req(`/api/sites/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteSite: (id) => req(`/api/sites/${id}`, { method: 'DELETE' }),
   deletePerson: (name) => req(`/api/people/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  deletePersonPhoto: (name, filename) =>
+    req(`/api/people/${encodeURIComponent(name)}/photos/${encodeURIComponent(filename)}`, { method: 'DELETE' }),
   renamePerson: (name, newName, employeeId) =>
     req(`/api/people/${encodeURIComponent(name)}`, {
       method: 'PUT',

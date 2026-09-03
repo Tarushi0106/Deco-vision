@@ -160,6 +160,24 @@ def delete_face(name: str) -> list[str]:
     return [r[0] for r in rows]
 
 
+def delete_face_photo(name: str, source_photo: str) -> bool:
+    """Removes a single enrolled sample by its source_photo filename —
+    filenames are unique per upload (uuid-suffixed, see add_person in
+    main.py), so this uniquely identifies one row without needing a
+    separate numeric id. Returns True if a row was actually deleted."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "DELETE FROM enrolled_faces WHERE name = ? AND source_photo = ?", (name, source_photo)
+        )
+    return cur.rowcount > 0
+
+
+def count_faces(name: str) -> int:
+    with get_connection() as conn:
+        row = conn.execute("SELECT COUNT(*) FROM enrolled_faces WHERE name = ?", (name,)).fetchone()
+    return row[0]
+
+
 def rename_face(old_name: str, new_name: str) -> int:
     """Renames every enrolled sample for this person, and cascades to past
     detection_events too — those rows store the name as a plain text snapshot,

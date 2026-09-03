@@ -173,15 +173,63 @@ function EditPersonModal({ person, onClose, onSaved }) {
   )
 }
 
-function PhotoViewerModal({ person, onClose }) {
+function PhotoViewerModal({ person: initialPerson, onClose, onChanged }) {
+  const [person, setPerson] = useState(initialPerson)
+  const [error, setError] = useState(null)
+  const [deletingFilename, setDeletingFilename] = useState(null)
+
+  const handleDeletePhoto = async (filename) => {
+    if (person.photos.length <= 1) {
+      if (!confirm(`This is ${person.name}'s last photo — deleting it removes them entirely. Continue?`)) return
+    } else if (!confirm('Delete this photo?')) {
+      return
+    }
+    setError(null)
+    setDeletingFilename(filename)
+    try {
+      const result = await api.deletePersonPhoto(person.name, filename)
+      onChanged()
+      if (result.remaining_samples === 0) {
+        onClose()
+        return
+      }
+      const idx = person.photos.indexOf(filename)
+      setPerson((p) => ({
+        ...p,
+        photos: p.photos.filter((f) => f !== filename),
+        photo_urls: p.photo_urls.filter((_, i) => i !== idx),
+        sample_count: result.remaining_samples,
+      }))
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setDeletingFilename(null)
+    }
+  }
+
   return (
     <div className="modal-backdrop" onClick={onClose}>
       <div className="card modal" onClick={(e) => e.stopPropagation()}>
         <h3>{person.name}</h3>
+        {error && <div className="form-message error">{error}</div>}
         <div className="photo-viewer-grid">
-          {person.photo_urls.map((url) => (
-            <img key={url} src={`${API_BASE}${url}`} alt={person.name} className="photo-viewer-img" />
-          ))}
+          {person.photo_urls.map((url, i) => {
+            const filename = person.photos[i]
+            return (
+              <div key={url} className="photo-viewer-item">
+                <img src={`${API_BASE}${url}`} alt={person.name} className="photo-viewer-img" />
+                <button
+                  type="button"
+                  className="photo-viewer-delete"
+                  title="Delete this photo"
+                  disabled={deletingFilename === filename}
+                  onClick={() => handleDeletePhoto(filename)}
+                >
+                  {deletingFilename === filename ? '…' : '✕'}
+                </button>
+              </div>
+            )
+          })}
         </div>
         <div className="modal-actions">
           <button type="button" className="btn btn-outline" onClick={onClose}>
@@ -320,7 +368,7 @@ export default function People() {
       )}
 
       {viewingPerson && (
-        <PhotoViewerModal person={viewingPerson} onClose={() => setViewingPerson(null)} />
+        <PhotoViewerModal person={viewingPerson} onClose={() => setViewingPerson(null)} onChanged={load} />
       )}
 
       {editingPerson && (

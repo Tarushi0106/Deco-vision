@@ -10,7 +10,10 @@ const INTRUSION_ALERT_TYPES = new Set(['zone_intrusion', 'intrusion'])
 const INTRUSION_TYPE_LABELS = { zone_intrusion: 'ZONE INTRUSION', intrusion: 'INTRUSION' }
 
 function timeAgo(ts) {
-  const seconds = Math.floor(Date.now() / 1000 - ts)
+  // Clamped at 0: a server clock running ahead of the viewer's browser
+  // otherwise makes Date.now()/1000 - ts negative, showing a nonsensical
+  // "-3713s ago" instead of just reading as "just now".
+  const seconds = Math.max(0, Math.floor(Date.now() / 1000 - ts))
   if (seconds < 60) return `${seconds}s ago`
   const mins = Math.floor(seconds / 60)
   if (mins < 60) return `${mins}m ago`

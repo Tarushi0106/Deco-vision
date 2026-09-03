@@ -928,7 +928,7 @@ class PipelineManager:
             if self._desk_tracker is not None:
                 self._desk_tracker.process_frame(camera_id, result["faces"], frame_w, frame_h)
 
-            self._check_zone_violations(camera_id, result["faces"])
+            self._check_zone_violations(camera_id, result["faces"], result.get("jpeg"))
             pipeline.set_detections(result["faces"])
 
         if "people" in result and self._desk_tracker is not None:
@@ -965,7 +965,9 @@ class PipelineManager:
                 ]
                 confidence_pct = round(max(matching_scores) * 100) if matching_scores else None
                 confidence_note = f" (confidence: {confidence_pct}%)" if confidence_pct is not None else ""
-                snapshot_path = self._save_alert_snapshot(camera_id, event_type, pipeline.get_latest_jpeg())
+                snapshot_path = self._save_alert_snapshot(
+                    camera_id, event_type, result.get("jpeg") or pipeline.get_latest_jpeg()
+                )
                 alerts_db.log_alert(
                     camera_id,
                     event_type,
@@ -992,7 +994,7 @@ class PipelineManager:
         contour = np.array(polygon_points, dtype=np.int32).reshape((-1, 1, 2))
         return cv2.pointPolygonTest(contour, point, False) >= 0
 
-    def _check_zone_violations(self, camera_id: int, faces: list[dict]) -> None:
+    def _check_zone_violations(self, camera_id: int, faces: list[dict], jpeg: bytes | None) -> None:
         """Restricted-zone allow-list check: anyone (a different enrolled
         person, or an unrecognized face) detected inside a zone's polygon
         who isn't on that zone's allowed_names list raises a zone_intrusion
@@ -1027,7 +1029,7 @@ class PipelineManager:
                 who = name if name != "Unknown" else "Unknown Person"
                 pipeline = self._pipelines.get(camera_id)
                 snapshot_path = self._save_alert_snapshot(
-                    camera_id, f"zone{zone['id']}", pipeline.get_latest_jpeg() if pipeline else None
+                    camera_id, f"zone{zone['id']}", jpeg or (pipeline.get_latest_jpeg() if pipeline else None)
                 )
                 alerts_db.log_alert(
                     camera_id,

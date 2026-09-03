@@ -37,6 +37,15 @@ jobs:
           set -euo pipefail
           app_dir="$1"
 
+          # Confirmed live 2026-09-03: this instance's clock had drifted
+          # ~90 minutes ahead (no NTP sync running), which made every alert's
+          # timestamp look like it was in the future on the dashboard
+          # ("-3713s ago"). Idempotent — safe to run on every deploy.
+          echo "Ensuring system clock is NTP-synced..."
+          sudo timedatectl set-ntp true
+          sudo systemctl restart systemd-timesyncd 2>/dev/null || true
+          timedatectl status || true
+
           cd "$app_dir"
           git fetch origin main
           git reset --hard origin/main

@@ -406,6 +406,13 @@ def run_worker(
                 # stored in; cheap (two ints) so always included rather than
                 # gated behind whether any camera currently has zones.
                 "frame_size": [frame.shape[1], frame.shape[0]],
+                # The EXACT frame that was just analyzed above (already-encoded
+                # bytes, no re-encode) — pipeline.py uses this for alert
+                # snapshots instead of "whatever's currently live", since by
+                # the time a result comes back and an alert fires, the live
+                # feed has already moved on to a newer frame that may no
+                # longer show the person/event that triggered the alert.
+                "jpeg": item["jpeg"],
             }
             if faces:
                 for f in faces:

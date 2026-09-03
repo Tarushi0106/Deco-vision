@@ -33,7 +33,7 @@ try:
 except ImportError:
     psutil = None
 
-from . import alerts_db, camera_db, clips_db, config, face_db, footfall_gate_db, zones_db
+from . import alert_events, alerts_db, camera_db, clips_db, config, face_db, footfall_gate_db, zones_db
 from .desk_tracker import DeskTracker
 from .detection_worker import CAMERA_DETECTION_MAX_DIM, run_worker
 from .footfall_counter import FootfallCounter, resolve_footfall_camera_ids
@@ -43,6 +43,15 @@ from .video_source import RtspSource, WebcamSource
 
 logger = logging.getLogger("dashboard.pipeline")
 recognition_logger = logging.getLogger("dashboard.recognition_pipeline")
+
+
+def _ts_ms() -> str:
+    """Millisecond-precision wall-clock timestamp for the detection-to-
+    dashboard latency trace in _check_zone_violations — set LOG_LEVEL=DEBUG
+    to see the full per-cycle path this produces."""
+    now = time.time()
+    return time.strftime("%H:%M:%S", time.localtime(now)) + f".{int(now * 1000) % 1000:03d}"
+
 
 JPEG_QUALITY = 80
 # Measured this session: pre-downscaling to 640px here before sending to the
@@ -92,9 +101,21 @@ INTRUSION_ALERT_COOLDOWN_SECONDS = 300
 # shorter than INTRUSION/ZONE's 300s — a real fire/smoke event should keep
 # re-alerting more often than that, not go quiet for 5 minutes at a time
 FIRE_SMOKE_ALERT_COOLDOWN_SECONDS = 120
-# same idea, but scoped per zone + detected identity (see recent_open_alert) —
-# a different unauthorized person in the same zone still alerts immediately
-ZONE_ALERT_COOLDOWN_SECONDS = 300
+# Zone intrusions use real entry/exit tracking instead (see
+# PipelineManager._zone_occupancy / _check_zone_violations), not a flat
+# cooldown — someone continuously present never re-fires no matter how
+# long they stay, and leaving-then-returning fires immediately rather than
+# waiting out a multi-minute timer. This is how long an absence has to
+# last before it counts as "left", not "recognition missed one frame" —
+# detect cycles run ~1/sec, so this tolerates a handful of missed/occluded
+# frames without treating a still-present person as a fresh entry.
+ZONE_EXIT_GRACE_SECONDS = 8
+# Recognition can resolve "Unknown" -> a real name a cycle or two after a
+# zone violation first fires (detection_worker's full-res recheck can land
+# after the initial match) — this is how recent an "Unknown" alert has to
+# be to count as the SAME physical entry (upgraded in place, see
+# alerts_db.upgrade_unknown_zone_alert) rather than a second, duplicate one.
+UNKNOWN_UPGRADE_WINDOW_SECONDS = 15
 # One evidence frame per alert (zone_intrusion, fire, smoke) — unlike
 # detection_worker.py's separate fire/smoke debug dir, this is linked to the
 # actual alert row (alerts.snapshot_path) and served via
@@ -619,6 +640,16 @@ class PipelineManager:
         self._sender_thread: threading.Thread | None = None
         self._receiver_thread: threading.Thread | None = None
 
+        # (camera_id, zone_id, person_name) -> last time this identity was
+        # seen inside this zone. Only ever read/written from _receiver_loop's
+        # thread (via _check_zone_violations), so no lock needed — same
+        # single-writer assumption CameraPipeline's own _last_logged/
+        # _consecutive_hits dicts already rely on. Entry/exit state for zone
+        # alerts (see _check_zone_violations) — replaced a flat time cooldown
+        # that couldn't tell "still standing there" from "left and came
+        # back", so a real re-entry could sit unalerted for minutes.
+        self._zone_occupancy: dict[tuple[int, int, str], float] = {}
+
     @staticmethod
     def _should_be_live(cam: dict) -> bool:
         return bool(cam["is_configured"] and cam["status"] == "active" and cam["live_feed_enabled"])
@@ -974,6 +1005,7 @@ class PipelineManager:
                     f"Possible {event_type} detected on camera{confidence_note}",
                     snapshot_path=snapshot_path,
                 )
+                alert_events.broadcast()
                 logger.warning("Camera %s: possible %s detected%s", camera_id, event_type, confidence_note)
             if event_type == "smoke":
                 pipeline.note_smoke_event()
@@ -987,6 +1019,7 @@ class PipelineManager:
         if result.get("person_count", 0) > 0 and self._is_within_restricted_window():
             if not alerts_db.recent_open_alert(camera_id, "intrusion", INTRUSION_ALERT_COOLDOWN_SECONDS):
                 alerts_db.log_alert(camera_id, "intrusion", "Person present during restricted hours")
+                alert_events.broadcast()
                 logger.warning("Camera %s: intrusion during restricted hours", camera_id)
 
     @staticmethod
@@ -998,15 +1031,30 @@ class PipelineManager:
         """Restricted-zone allow-list check: anyone (a different enrolled
         person, or an unrecognized face) detected inside a zone's polygon
         who isn't on that zone's allowed_names list raises a zone_intrusion
-        alert. Test point is each face's bbox center — the only real-time,
-        per-identity position signal available (pose/body bbox only runs
-        every detection_worker.POSE_INTERVAL_SECONDS and carries no name).
-        A zone with both restricted_start/restricted_end set only enforces
-        during that window; leaving them blank means the allow-list applies
-        at any time."""
+        alert, pushed to every connected client immediately (alert_events.
+        broadcast() below) — never a timer or a page refresh. Test point is
+        each face's bbox center — the only real-time, per-identity position
+        signal available (pose/body bbox only runs every
+        detection_worker.POSE_INTERVAL_SECONDS and carries no name). A zone
+        with both restricted_start/restricted_end set only enforces during
+        that window; leaving them blank means the allow-list applies at any
+        time.
+
+        Never waits on anything beyond this same cycle's already-completed
+        recognition: `name` here is whatever detection_worker's recognizer
+        already decided for THIS frame (confidently matched, or "Unknown")
+        — there's no separate slower identity step this blocks on. Two
+        follow-on behaviors close the gap that leaves, though: (1) entry/
+        exit tracking via self._zone_occupancy means someone continuously
+        present never re-fires, but leaving and returning fires again
+        immediately, not after a multi-minute cooldown; (2) if recognition
+        resolves "Unknown" -> a real name a cycle or two later (the same
+        physical entry, now identified), upgrade_unknown_zone_alert updates
+        that SAME alert row instead of logging a second, duplicate one."""
         zones = zones_db.list_zones(camera_id=camera_id)
         if not zones:
             return
+        now = time.time()
         for zone in zones:
             if not zone["enabled"]:
                 continue
@@ -1022,11 +1070,34 @@ class PipelineManager:
                 if name in zone["allowed_names"]:
                     continue
                 face["zone_violation"] = True
-                if alerts_db.recent_open_alert(
-                    camera_id, "zone_intrusion", ZONE_ALERT_COOLDOWN_SECONDS, zone_id=zone["id"], person_name=name
-                ):
-                    continue
+                # Per-cycle trace (fires every ~1s a violator stays put) —
+                # DEBUG only, or a busy zone would flood production logs;
+                # set LOG_LEVEL=DEBUG to see the full detection-to-dashboard
+                # path from your example.
+                logger.debug(
+                    "[%s] Camera %s: zone intrusion confirmed in '%s' - identity=%s, Allow List check: NOT ALLOWED",
+                    _ts_ms(), camera_id, zone["name"], name,
+                )
+
+                occ_key = (camera_id, zone["id"], name)
+                last_inside = self._zone_occupancy.get(occ_key)
+                self._zone_occupancy[occ_key] = now
+                if last_inside is not None and now - last_inside <= ZONE_EXIT_GRACE_SECONDS:
+                    continue  # same, already-alerted presence — not a fresh entry, no new event
+
                 who = name if name != "Unknown" else "Unknown Person"
+                message = f"{who} detected in restricted zone '{zone['name']}'"
+
+                if name != "Unknown" and alerts_db.upgrade_unknown_zone_alert(
+                    camera_id, zone["id"], name, message, within_seconds=UNKNOWN_UPGRADE_WINDOW_SECONDS
+                ):
+                    logger.info(
+                        "[%s] Camera %s: recognition resolved Unknown -> %s in '%s' - upgraded existing alert "
+                        "(no duplicate)", _ts_ms(), camera_id, name, zone["name"],
+                    )
+                    alert_events.broadcast()
+                    continue
+
                 pipeline = self._pipelines.get(camera_id)
                 snapshot_path = self._save_alert_snapshot(
                     camera_id, f"zone{zone['id']}", jpeg or (pipeline.get_latest_jpeg() if pipeline else None)
@@ -1034,11 +1105,13 @@ class PipelineManager:
                 alerts_db.log_alert(
                     camera_id,
                     "zone_intrusion",
-                    f"{who} detected in restricted zone '{zone['name']}'",
+                    message,
                     zone_id=zone["id"],
                     person_name=name,
                     snapshot_path=snapshot_path,
                 )
+                logger.info("[%s] Camera %s: intrusion event created - %s", _ts_ms(), camera_id, message)
+                alert_events.broadcast()
                 logger.warning("Camera %s: zone violation in '%s' by %s", camera_id, zone["name"], name)
 
     @staticmethod

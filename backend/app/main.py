@@ -30,8 +30,8 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 from . import (
-    alerts_db, auth, camera_db, clips_db, config, desk_db, face_db, footfall_db, footfall_gate_db, footfall_report,
-    license_db, license_qr, scheduler, user_db, zones_db,
+    alert_events, alerts_db, auth, camera_db, clips_db, config, desk_db, face_db, footfall_db, footfall_gate_db,
+    footfall_report, license_db, license_qr, scheduler, user_db, zones_db,
 )
 from . import onvif_client, pipeline, replay_prefetch
 from .camera_client import get_camera_client, sync_face_to_all_devices
@@ -69,11 +69,6 @@ VIDEO_FPS = 15
 VIDEO_INTERVAL = 1 / VIDEO_FPS
 DETECTIONS_FPS = 6
 DETECTIONS_INTERVAL = 1 / DETECTIONS_FPS
-# Alerts don't need per-frame cadence like video/detections above, but this
-# is what makes Live Alerts push-updated instead of waiting on the
-# frontend's old 15s HTTP poll — same poll-and-push-over-a-socket pattern
-# as /ws/live and /ws/detections, just on its own much coarser interval.
-ALERTS_INTERVAL = 2
 
 
 class CameraIn(BaseModel):
@@ -174,6 +169,11 @@ class ZoneUpdate(BaseModel):
 
 @app.on_event("startup")
 def startup():
+    # Starlette calls a sync startup handler directly on the event loop
+    # thread (not the threadpool sync routes get), so this correctly
+    # captures the loop /ws/alerts's broadcasts get scheduled onto from
+    # pipeline.py's background thread — see alert_events.py.
+    alert_events.bind_loop(asyncio.get_running_loop())
     face_db.init_db()
     seeded = face_db.seed_enrolled_faces_if_empty()
     if seeded:
@@ -401,25 +401,19 @@ def get_stats():
     }
 
 
-def _list_alerts_with_camera_names(resolved: bool | None = None, limit: int = 50) -> list[dict]:
-    """Shared by the REST endpoint below and the /ws/alerts push socket —
-    one place attaching camera_name onto alerts_db's raw rows, so the two
-    never drift out of sync with each other."""
-    cameras_by_id = {c["id"]: c["name"] for c in camera_db.list_cameras()}
-    alerts = alerts_db.list_alerts(resolved=resolved, limit=limit)
-    for alert in alerts:
-        alert["camera_name"] = cameras_by_id.get(alert["camera_id"], "Unknown camera")
-    return alerts
-
-
 @app.get("/api/alerts")
 def list_alerts(resolved: bool | None = None, limit: int = 50):
-    return _list_alerts_with_camera_names(resolved=resolved, limit=limit)
+    return alerts_db.list_alerts_with_camera_names(resolved=resolved, limit=limit)
 
 
 @app.post("/api/alerts/{alert_id}/resolve")
 def resolve_alert(alert_id: int):
     alerts_db.resolve_alert(alert_id)
+    # Pushes the updated (now-shorter) unresolved list to every connected
+    # client immediately, so resolving on one screen clears it from every
+    # other open Dashboard/Intrusion/Smoke tab without them needing to
+    # wait for their next event or refresh.
+    alert_events.broadcast()
     return {"ok": True}
 
 
@@ -1085,20 +1079,27 @@ async def detections_feed(websocket: WebSocket, camera_id: int):
 
 @app.websocket("/ws/alerts")
 async def alerts_feed(websocket: WebSocket):
-    """Global (not per-camera) — same poll-and-push-over-a-socket pattern as
-    live_feed/detections_feed above, just resending the current unresolved
-    alert list every ALERTS_INTERVAL instead of a per-camera frame. Lets
-    Dashboard/Intrusion/Smoke/AlertBanner update the instant a new alert is
-    logged, without their old 15s HTTP poll — the DB write in pipeline.py
-    is still the single source of truth, this only pushes what's already
-    there sooner."""
+    """Global (not per-camera), and NOT a poll loop — unlike live_feed/
+    detections_feed above, this never sleeps-then-resends on a timer. It
+    sends one snapshot on connect (so a just-opened tab isn't blank), then
+    purely waits: every subsequent message is pushed by alert_events.
+    broadcast() the instant pipeline.py logs/upgrades an alert or main.py
+    resolves one — true event-driven delivery, not "polls every N
+    seconds"."""
     await websocket.accept()
+    alert_events.register(websocket)
+    logger.info("alerts_feed client connected (%d total)", alert_events.client_count())
     try:
+        await websocket.send_json(alerts_db.list_alerts_with_camera_names(resolved=False))
         while True:
-            await websocket.send_json(_list_alerts_with_camera_names(resolved=False))
-            await asyncio.sleep(ALERTS_INTERVAL)
+            # Client never sends anything on this socket — this call exists
+            # purely to block until disconnect (WebSocketDisconnect) without
+            # a sleep/poll loop of our own.
+            await websocket.receive_text()
     except (WebSocketDisconnect, ConnectionResetError, RuntimeError):
         logger.info("alerts_feed client disconnected")
+    finally:
+        alert_events.unregister(websocket)
 
 
 ####################################################################

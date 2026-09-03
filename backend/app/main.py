@@ -411,6 +411,17 @@ def resolve_alert(alert_id: int):
     return {"ok": True}
 
 
+@app.get("/api/alerts/{alert_id}/snapshot")
+def get_alert_snapshot(alert_id: int):
+    alert = alerts_db.get_alert(alert_id)
+    if not alert or not alert.get("snapshot_path"):
+        raise HTTPException(status_code=404, detail="No snapshot for this alert")
+    path = Path(alert["snapshot_path"])
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Snapshot file missing")
+    return FileResponse(path, media_type="image/jpeg")
+
+
 @app.get("/api/settings")
 def get_settings():
     return {

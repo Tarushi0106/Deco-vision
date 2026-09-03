@@ -56,6 +56,7 @@ export const api = {
   getClipsForDay: (personName, date) =>
     req(`/api/people/${encodeURIComponent(personName)}/clips-for-day?date=${date}`),
   clipVideoUrl: (clipId) => `${API_BASE}/api/clips/${clipId}/video`,
+  alertSnapshotUrl: (alertId) => `${API_BASE}/api/alerts/${alertId}/snapshot`,
   getActiveClips: () => req('/api/clips/active'),
   listZones: (cameraId) => req(`/api/zones${cameraId ? `?camera_id=${cameraId}` : ''}`),
   createZone: (data) => req('/api/zones', { method: 'POST', body: JSON.stringify(data) }),

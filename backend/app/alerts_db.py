@@ -62,6 +62,8 @@ def _migrate_zone_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE alerts ADD COLUMN zone_id INTEGER")
     if "person_name" not in columns:
         conn.execute("ALTER TABLE alerts ADD COLUMN person_name TEXT")
+    if "snapshot_path" not in columns:
+        conn.execute("ALTER TABLE alerts ADD COLUMN snapshot_path TEXT")
 
 
 def get_setting(key: str, default: str | None = None) -> str | None:
@@ -80,13 +82,26 @@ def set_setting(key: str, value: str) -> None:
 
 
 def log_alert(
-    camera_id: int, alert_type: str, message: str, zone_id: int | None = None, person_name: str | None = None
+    camera_id: int,
+    alert_type: str,
+    message: str,
+    zone_id: int | None = None,
+    person_name: str | None = None,
+    snapshot_path: str | None = None,
 ) -> None:
     with get_connection() as conn:
         conn.execute(
-            "INSERT INTO alerts (ts, camera_id, type, message, zone_id, person_name) VALUES (?, ?, ?, ?, ?, ?)",
-            (time.time(), camera_id, alert_type, message, zone_id, person_name),
+            "INSERT INTO alerts (ts, camera_id, type, message, zone_id, person_name, snapshot_path) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (time.time(), camera_id, alert_type, message, zone_id, person_name, snapshot_path),
         )
+
+
+def get_alert(alert_id: int) -> dict | None:
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM alerts WHERE id = ?", (alert_id,)).fetchone()
+    return dict(row) if row else None
 
 
 def recent_open_alert(

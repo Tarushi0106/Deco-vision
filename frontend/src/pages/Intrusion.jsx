@@ -6,6 +6,17 @@ import './pages.css'
 
 const ZONE_BLANK = { name: '', allowed_names: [], restricted_start: '', restricted_end: '' }
 
+const INTRUSION_ALERT_TYPES = new Set(['zone_intrusion', 'intrusion'])
+const INTRUSION_TYPE_LABELS = { zone_intrusion: 'ZONE INTRUSION', intrusion: 'INTRUSION' }
+
+function timeAgo(ts) {
+  const seconds = Math.floor(Date.now() / 1000 - ts)
+  if (seconds < 60) return `${seconds}s ago`
+  const mins = Math.floor(seconds / 60)
+  if (mins < 60) return `${mins}m ago`
+  return `${Math.floor(mins / 60)}h ago`
+}
+
 function IntrusionWindowCard() {
   const [start, setStart] = useState('')
   const [end, setEnd] = useState('')
@@ -157,6 +168,18 @@ export default function Intrusion() {
   const [draftPoints, setDraftPoints] = useState([])
   const [editingShape, setEditingShape] = useState(false)
   const [editingZone, setEditingZone] = useState(null)
+  const [alerts, setAlerts] = useState([])
+
+  const loadAlerts = () => {
+    api.listAlerts({ resolved: false })
+      .then((all) => setAlerts(all.filter((a) => INTRUSION_ALERT_TYPES.has(a.type))))
+      .catch(() => {})
+  }
+
+  const handleResolveAlert = async (id) => {
+    await api.resolveAlert(id)
+    loadAlerts()
+  }
 
   useEffect(() => {
     api
@@ -167,6 +190,9 @@ export default function Intrusion() {
       })
       .catch(() => {})
     api.listFaces().then(setPeople).catch(() => {})
+    loadAlerts()
+    const interval = setInterval(loadAlerts, 15000)
+    return () => clearInterval(interval)
   }, [])
 
   const loadZones = (camId) => {
@@ -331,6 +357,38 @@ export default function Intrusion() {
                 ))}
               </tbody>
             </table>
+          )}
+        </div>
+
+        <div className="card panel">
+          <div className="panel-header">
+            <h3>Intrusion Alerts</h3>
+          </div>
+          {alerts.length === 0 ? (
+            <div className="empty-state">No active intrusion alerts.</div>
+          ) : (
+            <div className="alerts-list">
+              {alerts.map((alert) => (
+                <div key={alert.id} className="alerts-list-row">
+                  <div className="alerts-list-top">
+                    <span className="pill pill-danger">{INTRUSION_TYPE_LABELS[alert.type] || alert.type.toUpperCase()}</span>
+                    <span className="alerts-list-camera">{alert.camera_name}</span>
+                    <span className="alerts-list-time">{timeAgo(alert.ts)}</span>
+                  </div>
+                  <div className="alerts-list-message">{alert.message}</div>
+                  {alert.snapshot_path && (
+                    <img
+                      className="alerts-list-snapshot"
+                      src={api.alertSnapshotUrl(alert.id)}
+                      alt={`Snapshot: ${alert.message}`}
+                    />
+                  )}
+                  <button className="btn btn-outline" onClick={() => handleResolveAlert(alert.id)}>
+                    Resolve
+                  </button>
+                </div>
+              ))}
+            </div>
           )}
         </div>
 

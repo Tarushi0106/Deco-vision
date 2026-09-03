@@ -38,7 +38,7 @@ export default function SmokeDetection() {
 
   const loadAlerts = () => {
     api.listAlerts({ resolved: false })
-      .then((all) => setAlerts(all.filter((a) => a.type === 'smoke')))
+      .then((all) => setAlerts(all.filter((a) => a.type === 'smoke' || a.type === 'fire')))
       .catch(() => {})
   }
 
@@ -74,11 +74,12 @@ export default function SmokeDetection() {
       <AlertBanner />
       <div className="page-toolbar">
         <div>
-          <h2>Smoke Detection</h2>
+          <h2>Smoke &amp; Fire Detection</h2>
           <div className="page-toolbar-sub">
-            Cameras are watched for a genuinely growing haze (color + motion, not just a live model). No box is drawn
-            on the video for a suspected smoke region — a flashing dashboard alert and a saved clip are the signal
-            instead, since a box on hazy/uncertain footage reads as an accusation more than a fire box does.
+            Cameras are watched for a genuinely growing haze (color + motion, not just a live model) and for
+            flickering flame color. No box is drawn on the video for a suspected smoke region — a flashing dashboard
+            alert and a saved clip are the signal instead, since a box on hazy/uncertain footage reads as an
+            accusation more than a fire box does. Fire regions are boxed live, same as faces.
           </div>
         </div>
       </div>
@@ -97,20 +98,27 @@ export default function SmokeDetection() {
 
         <div className="card panel">
           <div className="panel-header">
-            <h3>Smoke Alerts</h3>
+            <h3>Smoke &amp; Fire Alerts</h3>
           </div>
           {alerts.length === 0 ? (
-            <div className="empty-state">No active smoke alerts.</div>
+            <div className="empty-state">No active smoke or fire alerts.</div>
           ) : (
             <div className="alerts-list">
               {alerts.map((alert) => (
                 <div key={alert.id} className="alerts-list-row">
                   <div className="alerts-list-top">
-                    <span className="pill pill-danger">SMOKE</span>
+                    <span className="pill pill-danger">{alert.type.toUpperCase()}</span>
                     <span className="alerts-list-camera">{alert.camera_name}</span>
                     <span className="alerts-list-time">{timeAgo(alert.ts)}</span>
                   </div>
                   <div className="alerts-list-message">{alert.message}</div>
+                  {alert.snapshot_path && (
+                    <img
+                      className="alerts-list-snapshot"
+                      src={api.alertSnapshotUrl(alert.id)}
+                      alt={`Snapshot: ${alert.message}`}
+                    />
+                  )}
                   <button className="btn btn-outline" onClick={() => handleResolve(alert.id)}>
                     Resolve
                   </button>

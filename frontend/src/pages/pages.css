@@ -375,6 +375,14 @@
   word-break: break-word;
 }
 
+.alerts-list-snapshot {
+  display: block;
+  max-width: 180px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  margin-bottom: 0.5rem;
+}
+
 .zone-form {
   margin-top: 0.75rem;
 }

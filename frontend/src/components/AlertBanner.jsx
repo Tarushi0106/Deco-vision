@@ -28,10 +28,11 @@ function playAlertBeep() {
   }
 }
 
-// Scope of this flashing banner, per explicit request: fire/smoke/intrusion
-// only — zone_intrusion and fall stay visible in Dashboard's Live Alerts
-// table but don't trigger the flash+beep here.
-const FLASH_ALERT_TYPES = new Set(['fire', 'smoke', 'intrusion'])
+// Scope of this flashing banner, per explicit request: fire/smoke/intrusion/
+// zone_intrusion flash+beep here (a zone violation is exactly as time-
+// sensitive as smoke — someone unauthorized is in a restricted area right
+// now). fall stays visible in Dashboard's Live Alerts table only.
+const FLASH_ALERT_TYPES = new Set(['fire', 'smoke', 'intrusion', 'zone_intrusion'])
 
 // Self-contained: polls its own alert feed and beeps + shows a pulsing red
 // banner on any NEW unresolved alert. Drop it into any page — it doesn't

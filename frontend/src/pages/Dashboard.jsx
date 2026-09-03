@@ -195,6 +195,13 @@ export default function Dashboard() {
                     <span className="alerts-list-time">{timeAgo(alert.ts)}</span>
                   </div>
                   <div className="alerts-list-message">{alert.message}</div>
+                  {alert.snapshot_path && (
+                    <img
+                      className="alerts-list-snapshot"
+                      src={api.alertSnapshotUrl(alert.id)}
+                      alt={`Snapshot: ${alert.message}`}
+                    />
+                  )}
                   <button className="btn btn-outline" onClick={() => handleResolve(alert.id)}>
                     Resolve
                   </button>

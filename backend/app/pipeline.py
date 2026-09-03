@@ -95,6 +95,13 @@ FIRE_SMOKE_ALERT_COOLDOWN_SECONDS = 120
 # same idea, but scoped per zone + detected identity (see recent_open_alert) —
 # a different unauthorized person in the same zone still alerts immediately
 ZONE_ALERT_COOLDOWN_SECONDS = 300
+# One evidence frame per alert (zone_intrusion, fire, smoke) — unlike
+# detection_worker.py's separate fire/smoke debug dir, this is linked to the
+# actual alert row (alerts.snapshot_path) and served via
+# GET /api/alerts/{id}/snapshot. Reuses the same JPEG the live view is
+# already showing (CameraPipeline.get_latest_jpeg()), so this costs one file
+# write, never a re-encode.
+ALERT_SNAPSHOT_DIR = Path(__file__).resolve().parent.parent / "data" / "alert_snapshots"
 # don't log a new detection_event for the same person on the same camera
 # more often than this - avoids flooding the table while someone stands in frame
 DETECTION_LOG_COOLDOWN_SECONDS = config.DETECTION_LOG_COOLDOWN_SECONDS
@@ -949,8 +956,23 @@ class PipelineManager:
         # evidence behind each change.
         for event_type in result.get("fire_smoke_events", []):
             if not alerts_db.recent_open_alert(camera_id, event_type, FIRE_SMOKE_ALERT_COOLDOWN_SECONDS):
-                alerts_db.log_alert(camera_id, event_type, f"Possible {event_type} detected on camera")
-                logger.warning("Camera %s: possible %s detected", camera_id, event_type)
+                # fire_smoke_detector's own per-box "score" (see its update())
+                # is the only confidence signal this heuristic detector has —
+                # take the strongest matching box from the SAME frame that
+                # just confirmed this event, not an average across history.
+                matching_scores = [
+                    b["score"] for b in result.get("fire_smoke", []) if b.get("type") == event_type
+                ]
+                confidence_pct = round(max(matching_scores) * 100) if matching_scores else None
+                confidence_note = f" (confidence: {confidence_pct}%)" if confidence_pct is not None else ""
+                snapshot_path = self._save_alert_snapshot(camera_id, event_type, pipeline.get_latest_jpeg())
+                alerts_db.log_alert(
+                    camera_id,
+                    event_type,
+                    f"Possible {event_type} detected on camera{confidence_note}",
+                    snapshot_path=snapshot_path,
+                )
+                logger.warning("Camera %s: possible %s detected%s", camera_id, event_type, confidence_note)
             if event_type == "smoke":
                 pipeline.note_smoke_event()
 
@@ -1002,15 +1024,34 @@ class PipelineManager:
                     camera_id, "zone_intrusion", ZONE_ALERT_COOLDOWN_SECONDS, zone_id=zone["id"], person_name=name
                 ):
                     continue
-                who = name if name != "Unknown" else "an unrecognized person"
+                who = name if name != "Unknown" else "Unknown Person"
+                pipeline = self._pipelines.get(camera_id)
+                snapshot_path = self._save_alert_snapshot(
+                    camera_id, f"zone{zone['id']}", pipeline.get_latest_jpeg() if pipeline else None
+                )
                 alerts_db.log_alert(
                     camera_id,
                     "zone_intrusion",
                     f"{who} detected in restricted zone '{zone['name']}'",
                     zone_id=zone["id"],
                     person_name=name,
+                    snapshot_path=snapshot_path,
                 )
                 logger.warning("Camera %s: zone violation in '%s' by %s", camera_id, zone["name"], name)
+
+    @staticmethod
+    def _save_alert_snapshot(camera_id: int, label: str, jpeg: bytes | None) -> str | None:
+        """Best-effort only, same as detection_worker._save_fire_smoke_debug_frame
+        — a failure here should never take down alerting over an evidence frame."""
+        if not jpeg:
+            return None
+        try:
+            ALERT_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+            path = ALERT_SNAPSHOT_DIR / f"cam{camera_id}_{label}_{int(time.time() * 1000)}.jpg"
+            path.write_bytes(jpeg)
+            return str(path)
+        except Exception:
+            return None
 
     @staticmethod
     def _time_in_window(start_str: str | None, end_str: str | None) -> bool:

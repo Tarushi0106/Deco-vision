@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { api } from '../api'
 import AlertBanner from '../components/AlertBanner'
 import CameraTile from '../components/CameraTile'
+import useLiveAlerts from '../hooks/useLiveAlerts'
 import './pages.css'
 
 // Clips for a smoke event are logged under this fixed pseudo "person" name
@@ -33,17 +34,12 @@ function timeAgo(ts) {
 
 export default function SmokeDetection() {
   const [cameras, setCameras] = useState([])
-  const [alerts, setAlerts] = useState([])
+  const allAlerts = useLiveAlerts()
+  const alerts = allAlerts.filter((a) => a.type === 'smoke')
   const [clips, setClips] = useState(null)
   const [clipsError, setClipsError] = useState(null)
   const [playingClip, setPlayingClip] = useState(null)
   const [playStatus, setPlayStatus] = useState(null) // 'loading' | 'error' | null
-
-  const loadAlerts = () => {
-    api.listAlerts({ resolved: false })
-      .then((all) => setAlerts(all.filter((a) => a.type === 'smoke' || a.type === 'fire')))
-      .catch(() => {})
-  }
 
   const loadClips = () => {
     api.getClips(SMOKE_CLIP_SUBJECT).then(setClips).catch((err) => setClipsError(err.message))
@@ -51,12 +47,8 @@ export default function SmokeDetection() {
 
   useEffect(() => {
     api.listCameras().then(setCameras).catch(() => {})
-    loadAlerts()
     loadClips()
-    const interval = setInterval(() => {
-      loadAlerts()
-      loadClips()
-    }, 15000)
+    const interval = setInterval(loadClips, 15000)
     return () => clearInterval(interval)
   }, [])
 
@@ -64,7 +56,6 @@ export default function SmokeDetection() {
 
   const handleResolve = async (id) => {
     await api.resolveAlert(id)
-    loadAlerts()
   }
 
   const handleSelectClip = (clip) => {
@@ -77,12 +68,12 @@ export default function SmokeDetection() {
       <AlertBanner />
       <div className="page-toolbar">
         <div>
-          <h2>Smoke &amp; Fire Detection</h2>
+          <h2>Smoke Detection</h2>
           <div className="page-toolbar-sub">
-            Cameras are watched for a genuinely growing haze (color + motion, not just a live model) and for
-            flickering flame color. No box is drawn on the video for a suspected smoke region — a flashing dashboard
-            alert and a saved clip are the signal instead, since a box on hazy/uncertain footage reads as an
-            accusation more than a fire box does. Fire regions are boxed live, same as faces.
+            Cameras are watched for a genuinely growing haze (color + motion, not just a live model). No box is drawn
+            on the video for a suspected smoke region — a flashing dashboard alert and a saved clip are the signal
+            instead, since a box on hazy/uncertain footage reads as an accusation more than a fire box does. Fire
+            alerts are shown on the Dashboard, not here — see Live Alerts.
           </div>
         </div>
       </div>
@@ -101,16 +92,16 @@ export default function SmokeDetection() {
 
         <div className="card panel">
           <div className="panel-header">
-            <h3>Smoke &amp; Fire Alerts</h3>
+            <h3>Smoke Alerts</h3>
           </div>
           {alerts.length === 0 ? (
-            <div className="empty-state">No active smoke or fire alerts.</div>
+            <div className="empty-state">No active smoke alerts.</div>
           ) : (
             <div className="alerts-list">
               {alerts.map((alert) => (
                 <div key={alert.id} className="alerts-list-row">
                   <div className="alerts-list-top">
-                    <span className="pill pill-danger">{alert.type.toUpperCase()}</span>
+                    <span className="pill pill-danger">SMOKE</span>
                     <span className="alerts-list-camera">{alert.camera_name}</span>
                     <span className="alerts-list-time">{timeAgo(alert.ts)}</span>
                   </div>

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { api } from '../api'
 import AlertBanner from '../components/AlertBanner'
 import CameraTile from '../components/CameraTile'
+import useLiveAlerts from '../hooks/useLiveAlerts'
 import './pages.css'
 
 const ZONE_BLANK = { name: '', allowed_names: [], restricted_start: '', restricted_end: '' }
@@ -171,17 +172,11 @@ export default function Intrusion() {
   const [draftPoints, setDraftPoints] = useState([])
   const [editingShape, setEditingShape] = useState(false)
   const [editingZone, setEditingZone] = useState(null)
-  const [alerts, setAlerts] = useState([])
-
-  const loadAlerts = () => {
-    api.listAlerts({ resolved: false })
-      .then((all) => setAlerts(all.filter((a) => INTRUSION_ALERT_TYPES.has(a.type))))
-      .catch(() => {})
-  }
+  const allAlerts = useLiveAlerts()
+  const alerts = allAlerts.filter((a) => INTRUSION_ALERT_TYPES.has(a.type))
 
   const handleResolveAlert = async (id) => {
     await api.resolveAlert(id)
-    loadAlerts()
   }
 
   useEffect(() => {
@@ -193,9 +188,6 @@ export default function Intrusion() {
       })
       .catch(() => {})
     api.listFaces().then(setPeople).catch(() => {})
-    loadAlerts()
-    const interval = setInterval(loadAlerts, 15000)
-    return () => clearInterval(interval)
   }, [])
 
   const loadZones = (camId) => {

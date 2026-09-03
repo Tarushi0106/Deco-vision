@@ -69,6 +69,11 @@ VIDEO_FPS = 15
 VIDEO_INTERVAL = 1 / VIDEO_FPS
 DETECTIONS_FPS = 6
 DETECTIONS_INTERVAL = 1 / DETECTIONS_FPS
+# Alerts don't need per-frame cadence like video/detections above, but this
+# is what makes Live Alerts push-updated instead of waiting on the
+# frontend's old 15s HTTP poll — same poll-and-push-over-a-socket pattern
+# as /ws/live and /ws/detections, just on its own much coarser interval.
+ALERTS_INTERVAL = 2
 
 
 class CameraIn(BaseModel):
@@ -396,13 +401,20 @@ def get_stats():
     }
 
 
-@app.get("/api/alerts")
-def list_alerts(resolved: bool | None = None, limit: int = 50):
+def _list_alerts_with_camera_names(resolved: bool | None = None, limit: int = 50) -> list[dict]:
+    """Shared by the REST endpoint below and the /ws/alerts push socket —
+    one place attaching camera_name onto alerts_db's raw rows, so the two
+    never drift out of sync with each other."""
     cameras_by_id = {c["id"]: c["name"] for c in camera_db.list_cameras()}
     alerts = alerts_db.list_alerts(resolved=resolved, limit=limit)
     for alert in alerts:
         alert["camera_name"] = cameras_by_id.get(alert["camera_id"], "Unknown camera")
     return alerts
+
+
+@app.get("/api/alerts")
+def list_alerts(resolved: bool | None = None, limit: int = 50):
+    return _list_alerts_with_camera_names(resolved=resolved, limit=limit)
 
 
 @app.post("/api/alerts/{alert_id}/resolve")
@@ -1069,6 +1081,24 @@ async def detections_feed(websocket: WebSocket, camera_id: int):
             await asyncio.sleep(DETECTIONS_INTERVAL)
     except (WebSocketDisconnect, ConnectionResetError, RuntimeError):
         logger.info("detections_feed client disconnected (camera %s)", camera_id)
+
+
+@app.websocket("/ws/alerts")
+async def alerts_feed(websocket: WebSocket):
+    """Global (not per-camera) — same poll-and-push-over-a-socket pattern as
+    live_feed/detections_feed above, just resending the current unresolved
+    alert list every ALERTS_INTERVAL instead of a per-camera frame. Lets
+    Dashboard/Intrusion/Smoke/AlertBanner update the instant a new alert is
+    logged, without their old 15s HTTP poll — the DB write in pipeline.py
+    is still the single source of truth, this only pushes what's already
+    there sooner."""
+    await websocket.accept()
+    try:
+        while True:
+            await websocket.send_json(_list_alerts_with_camera_names(resolved=False))
+            await asyncio.sleep(ALERTS_INTERVAL)
+    except (WebSocketDisconnect, ConnectionResetError, RuntimeError):
+        logger.info("alerts_feed client disconnected")
 
 
 ####################################################################

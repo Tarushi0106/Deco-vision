@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { api } from '../api'
 import AlertBanner from '../components/AlertBanner'
 import CameraTile from '../components/CameraTile'
+import useLiveAlerts from '../hooks/useLiveAlerts'
 import './pages.css'
 
 function StatTile({ label, value, sub }) {
@@ -36,23 +37,15 @@ function timeAgo(ts) {
 export default function Dashboard() {
   const [cameras, setCameras] = useState([])
   const [stats, setStats] = useState(null)
-  const [alerts, setAlerts] = useState([])
-
-  const loadAlerts = () => {
-    api.listAlerts({ resolved: false }).then(setAlerts).catch(() => {})
-  }
+  const alerts = useLiveAlerts()
 
   useEffect(() => {
     api.listCameras().then(setCameras).catch(() => {})
     api.getStats().then(setStats).catch(() => {})
-    loadAlerts()
-    const interval = setInterval(loadAlerts, 15000)
-    return () => clearInterval(interval)
   }, [])
 
   const handleResolve = async (id) => {
     await api.resolveAlert(id)
-    loadAlerts()
   }
 
   return (

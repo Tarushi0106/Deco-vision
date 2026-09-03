@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react'
-import { api } from '../api'
+import { useEffect, useRef } from 'react'
+import useLiveAlerts from '../hooks/useLiveAlerts'
 import '../pages/pages.css'
 
 // short two-tone alert beep, synthesized on the fly — no audio asset to ship
@@ -34,34 +34,27 @@ function playAlertBeep() {
 // now). fall stays visible in Dashboard's Live Alerts table only.
 const FLASH_ALERT_TYPES = new Set(['fire', 'smoke', 'intrusion', 'zone_intrusion'])
 
-// Self-contained: polls its own alert feed and beeps + shows a pulsing red
-// banner on any NEW unresolved alert. Drop it into any page — it doesn't
-// need the host page's own alerts state (Dashboard's alerts table, e.g.,
-// stays independent so it can list/resolve without this banner's involvement).
+// Self-contained: subscribes to the live alert feed and beeps + shows a
+// pulsing red banner on any NEW unresolved alert. Drop it into any page —
+// it doesn't need the host page's own alerts state (Dashboard's alerts
+// table, e.g., stays independent so it can list/resolve without this
+// banner's involvement).
 export default function AlertBanner() {
-  const [alerts, setAlerts] = useState([])
-  const seenAlertIds = useRef(null) // null until first load, so existing alerts don't beep on page open
+  const allAlerts = useLiveAlerts()
+  const alerts = allAlerts.filter((a) => FLASH_ALERT_TYPES.has(a.type))
+  const seenAlertIds = useRef(null) // null until first push, so existing alerts don't beep on page open
 
   useEffect(() => {
-    const load = () => {
-      api
-        .listAlerts({ resolved: false })
-        .then((all) => {
-          const fresh = all.filter((a) => FLASH_ALERT_TYPES.has(a.type))
-          if (seenAlertIds.current === null) {
-            seenAlertIds.current = new Set(fresh.map((a) => a.id))
-          } else if (fresh.some((a) => !seenAlertIds.current.has(a.id))) {
-            playAlertBeep()
-            seenAlertIds.current = new Set(fresh.map((a) => a.id))
-          }
-          setAlerts(fresh)
-        })
-        .catch(() => {})
+    if (seenAlertIds.current === null) {
+      seenAlertIds.current = new Set(alerts.map((a) => a.id))
+      return
     }
-    load()
-    const interval = setInterval(load, 15000)
-    return () => clearInterval(interval)
-  }, [])
+    if (alerts.some((a) => !seenAlertIds.current.has(a.id))) {
+      playAlertBeep()
+    }
+    seenAlertIds.current = new Set(alerts.map((a) => a.id))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [alerts.map((a) => a.id).join(',')])
 
   if (alerts.length === 0) return null
 

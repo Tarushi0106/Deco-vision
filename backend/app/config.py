@@ -162,8 +162,13 @@ DESK_SESSION_GRACE_SECONDS = int(os.getenv("DESK_SESSION_GRACE_SECONDS", "20"))
 
 # Cosine-similarity floor for a face embedding to count as a recognized match
 # (recognizer.py). Below this, a face is reported as "Unknown" regardless of
-# whose embedding it's closest to.
-RECOGNITION_SIMILARITY_THRESHOLD = float(os.getenv("RECOGNITION_SIMILARITY_THRESHOLD", "0.30"))
+# whose embedding it's closest to. Raised from 0.30 after live logs showed
+# real matches scoring anywhere from ~0.31 to ~0.60 with 38 people enrolled
+# (single reference photo each) — anything below ~0.5 was frequently the
+# WRONG person, not just a low-confidence right one, since more enrolled
+# candidates means more chances for two different people's embeddings to
+# land close together. Prioritizing "Unknown" over a wrong name.
+RECOGNITION_SIMILARITY_THRESHOLD = float(os.getenv("RECOGNITION_SIMILARITY_THRESHOLD", "0.55"))
 
 # Face-detector confidence floor used when no per-camera override applies
 # (detection_worker.py's CAMERA_DET_THRESH still takes priority for cameras
@@ -217,6 +222,53 @@ DETECTION_LOG_COOLDOWN_SECONDS = int(os.getenv("DETECTION_LOG_COOLDOWN_SECONDS",
 # detection gets wrongly reported as "no face detected".
 DETECTION_EMBED_TIMEOUT_SECONDS = float(os.getenv("DETECTION_EMBED_TIMEOUT_SECONDS", "25"))
 
+# How often the Honeywell recognition poller (honeywell_recognition_poller.py)
+# queries each camera's own onboard SnapedFaces recognition log for new
+# matches. This — not anything in the local detection pipeline — is what
+# now decides how fast a recognized person shows up in Attendance/People
+# Analytics, since identity comes from the camera's own engine rather than
+# local ArcFace matching. A short interval (originally 2s) was tried and
+# confirmed too aggressive: this device starts refusing/timing out new
+# connections after just a handful of requests in quick succession, live-
+# verified this session (a People List fetch — 3 requests — succeeded, but
+# a SnapedFaces fetch moments later was refused, then timed out on retry).
+# 20s matches the value already in production use as a stability mitigation.
+HONEYWELL_POLL_INTERVAL_SECONDS = float(os.getenv("HONEYWELL_POLL_INTERVAL_SECONDS", "20"))
+
+# The one Honeywell device treated as the authoritative source for the People
+# List (see main.py's people/sync-from-camera). Enrolling people directly on
+# this camera and re-syncing is meant to fully reconcile enrolled_faces
+# (update existing, add new, remove anything no longer on this device's Allow
+# List) — never a blind merge across every configured camera/device, which
+# previously pulled in an unrelated device's stale Allow List alongside this
+# one's real data.
+PRIMARY_PEOPLE_SOURCE_HOST = os.getenv("PRIMARY_PEOPLE_SOURCE_HOST", "103.204.0.122")
+
+# Honeywell recognition-poller reconnect backoff, mirroring
+# CAMERA_RECONNECT_*_DELAY_SECONDS below but tracked per physical device host
+# rather than per RTSP stream — a host that's failing backs off up to the max
+# instead of being retried every HONEYWELL_POLL_INTERVAL_SECONDS regardless,
+# and resets to base the moment a poll against it succeeds again.
+HONEYWELL_RECONNECT_BASE_DELAY_SECONDS = float(os.getenv("HONEYWELL_RECONNECT_BASE_DELAY_SECONDS", "5"))
+HONEYWELL_RECONNECT_MAX_DELAY_SECONDS = float(os.getenv("HONEYWELL_RECONNECT_MAX_DELAY_SECONDS", "120"))
+
+# How often the recognition poller's in-memory Honeywell-person-ID -> name
+# cache (built from our already-synced enrolled_faces, not a fresh camera API
+# call) is refreshed on a timer, independent of the immediate on-demand
+# refresh that already happens the moment an unresolved person ID is seen.
+HONEYWELL_PEOPLE_CACHE_REFRESH_INTERVAL_SECONDS = float(
+    os.getenv("HONEYWELL_PEOPLE_CACHE_REFRESH_INTERVAL_SECONDS", "300")
+)
+
+# Optional, off by default (None = disabled): Honeywell's recognition-score
+# semantics have never been confirmed against real documentation, so this
+# never discards a low-scoring event — Honeywell remains the recognition
+# authority. If set, an event scoring below this is still written normally,
+# just tagged recognition_source='low_confidence' instead of 'honeywell' for
+# a reviewer to notice, rather than silently trusted or silently dropped.
+_low_conf_raw = os.getenv("HONEYWELL_LOW_CONFIDENCE_THRESHOLD")
+HONEYWELL_LOW_CONFIDENCE_THRESHOLD = float(_low_conf_raw) if _low_conf_raw else None
+
 # RTSP reconnect backoff (pipeline.py): starts at the base delay, doubles on
 # each consecutive failure up to the max, resets to base on a successful
 # reconnect. Prevents a real outage from hammering the camera's own login
@@ -267,6 +319,15 @@ RECOGNITION_TRACK_IOU_THRESHOLD = float(os.getenv("RECOGNITION_TRACK_IOU_THRESHO
 # accumulate votes, permanently forcing that camera to Unknown. Raised well
 # past that camera's worst measured cycle time.
 RECOGNITION_TRACK_TIMEOUT_SECONDS = float(os.getenv("RECOGNITION_TRACK_TIMEOUT_SECONDS", "180"))
+
+# fire_smoke_detector.py is a classical HSV-color/flicker heuristic, not a
+# trained model — confirmed live to false-positive on skin tone/warm-toned
+# clothing under bright lighting when a face wasn't detected that exact
+# frame (the face-exclusion zone it relies on needs a face box to exist).
+# Turned off by default per that false positive; set back to true once a
+# real trained fire/smoke model replaces this heuristic, or the thresholds
+# are retuned against real fire footage.
+FIRE_SMOKE_DETECTION_ENABLED = os.getenv("FIRE_SMOKE_DETECTION_ENABLED", "false").lower() == "true"
 
 # How often the sender loop checks whether each camera's detection worker
 # process is still alive, and respawns it if not. Detection worker crashes

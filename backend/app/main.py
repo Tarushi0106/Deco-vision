@@ -30,10 +30,10 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 from . import (
-    alert_events, alerts_db, auth, camera_db, clips_db, config, desk_db, face_db, footfall_db, footfall_gate_db,
-    footfall_report, license_db, license_qr, scheduler, user_db, zones_db,
+    alerts_db, auth, camera_db, clips_db, config, desk_db, face_db, footfall_db, footfall_gate_db, footfall_report,
+    license_db, license_qr, scheduler, user_db, zones_db,
 )
-from . import onvif_client, pipeline, replay_prefetch
+from . import honeywell_recognition_poller, onvif_client, pipeline, replay_prefetch
 from .camera_client import get_camera_client, sync_face_to_all_devices
 from .pipeline import pipeline_manager
 
@@ -83,15 +83,6 @@ class CameraIn(BaseModel):
     stream_path: str | None = "/h264/ch1/sub/av_stream"
     live_feed_enabled: bool | None = True
     admin_port: int | None = config.CAMERA_ADMIN_PORT
-    # Off means this camera streams live video only — no face recognition,
-    # zone/fire/smoke detection, attendance, or clip recording ever runs on
-    # it (see pipeline.py's PipelineManager._start_camera, which skips
-    # spawning a detection worker entirely for it, not just hiding results
-    # in the UI). Defaults on so every existing camera's behavior is
-    # unchanged; only meant to be turned off for a deployment that's
-    # explicitly display-only for this camera (e.g. no consent/legal basis
-    # yet for biometric processing on it).
-    ai_enabled: bool | None = True
 
 
 class CameraUpdate(BaseModel):
@@ -106,7 +97,6 @@ class CameraUpdate(BaseModel):
     stream_path: str | None = None
     live_feed_enabled: bool | None = None
     admin_port: int | None = None
-    ai_enabled: bool | None = None
 
 
 class SiteIn(BaseModel):
@@ -179,15 +169,13 @@ class ZoneUpdate(BaseModel):
 
 @app.on_event("startup")
 def startup():
-    # Starlette calls a sync startup handler directly on the event loop
-    # thread (not the threadpool sync routes get), so this correctly
-    # captures the loop /ws/alerts's broadcasts get scheduled onto from
-    # pipeline.py's background thread — see alert_events.py.
-    alert_events.bind_loop(asyncio.get_running_loop())
     face_db.init_db()
-    seeded = face_db.seed_enrolled_faces_if_empty()
-    if seeded:
-        logger.info("Seeded %d enrolled face row(s) from backend/seed_data/ (fresh deployment)", seeded)
+    # seed_enrolled_faces_if_empty() intentionally NOT called: the main
+    # Honeywell camera's own People List is the authoritative source now
+    # (see /api/people/sync-from-camera) - silently restoring an old,
+    # committed roster snapshot whenever enrolled_faces is empty previously
+    # undid an intentional full deletion, since this code has no way to tell
+    # "genuinely fresh deployment" apart from "someone cleared everyone."
     camera_db.init_db()
     user_db.init_db()
     alerts_db.init_db()
@@ -200,10 +188,12 @@ def startup():
     pipeline_manager.start()
     scheduler.start_scheduler()
     replay_prefetch.start()
+    honeywell_recognition_poller.start()
 
 
 @app.on_event("shutdown")
 def shutdown():
+    honeywell_recognition_poller.stop()
     replay_prefetch.stop()
     scheduler.shutdown_scheduler()
     pipeline_manager.stop()
@@ -408,34 +398,27 @@ def get_stats():
         # stays on the otherwise-unauthenticated main dashboard endpoint.
         "cameras_assigned": license_db.count_assigned_cameras(),
         "cameras_accessed": license_db.count_live_assigned_cameras(live_ids),
+        # Per-physical-device recognition pipeline health, keyed by host —
+        # lets the dashboard tell "no one has been recognized" apart from
+        # "the recognition pipeline itself is broken" (e.g. worker_running
+        # false, or healthy false with a rising backoff_delay_seconds).
+        "honeywell_recognition": honeywell_recognition_poller.get_health_status(),
     }
 
 
 @app.get("/api/alerts")
 def list_alerts(resolved: bool | None = None, limit: int = 50):
-    return alerts_db.list_alerts_with_camera_names(resolved=resolved, limit=limit)
+    cameras_by_id = {c["id"]: c["name"] for c in camera_db.list_cameras()}
+    alerts = alerts_db.list_alerts(resolved=resolved, limit=limit)
+    for alert in alerts:
+        alert["camera_name"] = cameras_by_id.get(alert["camera_id"], "Unknown camera")
+    return alerts
 
 
 @app.post("/api/alerts/{alert_id}/resolve")
 def resolve_alert(alert_id: int):
     alerts_db.resolve_alert(alert_id)
-    # Pushes the updated (now-shorter) unresolved list to every connected
-    # client immediately, so resolving on one screen clears it from every
-    # other open Dashboard/Intrusion/Smoke tab without them needing to
-    # wait for their next event or refresh.
-    alert_events.broadcast()
     return {"ok": True}
-
-
-@app.get("/api/alerts/{alert_id}/snapshot")
-def get_alert_snapshot(alert_id: int):
-    alert = alerts_db.get_alert(alert_id)
-    if not alert or not alert.get("snapshot_path"):
-        raise HTTPException(status_code=404, detail="No snapshot for this alert")
-    path = Path(alert["snapshot_path"])
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="Snapshot file missing")
-    return FileResponse(path, media_type="image/jpeg")
 
 
 @app.get("/api/settings")
@@ -981,64 +964,153 @@ def remove_person_photo(name: str, filename: str):
     return {"name": name, "filename": filename, "remaining_samples": remaining}
 
 
-def _sync_people_from_camera() -> dict:
-    synced, skipped = 0, 0
-    failed = []
-    already_synced = face_db.get_synced_camera_face_ids()
+def _resolve_primary_camera_connection() -> dict | None:
+    """Full connection details (host/user/password/admin_port) for
+    config.PRIMARY_PEOPLE_SOURCE_HOST — camera_db.list_cameras() strips the
+    password, so re-fetch via get_camera_connection() once a matching active
+    row's id is found."""
+    host = config.PRIMARY_PEOPLE_SOURCE_HOST
+    for cam in camera_db.list_cameras():
+        if cam.get("host") == host and cam.get("status") == "active":
+            full = camera_db.get_camera_connection(cam["id"])
+            if full and full.get("user") and full.get("password"):
+                return full
+    return None
 
-    for device in camera_db.list_active_devices():
-        host = device["host"]
-        if not device.get("user") or not device.get("password"):
+
+def _sync_people_from_camera() -> dict:
+    """Full reconciliation against the ONE primary Honeywell camera
+    (config.PRIMARY_PEOPLE_SOURCE_HOST) — its Allow List is authoritative:
+    an existing camera_face_id gets updated if renamed, a new one gets
+    inserted, and any local row previously sourced from this same host that
+    no longer appears gets removed. Never touches any other device's data —
+    the previous "every active device" sync mixed an unrelated camera's
+    stale Allow List in alongside this one's real data, which is exactly
+    what this reconciliation is meant to prevent from happening again."""
+    host = config.PRIMARY_PEOPLE_SOURCE_HOST
+    empty_result = {"new": 0, "updated": 0, "removed": 0, "duplicates_prevented": 0, "failed": []}
+
+    cam = _resolve_primary_camera_connection()
+    if cam is None:
+        error = f"no active camera configured with host {host!r} (config.PRIMARY_PEOPLE_SOURCE_HOST) and admin credentials"
+        logger.error("Could not connect to Main Honeywell Camera: %s", error)
+        return {**empty_result, "failed": [{"host": host, "name": None, "error": error}]}
+
+    logger.info("Connected to Main Honeywell Camera (%s)", host)
+    client = get_camera_client(host, cam["user"], cam["password"], cam.get("admin_port", 443))
+
+    logger.info("Fetching latest People List...")
+    try:
+        faces = client.list_added_faces()
+    except Exception as e:
+        error = f"could not list Allow List: {e}"
+        logger.error("Fetching People List failed: %s", error)
+        return {**empty_result, "failed": [{"host": host, "name": None, "error": error}]}
+
+    logger.info("Received %d people", len(faces))
+    logger.info("Unique IDs received: %s", sorted(f["Id"] for f in faces))
+
+    existing = {row["camera_face_id"]: row for row in face_db.get_faces_by_camera_host(host)}
+
+    if not faces and existing:
+        # An empty AddedFaces response has been observed to come back as a
+        # normal 200 OK under this device's documented connection
+        # instability (see camera_client.py::list_added_faces's Count=0
+        # warning) rather than a raised exception — indistinguishable at
+        # the HTTP level from the Allow List genuinely being cleared. Since
+        # we already have `len(existing)` people locally sourced from this
+        # exact host, treating this response as authoritative would delete
+        # every one of them on a false signal. Refuse instead, and surface
+        # it as a failure to retry, rather than reconciling to zero.
+        error = (
+            f"received an empty People List but {len(existing)} people are already known from this host — "
+            "refusing to remove them on what's very likely a false-empty response rather than a genuine "
+            "mass-deletion on the camera; retry the sync once the connection is stable"
+        )
+        logger.error("Fetching People List: %s", error)
+        return {**empty_result, "failed": [{"host": host, "name": None, "error": error}]}
+
+    fresh_ids: set[str] = set()
+    new_count = updated_count = duplicates_prevented = 0
+    to_push: list[tuple[str, bytes]] = []  # newly-added people, also pushed to the OTHER camera(s) below
+    failed: list[dict] = []
+
+    for face in faces:
+        camera_face_id = f"{host}:{face['Id']}"
+        fresh_ids.add(camera_face_id)
+
+        if camera_face_id in existing:
+            if existing[camera_face_id]["name"] != face["Name"]:
+                face_db.update_face_name_by_camera_id(camera_face_id, face["Name"])
+                updated_count += 1
+            else:
+                duplicates_prevented += 1
+            time.sleep(0.3)  # camera's admin API is fragile under rapid repeated calls
             continue
-        client = get_camera_client(host, device["user"], device["password"], device.get("admin_port", 443))
 
         try:
-            faces = client.list_added_faces()
-        except Exception as e:
-            failed.append({"host": host, "name": None, "error": f"could not list Allow List: {e}"})
-            continue
+            detail = client.get_added_face_with_photo(face["Id"])
+            if not detail:
+                failed.append({"host": host, "name": face["Name"], "error": "camera has no photo for this entry"})
+                continue
+            photo_bytes = detail["_photo_bytes"]
 
-        for face in faces:
-            camera_face_id = f"{host}:{face['Id']}"
-            if camera_face_id in already_synced:
-                skipped += 1
+            frame = cv2.imdecode(np.frombuffer(photo_bytes, np.uint8), cv2.IMREAD_COLOR)
+            if frame is None:
+                failed.append({"host": host, "name": face["Name"], "error": "camera's photo is unreadable"})
                 continue
 
-            try:
-                photo_bytes = client.get_added_face_photo(face["Id"])
-                if not photo_bytes:
-                    failed.append({"host": host, "name": face["Name"], "error": "camera has no photo for this entry"})
-                    continue
+            embedding = pipeline_manager.compute_embedding(frame)
+            if embedding is None:
+                failed.append({"host": host, "name": face["Name"], "error": "no face detected in camera's photo"})
+                continue
 
-                frame = cv2.imdecode(np.frombuffer(photo_bytes, np.uint8), cv2.IMREAD_COLOR)
-                if frame is None:
-                    failed.append({"host": host, "name": face["Name"], "error": "camera's photo is unreadable"})
-                    continue
+            safe_name = re.sub(r"[^a-zA-Z0-9 ()_-]", "", face["Name"]).strip().replace(" ", "_")
+            saved_filename = f"{safe_name}_camera{face['Id']}_{uuid.uuid4().hex[:6]}.jpg"
+            (ENROLLMENT_PHOTOS_DIR / saved_filename).write_bytes(photo_bytes)
 
-                embedding = pipeline_manager.compute_embedding(frame)
-                if embedding is None:
-                    failed.append({"host": host, "name": face["Name"], "error": "no face detected in camera's photo"})
-                    continue
+            face_db.add_face(face["Name"], saved_filename, embedding, camera_face_id=camera_face_id)
+            id_code = (detail.get("IdCode") or "").strip()
+            if id_code:
+                face_db.set_employee_id(face["Name"], id_code)
+            new_count += 1
+            to_push.append((face["Name"], photo_bytes))
+        except Exception as e:
+            failed.append({"host": host, "name": face.get("Name"), "error": str(e)})
 
-                safe_name = re.sub(r"[^a-zA-Z0-9 ()_-]", "", face["Name"]).strip().replace(" ", "_")
-                saved_filename = f"{safe_name}_camera{face['Id']}_{uuid.uuid4().hex[:6]}.jpg"
-                (ENROLLMENT_PHOTOS_DIR / saved_filename).write_bytes(photo_bytes)
+        time.sleep(0.3)
 
-                face_db.add_face(face["Name"], saved_filename, embedding, camera_face_id=camera_face_id)
-                already_synced.add(camera_face_id)
-                synced += 1
-            except Exception as e:
-                failed.append({"host": host, "name": face.get("Name"), "error": str(e)})
+    removed_count = 0
+    for camera_face_id, row in existing.items():
+        if camera_face_id in fresh_ids:
+            continue
+        source_photo = face_db.delete_face_by_camera_id(camera_face_id)
+        if source_photo:
+            (ENROLLMENT_PHOTOS_DIR / source_photo).unlink(missing_ok=True)
+        zones_db.remove_person_from_zones(row["name"])
+        removed_count += 1
 
-            # the camera's admin API is fragile under rapid repeated calls —
-            # pace requests rather than hammering it back-to-back
-            time.sleep(0.3)
+    logger.info(
+        "New records: %d | Updated records: %d | Duplicates prevented: %d | Removed records: %d",
+        new_count, updated_count, duplicates_prevented, removed_count,
+    )
 
-    if synced:
+    if new_count or updated_count or removed_count:
         pipeline_manager.reload_faces()
-        logger.info("Synced %d people from camera Allow List(s)", synced)
 
-    return {"synced": synced, "skipped": skipped, "failed": failed}
+    if to_push:
+        logger.info("Syncing to other cameras...")
+        for name, photo_bytes in to_push:
+            try:
+                sync_face_to_all_devices(name, photo_bytes, exclude_host=host)
+            except Exception as e:
+                failed.append({"host": host, "name": name, "error": f"could not push to other cameras: {e}"})
+        logger.info("Camera synchronization completed")
+
+    return {
+        "new": new_count, "updated": updated_count, "removed": removed_count,
+        "duplicates_prevented": duplicates_prevented, "failed": failed,
+    }
 
 
 @app.post("/api/people/sync-from-camera")
@@ -1085,31 +1157,6 @@ async def detections_feed(websocket: WebSocket, camera_id: int):
             await asyncio.sleep(DETECTIONS_INTERVAL)
     except (WebSocketDisconnect, ConnectionResetError, RuntimeError):
         logger.info("detections_feed client disconnected (camera %s)", camera_id)
-
-
-@app.websocket("/ws/alerts")
-async def alerts_feed(websocket: WebSocket):
-    """Global (not per-camera), and NOT a poll loop — unlike live_feed/
-    detections_feed above, this never sleeps-then-resends on a timer. It
-    sends one snapshot on connect (so a just-opened tab isn't blank), then
-    purely waits: every subsequent message is pushed by alert_events.
-    broadcast() the instant pipeline.py logs/upgrades an alert or main.py
-    resolves one — true event-driven delivery, not "polls every N
-    seconds"."""
-    await websocket.accept()
-    alert_events.register(websocket)
-    logger.info("alerts_feed client connected (%d total)", alert_events.client_count())
-    try:
-        await websocket.send_json(alerts_db.list_alerts_with_camera_names(resolved=False))
-        while True:
-            # Client never sends anything on this socket — this call exists
-            # purely to block until disconnect (WebSocketDisconnect) without
-            # a sleep/poll loop of our own.
-            await websocket.receive_text()
-    except (WebSocketDisconnect, ConnectionResetError, RuntimeError):
-        logger.info("alerts_feed client disconnected")
-    finally:
-        alert_events.unregister(websocket)
 
 
 ####################################################################

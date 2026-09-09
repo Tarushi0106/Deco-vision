@@ -169,8 +169,18 @@ MIN_CLIP_DURATION_SECONDS = 1.5  # discard clips shorter than this — a single 
 # already happened on the full-res frame before this ever runs), so downscaling here has
 # zero accuracy cost — unlike the recognition pipeline, where downscaling wrecked matching.
 CLIP_MAX_DIM = 960  # cap the longer side of saved clip video — free CPU/disk win, no accuracy impact
-TRANSCODE_THREADS = 2  # ffmpeg's own thread cap per transcode job
-MAX_CONCURRENT_TRANSCODES = 2  # system-wide — bounds worst case to MAX_CONCURRENT_TRANSCODES * TRANSCODE_THREADS cores
+# Neither of these is pinned to specific cores (unlike the detection workers,
+# see DETECTION_WORKER_MAX_CPU_CORES) - ffmpeg is free to run on whatever
+# cores the OS scheduler gives it, directly competing with the main
+# process's own RTSP decode/API event loop and the detection workers for
+# the same physical cores. On a small box (measured live: a 4-vCPU EC2
+# instance already running 3 live RTSP decodes + 2 detection workers) the
+# old defaults (2 concurrent jobs x 2 threads = up to 4 cores) were enough
+# on their own to fully saturate the machine, independent of the detection
+# budget - dropped to 1x1 so worst case a transcode costs one core, not all
+# of them.
+TRANSCODE_THREADS = 1  # ffmpeg's own thread cap per transcode job
+MAX_CONCURRENT_TRANSCODES = 1  # system-wide — bounds worst case to MAX_CONCURRENT_TRANSCODES * TRANSCODE_THREADS cores
 _transcode_semaphore = threading.Semaphore(MAX_CONCURRENT_TRANSCODES)
 
 

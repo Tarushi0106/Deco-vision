@@ -40,8 +40,18 @@ export default function Dashboard() {
   const alerts = useLiveAlerts()
 
   useEffect(() => {
-    api.listCameras().then(setCameras).catch(() => {})
-    api.getStats().then(setStats).catch(() => {})
+    const load = () => {
+      api.listCameras().then(setCameras).catch(() => {})
+      api.getStats().then(setStats).catch(() => {})
+    }
+    load()
+    // Cameras reconnect in the backend independently of this page being open
+    // (RTSP retry/backoff, a restart, etc.) — without this poll, a camera
+    // that comes back live after the initial load stays stuck showing
+    // "offline" here forever, since CameraTile only opens its live-feed
+    // WebSocket when the `live` flag it's given flips to true.
+    const interval = setInterval(load, 8000)
+    return () => clearInterval(interval)
   }, [])
 
   const handleResolve = async (id) => {

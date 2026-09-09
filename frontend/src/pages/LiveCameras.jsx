@@ -63,7 +63,14 @@ export default function LiveCameras() {
   const [expanded, setExpanded] = useState(null)
 
   useEffect(() => {
-    api.listCameras().then(setCameras).catch(() => {})
+    const load = () => api.listCameras().then(setCameras).catch(() => {})
+    load()
+    // See Dashboard.jsx's identical poll for why: without it, a camera that
+    // reconnects after this page's initial load stays stuck showing
+    // "offline" forever, since CameraTile only opens its live-feed
+    // WebSocket when the `live` flag it's given flips to true.
+    const interval = setInterval(load, 8000)
+    return () => clearInterval(interval)
   }, [])
 
   return (

@@ -226,11 +226,19 @@ CAMERA_RECONNECT_MAX_DELAY_SECONDS = float(os.getenv("CAMERA_RECONNECT_MAX_DELAY
 
 # Total CPU core budget for the whole detection subsystem (all per-camera
 # worker processes combined), split proportionally by relative cost — see
-# PipelineManager._worker_core_allocation. Should be tuned to the actual
-# deployment machine's core count, not left at a value measured on a
-# different (e.g. local dev) machine — see the deployment note on this in
-# recognition_config's module docstring below.
-DETECTION_WORKER_MAX_CPU_CORES = int(os.getenv("DETECTION_WORKER_MAX_CPU_CORES", "4"))
+# PipelineManager._worker_core_allocation. Explicitly set
+# DETECTION_WORKER_MAX_CPU_CORES to tune this for the actual deployment
+# machine — see the deployment note on this in recognition_config's module
+# docstring below. Left unset, the fallback below reserves 2 cores for
+# everything that ISN'T detection (the API/WebSocket event loop, nginx,
+# ffmpeg clip transcodes, the OS) rather than a fixed number that can equal
+# — or exceed — a small box's entire core count. That exact bug shipped to
+# a 4-vCPU EC2 instance with this defaulted to 4: the detection workers
+# were allowed the whole machine, starving the API process and making
+# every dashboard fetch slow regardless of how fast the DB or network was.
+DETECTION_WORKER_MAX_CPU_CORES = int(
+    os.getenv("DETECTION_WORKER_MAX_CPU_CORES", str(max(1, (os.cpu_count() or 4) - 2)))
+)
 
 # Default face-recognition sampling rate (frames/sec sent to the detection
 # worker) before any /api/settings override — that DB-backed "detection_fps"

@@ -7,11 +7,22 @@ and a real camera are available, `HoneywellSource` drops in without
 touching anything downstream.
 """
 
+import os
 from abc import ABC, abstractmethod
 from urllib.parse import quote
 
 import cv2
 import numpy as np
+
+# Left unset, ffmpeg's RTSP transport is negotiated with the camera and
+# commonly ends up UDP — fine on a local network, but measured live over a
+# long-haul path (EC2 in a different region/continent from the cameras):
+# ordinary packet loss on that path has no retransmission on UDP, so it
+# shows up as "no frame for Ns, forcing reconnect" every couple of minutes
+# (see pipeline.py's STALE_SOURCE_TIMEOUT_SECONDS) even though the camera
+# and the network are both otherwise fine. TCP retransmits, trading a little
+# latency for eliminating that whole class of stall.
+os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "rtsp_transport;tcp")
 
 
 class VideoSource(ABC):

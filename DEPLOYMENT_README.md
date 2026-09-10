@@ -1,4 +1,4 @@
-﻿# Deco Vision AWS EC2 Deployment Guide
+# Deco Vision AWS EC2 Deployment Guide
 
 ## 🎯 Quick Start (Choose Your Platform)
 

@@ -1,4 +1,4 @@
-﻿# ✅ Deco Vision AWS EC2 Deployment - Ready to Deploy
+# ✅ Deco Vision AWS EC2 Deployment - Ready to Deploy
 
 ## 🎉 Your Deployment Package is Complete!
 

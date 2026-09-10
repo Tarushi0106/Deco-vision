@@ -1,4 +1,4 @@
-﻿#!/bin/bash
+#!/bin/bash
 
 # Deco Vision One-Command Deployment Script
 # Usage: ./deploy.sh

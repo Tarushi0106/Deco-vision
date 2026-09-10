@@ -1,4 +1,4 @@
-﻿# Deco Vision One-Command Deployment Script (Windows PowerShell)
+# Deco Vision One-Command Deployment Script (Windows PowerShell)
 # Usage: .\deploy.ps1
 
 $EC2_IP = "13.53.133.110"

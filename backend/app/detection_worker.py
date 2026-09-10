@@ -201,7 +201,7 @@ def _lean_get(recognizer, img, input_size: tuple[int, int] | None = None):
     return faces
 
 
-def _detect_and_recognize(recognizer, frame, det_thresh: float, detection_max_dim: int) -> list[dict]:
+def _detect_and_recognize(recognizer, frame, det_thresh: float, detection_max_dim: int, track_cache) -> list[dict]:
     h, w = frame.shape[:2]
     scale = min(1.0, detection_max_dim / max(h, w))
     small = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA) if scale < 1.0 else frame
@@ -217,35 +217,55 @@ def _detect_and_recognize(recognizer, frame, det_thresh: float, detection_max_di
         f.bbox = f.bbox / scale
     faces.sort(key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]), reverse=True)
 
+    now = time.time()
     results = []
     rechecks_used = 0
     for f in faces:
         x1, y1, x2, y2 = [int(v) for v in f.bbox]
+        track = track_cache.match([x1, y1, x2, y2], now)
         name, score = recognizer._match(f.embedding)
         # Carried alongside name/score for footfall_counter.py's embedding-based
         # re-identification (unique people counting) — it needs the embedding
         # for EVERY face, enrolled or Unknown, not just recognition's name match.
         embedding = f.embedding
+        cache_skipped_recheck = False
 
-        # A face the cheap pass already matched confidently doesn't need the
-        # expensive recrop — spending the (limited, costly) recheck budget on
-        # it would just confirm what's already known, at the expense of an
-        # actually-uncertain face that might otherwise have gotten it.
-        if name == "Unknown" and rechecks_used < MAX_FULL_RES_RECHECKS:
-            rechecks_used += 1
-            bw, bh = x2 - x1, y2 - y1
-            pw, ph = int(bw * RECHECK_CROP_PADDING), int(bh * RECHECK_CROP_PADDING)
-            crop = frame[max(0, y1 - ph):y2 + ph, max(0, x1 - pw):x2 + pw]
-            if crop.size > 0:
-                recognizer._app.det_model.det_thresh = RECHECK_DET_THRESH
-                refined = _lean_recognize_crop(recognizer, crop)
-                if refined is not None:
-                    r_name, r_score = recognizer._match(refined.embedding)
-                    if r_score > score:
-                        name, score = r_name, r_score
-                        embedding = refined.embedding
+        if name == "Unknown":
+            # recognition_track_cache.py: a face already confidently known
+            # (or tried too recently) skips the expensive recrop below
+            # entirely — this, not a lower MAX_FULL_RES_RECHECKS, is what
+            # actually cuts steady-state CPU cost; the budget check still
+            # applies for whatever genuinely-new/due-for-retry faces remain.
+            if rechecks_used < MAX_FULL_RES_RECHECKS and track_cache.should_recheck(track, now):
+                rechecks_used += 1
+                bw, bh = x2 - x1, y2 - y1
+                pw, ph = int(bw * RECHECK_CROP_PADDING), int(bh * RECHECK_CROP_PADDING)
+                crop = frame[max(0, y1 - ph):y2 + ph, max(0, x1 - pw):x2 + pw]
+                if crop.size > 0:
+                    recognizer._app.det_model.det_thresh = RECHECK_DET_THRESH
+                    refined = _lean_recognize_crop(recognizer, crop)
+                    if refined is not None:
+                        r_name, r_score = recognizer._match(refined.embedding)
+                        if r_score > score:
+                            name, score = r_name, r_score
+                            embedding = refined.embedding
+                track_cache.record(track, name, score, now)
+            else:
+                # Skipped (already trusted, too-recent retry, or this
+                # cycle's recheck budget went to other faces) — fall back
+                # to the track's last known identity rather than reporting
+                # a bare "Unknown" for a face we've actually seen before.
+                cache_skipped_recheck = True
+                if track.name != "Unknown" and track.name:
+                    name, score = track.name, track.score
+        else:
+            track_cache.record(track, name, score, now)
 
-        results.append({"bbox": [x1, y1, x2, y2], "name": name, "score": round(score, 3), "embedding": embedding})
+        results.append({
+            "bbox": [x1, y1, x2, y2], "name": name, "score": round(score, 3), "embedding": embedding,
+            "source": "local_cache" if cache_skipped_recheck else "local_fresh",
+            "cache_skipped_recheck": cache_skipped_recheck,
+        })
     return results
 
 
@@ -323,12 +343,14 @@ def run_worker(
     from .fire_smoke_detector import FireSmokeTracker
     from .person_tracker import PersonTracker
     from .pose_detector import PoseDetector
+    from .recognition_track_cache import RecognitionTrackCache
     from .recognizer import FaceRecognizer
 
     recognizer = FaceRecognizer()
     pose_detector = PoseDetector()
     trackers: dict[int, PersonTracker] = {}
     fire_smoke_trackers: dict[int, FireSmokeTracker] = {}
+    recognition_caches: dict[int, RecognitionTrackCache] = {}
     last_pose_at: dict[int, float] = {}
     # fire_smoke_detector's events now keep firing every cycle for as long as
     # a condition stays confirmed (see FireSmokeTracker's docstring) so a
@@ -356,6 +378,10 @@ def run_worker(
 
         if kind == "reload_faces":
             recognizer._reload_enrolled()
+            # The roster changed (rename/add/remove) — any cached identity
+            # from before this could now be wrong.
+            for cache in recognition_caches.values():
+                cache.invalidate_all()
             continue
 
         if kind == "embed":
@@ -395,8 +421,9 @@ def run_worker(
 
             det_thresh = CAMERA_DET_THRESH.get(camera_id, DEFAULT_DET_THRESH)
             detection_max_dim = CAMERA_DETECTION_MAX_DIM.get(camera_id, DETECTION_DOWNSCALE_MAX_DIM)
+            track_cache = recognition_caches.setdefault(camera_id, RecognitionTrackCache())
             recognize_start = time.time()
-            faces = _detect_and_recognize(recognizer, frame, det_thresh, detection_max_dim)
+            faces = _detect_and_recognize(recognizer, frame, det_thresh, detection_max_dim, track_cache)
             recognize_ms = round((time.time() - recognize_start) * 1000, 1)
             result = {
                 "camera_id": camera_id,
@@ -406,19 +433,19 @@ def run_worker(
                 # stored in; cheap (two ints) so always included rather than
                 # gated behind whether any camera currently has zones.
                 "frame_size": [frame.shape[1], frame.shape[0]],
-                # The EXACT frame that was just analyzed above (already-encoded
-                # bytes, no re-encode) — pipeline.py uses this for alert
-                # snapshots instead of "whatever's currently live", since by
-                # the time a result comes back and an alert fires, the live
-                # feed has already moved on to a newer frame that may no
-                # longer show the person/event that triggered the alert.
-                "jpeg": item["jpeg"],
+                # Previously log-only — surfaced here so end-to-end latency
+                # (detection -> displayed name) can be measured from the API
+                # side too, not just grepped out of worker logs.
+                "queue_wait_ms": queue_wait_ms,
+                "recognize_ms": recognize_ms,
             }
             if faces:
                 for f in faces:
                     logger.debug(
-                        "camera=%s stage=recognized name=%s score=%s bbox=%s recognize_ms=%s",
-                        camera_id, f["name"], f["score"], f["bbox"], recognize_ms,
+                        "camera=%s stage=recognized name=%s score=%s bbox=%s source=%s "
+                        "cache_skipped_recheck=%s queue_wait_ms=%s recognize_ms=%s",
+                        camera_id, f["name"], f["score"], f["bbox"], f["source"],
+                        f["cache_skipped_recheck"], queue_wait_ms, recognize_ms,
                     )
             else:
                 logger.debug("camera=%s stage=no_faces_detected recognize_ms=%s", camera_id, recognize_ms)
@@ -429,21 +456,29 @@ def run_worker(
             # -detected face is excluded from consideration (see
             # fire_smoke_detector.FACE_EXCLUDE_*_PAD) — a person moving at
             # their desk otherwise reads as a "growing" smoke-colored blob.
-            fs_tracker = fire_smoke_trackers.setdefault(camera_id, FireSmokeTracker())
-            face_boxes = [f["bbox"] for f in result["faces"]]
-            frame_h, frame_w = frame.shape[:2]
-            ignore_boxes = [
-                [int(x1 * frame_w), int(y1 * frame_h), int(x2 * frame_w), int(y2 * frame_h)]
-                for x1, y1, x2, y2 in CAMERA_FIRE_SMOKE_IGNORE_REGIONS.get(camera_id, [])
-            ]
-            fire_smoke = fs_tracker.update(frame, exclude_boxes=face_boxes + ignore_boxes)
-            result["fire_smoke"] = fire_smoke["boxes"]
-            result["fire_smoke_events"] = fire_smoke["events"]
-            for event_type in fire_smoke["events"]:
-                debug_key = (camera_id, event_type)
-                if time.time() - last_debug_save_at.get(debug_key, 0) >= FIRE_SMOKE_DEBUG_SAVE_INTERVAL_SECONDS:
-                    last_debug_save_at[debug_key] = time.time()
-                    _save_fire_smoke_debug_frame(camera_id, frame, fire_smoke["boxes"])
+            #
+            # Disabled by default (config.FIRE_SMOKE_DETECTION_ENABLED) —
+            # this is a color/flicker heuristic, not a trained model, and
+            # confirmed live to false-positive on skin tone/warm clothing.
+            if config.FIRE_SMOKE_DETECTION_ENABLED:
+                fs_tracker = fire_smoke_trackers.setdefault(camera_id, FireSmokeTracker())
+                face_boxes = [f["bbox"] for f in result["faces"]]
+                frame_h, frame_w = frame.shape[:2]
+                ignore_boxes = [
+                    [int(x1 * frame_w), int(y1 * frame_h), int(x2 * frame_w), int(y2 * frame_h)]
+                    for x1, y1, x2, y2 in CAMERA_FIRE_SMOKE_IGNORE_REGIONS.get(camera_id, [])
+                ]
+                fire_smoke = fs_tracker.update(frame, exclude_boxes=face_boxes + ignore_boxes)
+                result["fire_smoke"] = fire_smoke["boxes"]
+                result["fire_smoke_events"] = fire_smoke["events"]
+                for event_type in fire_smoke["events"]:
+                    debug_key = (camera_id, event_type)
+                    if time.time() - last_debug_save_at.get(debug_key, 0) >= FIRE_SMOKE_DEBUG_SAVE_INTERVAL_SECONDS:
+                        last_debug_save_at[debug_key] = time.time()
+                        _save_fire_smoke_debug_frame(camera_id, frame, fire_smoke["boxes"])
+            else:
+                result["fire_smoke"] = []
+                result["fire_smoke_events"] = []
 
             now = time.time()
             if now - last_pose_at.get(camera_id, 0) >= POSE_INTERVAL_SECONDS:

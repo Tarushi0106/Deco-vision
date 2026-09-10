@@ -2,24 +2,9 @@ import { useEffect, useState } from 'react'
 import { api } from '../api'
 import AlertBanner from '../components/AlertBanner'
 import CameraTile from '../components/CameraTile'
-import useLiveAlerts from '../hooks/useLiveAlerts'
 import './pages.css'
 
 const ZONE_BLANK = { name: '', allowed_names: [], restricted_start: '', restricted_end: '' }
-
-const INTRUSION_ALERT_TYPES = new Set(['zone_intrusion', 'intrusion'])
-const INTRUSION_TYPE_LABELS = { zone_intrusion: 'ZONE INTRUSION', intrusion: 'INTRUSION' }
-
-function timeAgo(ts) {
-  // Clamped at 0: a server clock running ahead of the viewer's browser
-  // otherwise makes Date.now()/1000 - ts negative, showing a nonsensical
-  // "-3713s ago" instead of just reading as "just now".
-  const seconds = Math.max(0, Math.floor(Date.now() / 1000 - ts))
-  if (seconds < 60) return `${seconds}s ago`
-  const mins = Math.floor(seconds / 60)
-  if (mins < 60) return `${mins}m ago`
-  return `${Math.floor(mins / 60)}h ago`
-}
 
 function IntrusionWindowCard() {
   const [start, setStart] = useState('')
@@ -172,12 +157,6 @@ export default function Intrusion() {
   const [draftPoints, setDraftPoints] = useState([])
   const [editingShape, setEditingShape] = useState(false)
   const [editingZone, setEditingZone] = useState(null)
-  const allAlerts = useLiveAlerts()
-  const alerts = allAlerts.filter((a) => INTRUSION_ALERT_TYPES.has(a.type))
-
-  const handleResolveAlert = async (id) => {
-    await api.resolveAlert(id)
-  }
 
   useEffect(() => {
     api
@@ -352,38 +331,6 @@ export default function Intrusion() {
                 ))}
               </tbody>
             </table>
-          )}
-        </div>
-
-        <div className="card panel">
-          <div className="panel-header">
-            <h3>Intrusion Alerts</h3>
-          </div>
-          {alerts.length === 0 ? (
-            <div className="empty-state">No active intrusion alerts.</div>
-          ) : (
-            <div className="alerts-list">
-              {alerts.map((alert) => (
-                <div key={alert.id} className="alerts-list-row">
-                  <div className="alerts-list-top">
-                    <span className="pill pill-danger">{INTRUSION_TYPE_LABELS[alert.type] || alert.type.toUpperCase()}</span>
-                    <span className="alerts-list-camera">{alert.camera_name}</span>
-                    <span className="alerts-list-time">{timeAgo(alert.ts)}</span>
-                  </div>
-                  <div className="alerts-list-message">{alert.message}</div>
-                  {alert.snapshot_path && (
-                    <img
-                      className="alerts-list-snapshot"
-                      src={api.alertSnapshotUrl(alert.id)}
-                      alt={`Snapshot: ${alert.message}`}
-                    />
-                  )}
-                  <button className="btn btn-outline" onClick={() => handleResolveAlert(alert.id)}>
-                    Resolve
-                  </button>
-                </div>
-              ))}
-            </div>
           )}
         </div>
 

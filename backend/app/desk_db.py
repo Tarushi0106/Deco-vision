@@ -3,10 +3,11 @@ the live tracking side, which is where identity gets bound to a zone —
 nothing here decides WHO is at a desk, only records what the tracker
 already decided). Four tables:
 
-  - desk_zones: admin-drawn rectangles (normalized 0..1 fractions of frame
-    width/height, so they survive a camera resolution change) — anonymous,
-    auto-labeled ("Desk 1", "Desk 2", ...). NOT tied to an employee; who
-    occupies a zone is resolved dynamically every detection cycle.
+  - desk_zones: admin-drawn free-shape polygons (normalized 0..1 fractions
+    of frame width/height, so they survive a camera resolution change) —
+    anonymous, auto-labeled ("Desk 1", "Desk 2", ...). NOT tied to an
+    employee; who occupies a zone is resolved dynamically every detection
+    cycle.
   - desk_sessions: one row per continuous stretch an employee was detected
     occupying a specific zone — start_ts set once, end_ts (last confirmed
     still there) updated on every touch, the same create/touch shape
@@ -21,6 +22,7 @@ already decided). Four tables:
 """
 
 import contextlib
+import json
 import sqlite3
 import time
 from datetime import datetime
@@ -60,6 +62,21 @@ def init_db() -> None:
             )
             """
         )
+        existing_desk_zone_cols = {row[1] for row in conn.execute("PRAGMA table_info(desk_zones)")}
+        if "polygon" not in existing_desk_zone_cols:
+            # Free-shape desk outline (JSON list of [x, y] points, same
+            # normalized-fraction coordinate space as x1..y2) — added so a
+            # desk can be traced as a triangle/pentagon/etc, not just a
+            # drag-rectangle, matching how zones.polygon already works for
+            # restricted zones (see zones_db.py). NULL on any zone drawn
+            # before this column existed; get_zone/list_zones synthesizes a
+            # 4-point rectangle from x1..y2 for those on read, so old desks
+            # keep working with no data migration needed. x1..y2 themselves
+            # are kept (not dropped) as this shape's bounding box — cheap to
+            # derive once at write time and still useful for anything that
+            # only needs a quick "is this roughly here" box, not a precise
+            # polygon test.
+            conn.execute("ALTER TABLE desk_zones ADD COLUMN polygon TEXT")
         _migrate_zones_off_static_employee(conn)
 
         conn.execute(
@@ -137,6 +154,19 @@ def _migrate_zones_off_static_employee(conn: sqlite3.Connection) -> None:
 
 # ---- Zones ----
 
+def _with_polygon(d: dict) -> dict:
+    """Fills in `polygon` (list of [x, y] points) on a raw desk_zones row —
+    parsed from the stored JSON if present, or synthesized as this zone's
+    4-corner rectangle if it was drawn before the polygon column existed.
+    Every caller gets a real polygon either way, so desk_tracker's
+    point-in-polygon check never has to special-case old rows."""
+    if d.get("polygon"):
+        d["polygon"] = json.loads(d["polygon"])
+    else:
+        d["polygon"] = [[d["x1"], d["y1"]], [d["x2"], d["y1"]], [d["x2"], d["y2"]], [d["x1"], d["y2"]]]
+    return d
+
+
 def list_zones(camera_id: int | None = None) -> list[dict]:
     query = "SELECT * FROM desk_zones"
     params = []
@@ -147,20 +177,27 @@ def list_zones(camera_id: int | None = None) -> list[dict]:
     with get_connection() as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(query, params).fetchall()
-    return [dict(r) for r in rows]
+    return [_with_polygon(dict(r)) for r in rows]
 
 
 def get_zone(zone_id: int) -> dict | None:
     with get_connection() as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT * FROM desk_zones WHERE id = ?", (zone_id,)).fetchone()
-    return dict(row) if row else None
+    return _with_polygon(dict(row)) if row else None
 
 
-def create_zone(camera_id: int, x1: float, y1: float, x2: float, y2: float) -> int:
+def create_zone(camera_id: int, polygon: list) -> int:
     """Auto-labels "Desk N" — the next unused number for this camera, not
     just count+1, so deleting and re-adding zones doesn't produce
-    duplicate labels."""
+    duplicate labels. `polygon` is whatever shape was traced (>=3 points,
+    a triangle/pentagon/etc, not just a rectangle) — x1/y1/x2/y2 are still
+    stored alongside it as that shape's bounding box, cheap to derive here
+    and kept for anything that only needs a quick bounding check."""
+    xs = [p[0] for p in polygon]
+    ys = [p[1] for p in polygon]
+    x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
+
     with get_connection() as conn:
         existing = conn.execute(
             "SELECT zone_label FROM desk_zones WHERE camera_id = ?", (camera_id,)
@@ -178,9 +215,9 @@ def create_zone(camera_id: int, x1: float, y1: float, x2: float, y2: float) -> i
         zone_label = f"Desk {next_number}"
 
         cur = conn.execute(
-            "INSERT INTO desk_zones (camera_id, zone_label, x1, y1, x2, y2, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (camera_id, zone_label, x1, y1, x2, y2, time.time()),
+            "INSERT INTO desk_zones (camera_id, zone_label, x1, y1, x2, y2, polygon, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (camera_id, zone_label, x1, y1, x2, y2, json.dumps(polygon), time.time()),
         )
         return cur.lastrowid
 

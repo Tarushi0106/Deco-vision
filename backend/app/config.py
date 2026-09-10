@@ -38,9 +38,20 @@ RTSP_TRANSPORT = os.getenv("RTSP_TRANSPORT", "tcp")
 # ffmpeg's) - that's real, observed latency a purpose-built live-viewing
 # NVR client doesn't have on the identical camera/network, since it isn't
 # using ffmpeg's general-purpose (buffer-for-seekability) defaults.
-os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-    f"rtsp_transport;{RTSP_TRANSPORT}|fflags;nobuffer|flags;low_delay|max_delay;0"
-)
+#
+# max_delay;0 means zero tolerance for any out-of-order/late packet — fine
+# on a short, low-jitter path, but diagnosed live on a longer network path
+# (AWS server, further from the camera than a local machine) causing real
+# HEVC decode corruption: "Could not find ref with POC N" / "Error
+# constructing the frame RPS" repeating in the raw ffmpeg log, because a
+# reordered reference frame gets dropped instead of waited for. Overridable
+# per-deployment via RTSP_FFMPEG_OPTIONS so a longer/jitterier path can add a
+# small reorder buffer without changing the aggressive default everywhere
+# (e.g. this machine's own direct connection, where this hasn't been an
+# issue) — set to a plain string like
+# "rtsp_transport;tcp|max_delay;500000" to allow ~0.5s of reorder tolerance.
+_DEFAULT_FFMPEG_OPTIONS = f"rtsp_transport;{RTSP_TRANSPORT}|fflags;nobuffer|flags;low_delay|max_delay;0"
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = os.getenv("RTSP_FFMPEG_OPTIONS", _DEFAULT_FFMPEG_OPTIONS)
 
 # Cameras confirmed to support on-demand playback from their own onboard
 # recording (ONVIF Profile G / Replay - see onvif_client.py), mapped to the
@@ -163,7 +174,16 @@ DESK_SESSION_GRACE_SECONDS = int(os.getenv("DESK_SESSION_GRACE_SECONDS", "20"))
 # Cosine-similarity floor for a face embedding to count as a recognized match
 # (recognizer.py). Below this, a face is reported as "Unknown" regardless of
 # whose embedding it's closest to.
-RECOGNITION_SIMILARITY_THRESHOLD = float(os.getenv("RECOGNITION_SIMILARITY_THRESHOLD", "0.30"))
+#
+# Confirmed live there is NO clean separation between "correct match" and
+# "wrong match" scores with the current single-reference-photo-per-person
+# enrollment (38 people): 0.55 was tried and left almost nothing recognized
+# at all (observed max score was ~0.541 across a full session of live
+# traffic); 0.30 let clearly wrong matches through. 0.40 is a pragmatic
+# middle ground, not a value backed by a clean threshold in the data — real
+# improvement here needs multiple/better-quality reference photos per
+# person, not a different single number.
+RECOGNITION_SIMILARITY_THRESHOLD = float(os.getenv("RECOGNITION_SIMILARITY_THRESHOLD", "0.40"))
 
 # Face-detector confidence floor used when no per-camera override applies
 # (detection_worker.py's CAMERA_DET_THRESH still takes priority for cameras
@@ -190,9 +210,50 @@ CAMERA_DETECTION_MAX_DIM_OVERRIDES = (
 # How many of a frame's largest not-yet-matched faces get a second, full-
 # resolution recognition pass (detection_worker.py) — the expensive step that
 # fixes small/distant faces scoring far lower than their true similarity.
+# NOT lowered to save CPU: confirmed live on a real 6-person frame that
+# rechecking only the closest 3 faces missed 2 of 3 real, strong matches —
+# see this constant's other use site in detection_worker.py for that
+# measurement. recognition_track_cache.py is what actually cuts recheck
+# volume now (an already-confirmed or already-recently-tried face doesn't
+# consume a slot at all), not a lower ceiling here.
 RECOGNITION_MAX_FULL_RES_RECHECKS = int(os.getenv("RECOGNITION_MAX_FULL_RES_RECHECKS", "8"))
 RECOGNITION_RECHECK_DET_THRESH = float(os.getenv("RECOGNITION_RECHECK_DET_THRESH", "0.3"))
 RECOGNITION_RECHECK_CROP_PADDING = float(os.getenv("RECOGNITION_RECHECK_CROP_PADDING", "0.8"))
+
+# recognition_track_cache.py: how long a confidently-recognized face is
+# trusted before spending one recheck to reconfirm it, rather than paying
+# for a fresh recheck every single cycle it stays in frame. Note: on a
+# camera whose real per-cycle time already exceeds this (measured 24-100+s
+# under load on the wide-angle "Main gate" camera — see
+# RECOGNITION_TRACK_TIMEOUT_SECONDS below), this is effectively a no-op —
+# expected, not a bug. The actual latency win on that camera comes from the
+# recheck BUDGET no longer being spent on already-known faces at all
+# (see RECOGNITION_MAX_FULL_RES_RECHECKS above), not from this interval,
+# which mainly helps lighter-load cameras with faster cycles.
+RECOGNITION_CACHE_REVERIFY_SECONDS = float(os.getenv("RECOGNITION_CACHE_REVERIFY_SECONDS", "10"))
+
+# Same module, the opposite case: a tracked face that has never been
+# confidently identified only gets another expensive recheck attempt this
+# often, not on every single cycle — avoids repeatedly paying for a
+# recheck on a real Unknown/unregistered visitor who was never going to
+# match. No stale-identity risk here (unlike the reverify window above) —
+# "still Unknown" is always safe to keep reporting while waiting.
+RECOGNITION_RETRY_INTERVAL_SECONDS = float(os.getenv("RECOGNITION_RETRY_INTERVAL_SECONDS", "3"))
+
+# How long a recognition_track_cache.py track survives with no matching
+# detection before it's dropped (person left frame / long occlusion).
+# Deliberately its OWN, much shorter constant than
+# RECOGNITION_TRACK_TIMEOUT_SECONDS (180s, below) even though both are
+# IoU-based face tracking: that 180s value was tuned for
+# recognition_stabilizer.py, a purely cosmetic main-process layer where a
+# stale cached identity only mislabels the overlay for a while. This
+# cache's decisions also reach footfall/desk/zone-violation logic in
+# pipeline.py (whatever name a track reports IS what those consume), so a
+# wrong identity surviving 180s there risks a real desk-session or
+# zone-alert misattribution, not just a mislabeled frame. Start
+# conservative; widen only if live use shows tracks being needlessly
+# recreated more than this protects against.
+RECOGNITION_CACHE_TRACK_TIMEOUT_SECONDS = float(os.getenv("RECOGNITION_CACHE_TRACK_TIMEOUT_SECONDS", "20"))
 
 # How many consecutive detection cycles the SAME name must appear on a camera
 # before it's logged as a detection_event (attendance/analytics) — filters out
@@ -210,12 +271,116 @@ RECOGNITION_MIN_CONSECUTIVE_HITS = int(os.getenv("RECOGNITION_MIN_CONSECUTIVE_HI
 # continuously in frame.
 DETECTION_LOG_COOLDOWN_SECONDS = int(os.getenv("DETECTION_LOG_COOLDOWN_SECONDS", "30"))
 
+# How stale a camera's last-computed recognition result is allowed to look
+# before the LIVE OVERLAY hides it, independent of how often the frontend
+# happens to re-request it. Diagnosed live this session: /ws/detections
+# polls get_latest_detections() every ~167ms (DETECTIONS_FPS=6 in main.py)
+# regardless of whether the underlying result actually changed, so a
+# frontend "clear if no message arrives for 1s" timer can never fire — a
+# message always arrives. The camera's own compute cycle is what actually
+# refreshes the data (measured: ~1-2s on a light scene, 8-11s on the busy
+# Main gate camera's 6-8 person frame), so THAT is the real staleness clock.
+# Each detections payload now carries computed_at (the timestamp
+# set_detections() last ran) and the frontend clears locally once
+# now - computed_at exceeds this, rather than relying on message silence.
+# This does not — and physically cannot — make a busy multi-person scene's
+# true removal latency faster than its own recognition cycle time; it only
+# fixes the frontend showing data that's already known to be older than
+# this, whatever the real cycle time turns out to be this cycle.
+IDENTITY_LOST_TIMEOUT_SECONDS = float(os.getenv("IDENTITY_LOST_TIMEOUT_SECONDS", "1.0"))
+
+# A flat IDENTITY_LOST_TIMEOUT_SECONDS alone caused a real, reported bug: on
+# a camera whose actual recognition cycle takes longer than this (measured
+# 8-12s on a busy multi-person scene), the still-present person's name
+# flashed on for under a second and then disappeared every single cycle,
+# even though they never left — the fixed timeout was simply shorter than
+# the time between genuinely fresh results. CameraPipeline tracks each
+# camera's own last real cycle gap and widens the effective timeout to
+# max(IDENTITY_LOST_TIMEOUT_SECONDS, last_cycle_gap * this factor) — see
+# get_effective_identity_lost_timeout(). >1 on purpose: cycle time varies
+# cycle to cycle, so sizing the timeout to exactly the last gap would still
+# false-clear whenever the next cycle happens to run a bit slower than the
+# one before it.
+IDENTITY_LOST_TIMEOUT_SAFETY_FACTOR = float(os.getenv("IDENTITY_LOST_TIMEOUT_SAFETY_FACTOR", "1.5"))
+
 # How long a synchronous embedding request (enrollment / camera Allow List
 # sync) waits for the detection worker to respond before giving up. Must
 # comfortably exceed the worker's worst-case single-frame processing time on
 # whatever hardware this is running on, or a slow (but eventually successful)
 # detection gets wrongly reported as "no face detected".
 DETECTION_EMBED_TIMEOUT_SECONDS = float(os.getenv("DETECTION_EMBED_TIMEOUT_SECONDS", "25"))
+
+# How often the Honeywell recognition poller (honeywell_recognition_poller.py)
+# queries each camera's own onboard SnapedFaces recognition log for new
+# matches. This — not anything in the local detection pipeline — is what
+# now decides how fast a recognized person shows up in Attendance/People
+# Analytics, since identity comes from the camera's own engine rather than
+# local ArcFace matching. A short interval (originally 2s) was tried and
+# confirmed too aggressive: this device starts refusing/timing out new
+# connections after just a handful of requests in quick succession, live-
+# verified this session (a People List fetch — 3 requests — succeeded, but
+# a SnapedFaces fetch moments later was refused, then timed out on retry).
+# 20s matches the value already in production use as a stability mitigation.
+HONEYWELL_POLL_INTERVAL_SECONDS = float(os.getenv("HONEYWELL_POLL_INTERVAL_SECONDS", "20"))
+
+# How fresh a Honeywell recognition (face_db.detection_events,
+# recognition_source='honeywell') must be for pipeline.py's
+# CameraPipeline.set_detections to prefer it over the local worker's own
+# match for the live overlay — only when exactly one face is in frame,
+# since Honeywell's own events carry no bounding box and there's no way to
+# tell which face a Honeywell identity belongs to once more than one
+# person is present. Set comfortably above HONEYWELL_POLL_INTERVAL_SECONDS
+# (20s) and the poller's own write-cooldown (DETECTION_LOG_COOLDOWN_SECONDS,
+# 30s) — a shorter window would frequently find "nothing fresh enough" even
+# for someone Honeywell recognized moments ago, purely from the poller's
+# own cadence, silently defeating this most of the time. 0 disables the
+# feature entirely (always falls back to local recognition).
+HONEYWELL_LIVE_PREFERENCE_WINDOW_SECONDS = float(os.getenv("HONEYWELL_LIVE_PREFERENCE_WINDOW_SECONDS", "45"))
+
+# The one Honeywell device treated as the authoritative source for the People
+# List (see main.py's people/sync-from-camera). Enrolling people directly on
+# this camera and re-syncing is meant to fully reconcile enrolled_faces
+# (update existing, add new, remove anything no longer on this device's Allow
+# List) — never a blind merge across every configured camera/device, which
+# previously pulled in an unrelated device's stale Allow List alongside this
+# one's real data.
+PRIMARY_PEOPLE_SOURCE_HOST = os.getenv("PRIMARY_PEOPLE_SOURCE_HOST", "103.204.0.122")
+
+# Honeywell recognition-poller reconnect backoff, mirroring
+# CAMERA_RECONNECT_*_DELAY_SECONDS below but tracked per physical device host
+# rather than per RTSP stream — a host that's failing backs off up to the max
+# instead of being retried every HONEYWELL_POLL_INTERVAL_SECONDS regardless,
+# and resets to base the moment a poll against it succeeds again.
+HONEYWELL_RECONNECT_BASE_DELAY_SECONDS = float(os.getenv("HONEYWELL_RECONNECT_BASE_DELAY_SECONDS", "5"))
+HONEYWELL_RECONNECT_MAX_DELAY_SECONDS = float(os.getenv("HONEYWELL_RECONNECT_MAX_DELAY_SECONDS", "120"))
+
+# Diagnosed live (scripts/diagnose_honeywell.py, both from this machine and
+# from AWS): this device reliably serves roughly one request per connection
+# before resetting it, so a second failure right after a fresh relogin is
+# expected device behavior, not something more retries would fix. Bounded at
+# 2 (1 initial attempt + 1 reconnect-and-retry) rather than higher — a higher
+# value would turn a device that's already struggling under one request into
+# a request storm without meaningfully improving success odds; a
+# persistently-down device should fail fast here and let the poller's own
+# HONEYWELL_RECONNECT_*_DELAY_SECONDS backoff decide when to try again.
+HONEYWELL_MAX_REQUEST_ATTEMPTS = int(os.getenv("HONEYWELL_MAX_REQUEST_ATTEMPTS", "2"))
+
+# How often the recognition poller's in-memory Honeywell-person-ID -> name
+# cache (built from our already-synced enrolled_faces, not a fresh camera API
+# call) is refreshed on a timer, independent of the immediate on-demand
+# refresh that already happens the moment an unresolved person ID is seen.
+HONEYWELL_PEOPLE_CACHE_REFRESH_INTERVAL_SECONDS = float(
+    os.getenv("HONEYWELL_PEOPLE_CACHE_REFRESH_INTERVAL_SECONDS", "300")
+)
+
+# Optional, off by default (None = disabled): Honeywell's recognition-score
+# semantics have never been confirmed against real documentation, so this
+# never discards a low-scoring event — Honeywell remains the recognition
+# authority. If set, an event scoring below this is still written normally,
+# just tagged recognition_source='low_confidence' instead of 'honeywell' for
+# a reviewer to notice, rather than silently trusted or silently dropped.
+_low_conf_raw = os.getenv("HONEYWELL_LOW_CONFIDENCE_THRESHOLD")
+HONEYWELL_LOW_CONFIDENCE_THRESHOLD = float(_low_conf_raw) if _low_conf_raw else None
 
 # RTSP reconnect backoff (pipeline.py): starts at the base delay, doubles on
 # each consecutive failure up to the max, resets to base on a successful
@@ -275,6 +440,15 @@ RECOGNITION_TRACK_IOU_THRESHOLD = float(os.getenv("RECOGNITION_TRACK_IOU_THRESHO
 # accumulate votes, permanently forcing that camera to Unknown. Raised well
 # past that camera's worst measured cycle time.
 RECOGNITION_TRACK_TIMEOUT_SECONDS = float(os.getenv("RECOGNITION_TRACK_TIMEOUT_SECONDS", "180"))
+
+# fire_smoke_detector.py is a classical HSV-color/flicker heuristic, not a
+# trained model — confirmed live to false-positive on skin tone/warm-toned
+# clothing under bright lighting when a face wasn't detected that exact
+# frame (the face-exclusion zone it relies on needs a face box to exist).
+# Turned off by default per that false positive; set back to true once a
+# real trained fire/smoke model replaces this heuristic, or the thresholds
+# are retuned against real fire footage.
+FIRE_SMOKE_DETECTION_ENABLED = os.getenv("FIRE_SMOKE_DETECTION_ENABLED", "false").lower() == "true"
 
 # How often the sender loop checks whether each camera's detection worker
 # process is still alive, and respawns it if not. Detection worker crashes

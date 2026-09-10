@@ -1,4 +1,4 @@
-﻿# Deco Vision EC2 Deployment Guide
+# Deco Vision EC2 Deployment Guide
 
 ## Instance Information
 - **Public IP**: 16.171.18.221

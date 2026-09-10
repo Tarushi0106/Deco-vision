@@ -33,7 +33,7 @@ try:
 except ImportError:
     psutil = None
 
-from . import alert_events, alerts_db, camera_db, clips_db, config, face_db, footfall_gate_db, zones_db
+from . import alerts_db, camera_db, clips_db, config, face_db, footfall_gate_db, zones_db
 from .desk_tracker import DeskTracker
 from .detection_worker import CAMERA_DETECTION_MAX_DIM, run_worker
 from .footfall_counter import FootfallCounter, resolve_footfall_camera_ids
@@ -43,15 +43,6 @@ from .video_source import RtspSource, WebcamSource
 
 logger = logging.getLogger("dashboard.pipeline")
 recognition_logger = logging.getLogger("dashboard.recognition_pipeline")
-
-
-def _ts_ms() -> str:
-    """Millisecond-precision wall-clock timestamp for the detection-to-
-    dashboard latency trace in _check_zone_violations — set LOG_LEVEL=DEBUG
-    to see the full per-cycle path this produces."""
-    now = time.time()
-    return time.strftime("%H:%M:%S", time.localtime(now)) + f".{int(now * 1000) % 1000:03d}"
-
 
 JPEG_QUALITY = 80
 # Measured this session: pre-downscaling to 640px here before sending to the
@@ -101,38 +92,9 @@ INTRUSION_ALERT_COOLDOWN_SECONDS = 300
 # shorter than INTRUSION/ZONE's 300s — a real fire/smoke event should keep
 # re-alerting more often than that, not go quiet for 5 minutes at a time
 FIRE_SMOKE_ALERT_COOLDOWN_SECONDS = 120
-# Zone intrusions use real entry/exit tracking instead (see
-# PipelineManager._zone_occupancy / _check_zone_violations), not a flat
-# cooldown — someone continuously present never re-fires no matter how
-# long they stay, and leaving-then-returning fires immediately rather than
-# waiting out a multi-minute timer. This is how long an absence has to
-# last before it counts as "left", not "recognition missed one frame".
-# Originally set to 8s on the (wrong) assumption that detect cycles hit
-# every ~1s reliably — confirmed live on "Main gate camera" 2026-09-03:
-# a continuously-present, unmoving person re-triggered every ~20-30s at
-# 8s, MORE often than the old flat 300s cooldown, the opposite of the
-# point of this change. Matches PRESENCE_GRACE_SECONDS below (60s) —
-# same real measured recognition gaps (60-114s, same recognition
-# pipeline, see that constant's own comment) — but can't just reference
-# it directly, it's defined later in this file.
-ZONE_EXIT_GRACE_SECONDS = 60
-# Recognition can resolve "Unknown" -> a real name a cycle or two after a
-# zone violation first fires (detection_worker's full-res recheck can land
-# after the initial match) — this is how recent an "Unknown" alert has to
-# be to count as the SAME physical entry (upgraded in place, see
-# alerts_db.upgrade_unknown_zone_alert) rather than a second, duplicate one.
-UNKNOWN_UPGRADE_WINDOW_SECONDS = 15
-# One evidence frame per alert (zone_intrusion, fire, smoke) — unlike
-# detection_worker.py's separate fire/smoke debug dir, this is linked to the
-# actual alert row (alerts.snapshot_path) and served via
-# GET /api/alerts/{id}/snapshot. Reuses the same JPEG the live view is
-# already showing (CameraPipeline.get_latest_jpeg()), so this costs one file
-# write, never a re-encode.
-ALERT_SNAPSHOT_DIR = Path(__file__).resolve().parent.parent / "data" / "alert_snapshots"
-# don't log a new detection_event for the same person on the same camera
-# more often than this - avoids flooding the table while someone stands in frame
-DETECTION_LOG_COOLDOWN_SECONDS = config.DETECTION_LOG_COOLDOWN_SECONDS
-RECOGNITION_MIN_CONSECUTIVE_HITS = config.RECOGNITION_MIN_CONSECUTIVE_HITS
+# same idea, but scoped per zone + detected identity (see recent_open_alert) —
+# a different unauthorized person in the same zone still alerts immediately
+ZONE_ALERT_COOLDOWN_SECONDS = 300
 WORKER_HEALTH_CHECK_INTERVAL_SECONDS = config.WORKER_HEALTH_CHECK_INTERVAL_SECONDS
 # Pseudo "person_name" used to piggyback smoke events onto the exact same
 # presence/clip-session machinery built for face recognition (_last_detection,
@@ -190,14 +152,28 @@ class CameraPipeline:
         self._lock = threading.Lock()
         self._latest_jpeg: bytes | None = None
         self._latest_detections: list[dict] = []
+        # When set_detections() last actually ran — NOT when a client last
+        # asked for this data. /ws/detections polls get_latest_detections()
+        # on its own fixed schedule (DETECTIONS_FPS in main.py) regardless of
+        # whether the result changed, so "a message arrived" cannot mean
+        # "this data is fresh" — see IDENTITY_LOST_TIMEOUT_SECONDS in
+        # config.py for why this matters and what reads it.
+        self._latest_detections_computed_at: float = 0.0
+        # How long the PREVIOUS cycle took (gap between the last two
+        # set_detections() calls), not a config guess — a busy multi-person
+        # scene can take 8-12s per real recognition cycle on CPU alone, far
+        # longer than any reasonable fixed "clear after Ns" constant. A fixed
+        # timeout shorter than this camera's real cadence made a person's
+        # name flash off and back on every single cycle even though they
+        # never left (measured live, reported directly: "1 sec name pop").
+        # get_effective_identity_lost_timeout() uses this to size the
+        # overlay's clear-timeout to what THIS camera can actually keep up
+        # with, instead of one global number that's wrong for some cameras
+        # in either direction.
+        self._recent_cycle_gap: float = 0.0
         self._latest_fire_smoke: list[dict] = []
         self._running = False
         self._thread: threading.Thread | None = None
-        self._last_logged: dict[str, float] = {}
-        # Consecutive-hit streak per name, gating detection_event logging (not
-        # the live overlay) — see RECOGNITION_MIN_CONSECUTIVE_HITS. Reset to 0
-        # for any name absent from the current detection cycle.
-        self._consecutive_hits: dict[str, int] = {}
         # None (the default) means stabilization is off, in which case
         # set_detections() below skips it entirely -- zero behavior change
         # from before this feature existed.
@@ -255,6 +231,21 @@ class CameraPipeline:
         with self._lock:
             return list(self._latest_detections)
 
+    def get_latest_detections_computed_at(self) -> float:
+        with self._lock:
+            return self._latest_detections_computed_at
+
+    def get_effective_identity_lost_timeout(self) -> float:
+        """The overlay-clear timeout to actually use for THIS camera right
+        now: never below the configured target (IDENTITY_LOST_TIMEOUT_SECONDS
+        — what a fast camera should approach), but widened to comfortably
+        cover this camera's own last real cycle time when that's slower, so
+        a still-present person's name never flickers off just because this
+        cycle hasn't finished yet. See _recent_cycle_gap."""
+        with self._lock:
+            gap = self._recent_cycle_gap
+        return max(config.IDENTITY_LOST_TIMEOUT_SECONDS, gap * config.IDENTITY_LOST_TIMEOUT_SAFETY_FACTOR)
+
     def get_latest_fire_smoke(self) -> list[dict]:
         with self._lock:
             return list(self._latest_fire_smoke)
@@ -274,54 +265,58 @@ class CameraPipeline:
             self._last_detection[SMOKE_CLIP_SUBJECT] = now
 
     def set_detections(self, detections: list[dict]) -> None:
-        # Scoped here deliberately: zone-violation and footfall/desk logic in
-        # PipelineManager._dispatch_result already ran against the RAW
-        # per-frame match before this is called, so temporal smoothing never
-        # delays a security-relevant decision -- it only affects what's
-        # displayed live and what gets logged as a detection_event.
+        """Stores this camera's latest per-frame local detections (bbox +
+        embedding) for desk/footfall/gate tracking and clip-session presence
+        continuity below — NOT for identity display. Attendance/People
+        Analytics identity comes from honeywell_recognition_poller.py (the
+        camera's own recognition engine), written straight to
+        face_db.detection_events; this method no longer logs detection_events
+        itself.
+
+        Scoped here deliberately: zone-violation and footfall/desk logic in
+        PipelineManager._dispatch_result already ran against the RAW
+        per-frame match before this is called, so temporal smoothing never
+        delays a security-relevant decision -- it only affects what's
+        displayed live.
+
+        Also prefers a fresh Honeywell recognition (face_db.detection_events,
+        recognition_source='honeywell') over the local match for the LIVE
+        overlay specifically, when unambiguous — only ever when exactly one
+        face is in frame, since Honeywell's own events carry no bounding
+        box: with more than one face there is no way to tell which one a
+        given Honeywell identity belongs to, so local recognition is the
+        only safe source in that case. Operates on a copy, never mutating
+        the caller's dicts in place, so this stays structurally a
+        display-only override regardless of call order elsewhere.
+        """
+        if len(detections) == 1 and config.HONEYWELL_LIVE_PREFERENCE_WINDOW_SECONDS > 0:
+            recent = face_db.get_recent_camera_recognition(
+                self.camera_id, config.HONEYWELL_LIVE_PREFERENCE_WINDOW_SECONDS
+            )
+            if recent is not None:
+                face = dict(detections[0])
+                face["local_name"], face["local_score"] = face["name"], face["score"]
+                face["name"], face["score"], face["source"] = recent["name"], recent["score"], "honeywell"
+                detections = [face]
         if self._stabilizer is not None:
             detections = self._stabilizer.stabilize(detections)
+        now = time.time()
         with self._lock:
             self._latest_detections = detections
-        now = time.time()
+            if self._latest_detections_computed_at:
+                self._recent_cycle_gap = now - self._latest_detections_computed_at
+            self._latest_detections_computed_at = now
         with self._presence_lock:
             for det in detections:
                 name = det["name"]
                 if name == "Unknown":
                     continue
                 self._last_detection[name] = now
-        self._update_consecutive_hits(detections)
-        self._log_new_detections(detections, now)
         recognition_logger.debug(
             "camera=%s stage=result_stored names=%s",
             self.camera_id, [d["name"] for d in detections if d["name"] != "Unknown"],
         )
-
-    def _update_consecutive_hits(self, detections: list[dict]) -> None:
-        """Tracks how many detection cycles in a row each name has appeared
-        for, gating detection_event logging below — a name absent from THIS
-        cycle resets to 0 rather than decaying gradually, since each cycle
-        already represents a full detection_fps sampling interval (default
-        1s), not a single video frame."""
-        seen_this_cycle = {det["name"] for det in detections if det["name"] != "Unknown"}
-        for name in seen_this_cycle:
-            self._consecutive_hits[name] = self._consecutive_hits.get(name, 0) + 1
-        for name in list(self._consecutive_hits):
-            if name not in seen_this_cycle:
-                del self._consecutive_hits[name]
-
-    def _log_new_detections(self, detections: list[dict], now: float) -> None:
-        for det in detections:
-            name = det["name"]
-            if name == "Unknown":
-                continue
-            if self._consecutive_hits.get(name, 0) < RECOGNITION_MIN_CONSECUTIVE_HITS:
-                continue
-            last = self._last_logged.get(name, 0)
-            if now - last < DETECTION_LOG_COOLDOWN_SECONDS:
-                continue
-            self._last_logged[name] = now
-            face_db.log_detection_event(self.camera_id, name, det["bbox"], score=det.get("score"))
+        return detections  # post-override/post-stabilize — callers wanting recognition-source stats need this, not the raw input
 
     def _update_clip_sessions(self, frame, now: float) -> None:
         """Called once per encoded frame from the capture loop (never from
@@ -579,6 +574,46 @@ class CameraPipeline:
         return self._active_names
 
 
+def enqueue_latest_frame(input_queue, item: dict) -> tuple[bool, bool]:
+    """Puts `item` (a "detect" frame) on `input_queue`, preferring freshness
+    over completeness when the queue is full: the OLDEST queued "detect"
+    frame is dropped to make room, never the incoming newest one. A
+    dropped-newest policy would let the queue serve an ever-staler backlog
+    indefinitely — measured live before this fix at maxsize=10: queue_wait_ms
+    ran 40-60+ seconds by the time a frame was finally processed, because the
+    worker never got to see anything but a growing backlog. Any non-"detect"
+    control item found while dropping (e.g. a "reload_faces" message) is put
+    back rather than discarded.
+
+    A plain function (not a method) specifically so it can be unit-tested
+    against a real queue.Queue under simulated load without spinning up
+    PipelineManager's threads/processes — see
+    tests/test_pipeline_queue_freshness.py.
+
+    Returns (sent, dropped_stale): `sent` is whether `item` ended up queued
+    at all; `dropped_stale` is whether an existing queued frame was evicted
+    to make room for it.
+    """
+    try:
+        input_queue.put_nowait(item)
+        return True, False
+    except queue.Full:
+        dropped_stale = False
+        try:
+            stale = input_queue.get_nowait()
+            if stale.get("type") != "detect":
+                input_queue.put_nowait(stale)
+            else:
+                dropped_stale = True
+        except queue.Empty:
+            pass
+        try:
+            input_queue.put_nowait(item)
+            return True, dropped_stale
+        except queue.Full:
+            return False, dropped_stale
+
+
 class PipelineManager:
     def __init__(self):
         self._pipelines: dict[int, CameraPipeline] = {}
@@ -592,7 +627,7 @@ class PipelineManager:
         # full-res rechecks — see detection_worker.py's MAX_FULL_RES_RECHECKS)
         # can take 8-15+ seconds, during which every OTHER camera's frames
         # pile up behind it and get silently dropped once its input queue
-        # fills (maxsize=10) — that camera then barely gets recognized at
+        # fills (maxsize=2, see _start_worker) — that camera then barely gets recognized at
         # all, not because matching is wrong but because its frames rarely
         # reach the worker. Giving each camera its own process+queue means
         # one camera's cost can never block another's — and this scales UP
@@ -628,6 +663,16 @@ class PipelineManager:
         # defeat the point of separate processes.
         self._next_core_offset = 0
 
+        # Observability (task section 14): per-camera counters cheap enough
+        # to update on every dispatched frame/dropped frame without adding
+        # measurable overhead to the hot path. Read by main.py's /api/stats
+        # so CAMERA/API/QUEUE/INFERENCE trouble can be told apart without
+        # grepping logs. Lock-protected since _sender_loop (drops) and
+        # _receiver_loop (recognition results) are different threads.
+        self._stats_lock = threading.Lock()
+        self._dropped_frame_count: dict[int, int] = {}
+        self._recognition_stats: dict[int, dict] = {}
+
         # Unique footfall (people counting) — see footfall_counter.py. Lives
         # here, in the main process, because its in-memory dedup cache needs
         # to persist across the worker's whole lifetime and it writes to the
@@ -655,22 +700,6 @@ class PipelineManager:
         self._running = False
         self._sender_thread: threading.Thread | None = None
         self._receiver_thread: threading.Thread | None = None
-
-        # camera_id -> whether its detection worker is (supposed to be)
-        # running — lets refresh_cameras() tell "ai_enabled just got toggled
-        # on an already-live camera" apart from "this camera is brand new"
-        # without restarting the video capture pipeline either way.
-        self._ai_enabled_state: dict[int, bool] = {}
-
-        # (camera_id, zone_id, person_name) -> last time this identity was
-        # seen inside this zone. Only ever read/written from _receiver_loop's
-        # thread (via _check_zone_violations), so no lock needed — same
-        # single-writer assumption CameraPipeline's own _last_logged/
-        # _consecutive_hits dicts already rely on. Entry/exit state for zone
-        # alerts (see _check_zone_violations) — replaced a flat time cooldown
-        # that couldn't tell "still standing there" from "left and came
-        # back", so a real re-entry could sit unalerted for minutes.
-        self._zone_occupancy: dict[tuple[int, int, str], float] = {}
 
     @staticmethod
     def _should_be_live(cam: dict) -> bool:
@@ -755,14 +784,9 @@ class PipelineManager:
         self._gate_tracker = GateTracker(footfall_gate_db)
 
         live_cameras = [cam for cam in camera_db.list_cameras() if self._should_be_live(cam)]
-        # Display-only cameras (ai_enabled=0) get a video pipeline but no
-        # detection worker at all (see _start_camera) — excluded here so
-        # they don't dilute WORKER_MAX_CPU_CORES's split across cameras
-        # that actually run inference.
-        ai_camera_ids = [cam["id"] for cam in live_cameras if cam.get("ai_enabled", True)]
-        allocation = self._worker_core_allocation(ai_camera_ids)
+        allocation = self._worker_core_allocation([cam["id"] for cam in live_cameras])
         for cam in live_cameras:
-            self._start_camera(cam["id"], allocation.get(cam["id"], WORKER_MAX_CPU_CORES), cam.get("ai_enabled", True))
+            self._start_camera(cam["id"], allocation[cam["id"]])
 
         self._running = True
         self._sender_thread = threading.Thread(target=self._sender_loop, daemon=True)
@@ -790,7 +814,16 @@ class PipelineManager:
         return (cam["host"], cam["port"], cam["user"], cam["password"], cam["stream_path"])
 
     def _start_worker(self, camera_id: int, cores: int) -> None:
-        input_queue: multiprocessing.Queue = multiprocessing.Queue(maxsize=10)
+        # maxsize small on purpose: a busy multi-person scene can take
+        # 5-8s per frame on CPU-only inference (no GPU), so a deep FIFO
+        # just accumulates stale frames — measured live at maxsize=10, the
+        # queue sat permanently full and a processed frame's queue_wait_ms
+        # ran 40-60+ SECONDS, since each of the ~10 queued frames ahead of
+        # it had to be serviced first. A stale name is worse than a
+        # slightly-delayed one, so keep only enough slots to smooth a brief
+        # burst, not to buffer a sustained backlog. See _sender_loop, which
+        # also drops the OLDEST queued frame (not the newest) once full.
+        input_queue: multiprocessing.Queue = multiprocessing.Queue(maxsize=2)
         worker = multiprocessing.Process(
             target=run_worker,
             args=(input_queue, self._result_queue, self._embed_response_queue, self._embed_request_queue, cores),
@@ -833,8 +866,7 @@ class PipelineManager:
             self._stop_worker(camera_id)
             self._start_worker(camera_id, cores)
 
-    def _start_camera(self, camera_id: int, worker_cores: int = WORKER_MAX_CPU_CORES, ai_enabled: bool = True) -> None:
-        self._ai_enabled_state[camera_id] = ai_enabled
+    def _start_camera(self, camera_id: int, worker_cores: int = WORKER_MAX_CPU_CORES) -> None:
         if camera_id in self._pipelines:
             return
         pipeline = CameraPipeline(camera_id)
@@ -844,13 +876,7 @@ class PipelineManager:
         # Not restarted on a plain reconnect (see refresh_cameras) — the worker
         # process holds no RTSP connection state, only the capture pipeline
         # above does, so an already-running worker for this camera stays put.
-        # Display-only cameras (ai_enabled=False) never get one at all —
-        # video still streams via the capture pipeline above, but no face
-        # recognition, zone/fire/smoke detection, or attendance logging
-        # ever runs on them; there's no detection code path to opt out of
-        # downstream, because the worker process that would run it is
-        # simply never started.
-        if ai_enabled and camera_id not in self._worker_processes:
+        if camera_id not in self._worker_processes:
             self._start_worker(camera_id, worker_cores)
 
     def refresh_cameras(self) -> None:
@@ -860,10 +886,7 @@ class PipelineManager:
         (host/port/user/password/stream_path) changed — otherwise editing
         just the password would leave the pipeline running on its already
         -open, old-credentials connection until that connection happened to
-        drop on its own. Toggling ai_enabled on an already-live camera
-        starts/stops just its detection worker, never touching the video
-        capture pipeline — so flipping a camera to/from display-only never
-        interrupts its live feed."""
+        drop on its own."""
         self._refresh_footfall_cameras()
         cameras = {c["id"]: c for c in camera_db.list_cameras()}
 
@@ -873,30 +896,16 @@ class PipelineManager:
                 self._pipelines.pop(camera_id).stop()
                 self._conn_keys.pop(camera_id, None)
                 self._stop_worker(camera_id)
-                self._ai_enabled_state.pop(camera_id, None)
             elif self._connection_key(camera_id) != self._conn_keys.get(camera_id):
                 logger.info("Camera %s: connection details changed, reconnecting", camera_id)
                 self._pipelines.pop(camera_id).stop()
                 self._conn_keys.pop(camera_id, None)
-            else:
-                ai_enabled = cam.get("ai_enabled", True)
-                was_enabled = self._ai_enabled_state.get(camera_id, True)
-                if ai_enabled and not was_enabled:
-                    logger.info("Camera %s: AI processing enabled, starting detection worker", camera_id)
-                    self._start_worker(camera_id, WORKER_MAX_CPU_CORES)
-                elif not ai_enabled and was_enabled:
-                    logger.info("Camera %s: AI processing disabled, stopping detection worker", camera_id)
-                    self._stop_worker(camera_id)
-                self._ai_enabled_state[camera_id] = ai_enabled
 
-        live_cameras = [cam for cam in cameras.values() if self._should_be_live(cam)]
-        ai_camera_ids = [
-            cam["id"] for cam in live_cameras if cam.get("ai_enabled", True) and cam["id"] not in self._pipelines
-        ]
-        allocation = self._worker_core_allocation(ai_camera_ids)
-        for cam in live_cameras:
-            if cam["id"] not in self._pipelines:
-                self._start_camera(cam["id"], allocation.get(cam["id"], WORKER_MAX_CPU_CORES), cam.get("ai_enabled", True))
+        live_ids = [cam["id"] for cam in cameras.values() if self._should_be_live(cam)]
+        allocation = self._worker_core_allocation(live_ids)
+        for cam in cameras.values():
+            if self._should_be_live(cam):
+                self._start_camera(cam["id"], allocation[cam["id"]])
 
     def _sender_loop(self) -> None:
         """Feeds the detection worker JPEG bytes at the user-configurable
@@ -927,13 +936,16 @@ class PipelineManager:
                 input_queue = self._input_queues.get(camera_id)
                 if input_queue is None:
                     continue
-                try:
-                    input_queue.put_nowait(
-                        {"type": "detect", "camera_id": camera_id, "jpeg": jpeg, "enqueued_at": now}
-                    )
-                    recognition_logger.debug("camera=%s stage=frame_selected sent_to_worker=1", camera_id)
-                except queue.Full:
+                item = {"type": "detect", "camera_id": camera_id, "jpeg": jpeg, "enqueued_at": now}
+                sent, dropped_stale = enqueue_latest_frame(input_queue, item)
+                if dropped_stale:
+                    self._record_dropped_frame(camera_id)
+                if sent:
+                    recognition_logger.debug("camera=%s stage=frame_selected sent_to_worker=1 dropped_stale=%d", camera_id, int(dropped_stale))
+                else:
                     recognition_logger.debug("camera=%s stage=frame_selected sent_to_worker=0 reason=queue_full", camera_id)
+                    if not dropped_stale:
+                        self._record_dropped_frame(camera_id)  # this fresh frame itself never made it in either
 
             time.sleep(interval)
 
@@ -1010,8 +1022,9 @@ class PipelineManager:
             if self._desk_tracker is not None:
                 self._desk_tracker.process_frame(camera_id, result["faces"], frame_w, frame_h)
 
-            self._check_zone_violations(camera_id, result["faces"], result.get("jpeg"))
-            pipeline.set_detections(result["faces"])
+            self._check_zone_violations(camera_id, result["faces"])
+            final_detections = pipeline.set_detections(result["faces"])
+            self._record_recognition_result(camera_id, final_detections)
 
         if "people" in result and self._desk_tracker is not None:
             frame_w, frame_h = result.get("frame_size", (0, 0))
@@ -1038,26 +1051,8 @@ class PipelineManager:
         # evidence behind each change.
         for event_type in result.get("fire_smoke_events", []):
             if not alerts_db.recent_open_alert(camera_id, event_type, FIRE_SMOKE_ALERT_COOLDOWN_SECONDS):
-                # fire_smoke_detector's own per-box "score" (see its update())
-                # is the only confidence signal this heuristic detector has —
-                # take the strongest matching box from the SAME frame that
-                # just confirmed this event, not an average across history.
-                matching_scores = [
-                    b["score"] for b in result.get("fire_smoke", []) if b.get("type") == event_type
-                ]
-                confidence_pct = round(max(matching_scores) * 100) if matching_scores else None
-                confidence_note = f" (confidence: {confidence_pct}%)" if confidence_pct is not None else ""
-                snapshot_path = self._save_alert_snapshot(
-                    camera_id, event_type, result.get("jpeg") or pipeline.get_latest_jpeg()
-                )
-                alerts_db.log_alert(
-                    camera_id,
-                    event_type,
-                    f"Possible {event_type} detected on camera{confidence_note}",
-                    snapshot_path=snapshot_path,
-                )
-                alert_events.broadcast()
-                logger.warning("Camera %s: possible %s detected%s", camera_id, event_type, confidence_note)
+                alerts_db.log_alert(camera_id, event_type, f"Possible {event_type} detected on camera")
+                logger.warning("Camera %s: possible %s detected", camera_id, event_type)
             if event_type == "smoke":
                 pipeline.note_smoke_event()
 
@@ -1070,7 +1065,6 @@ class PipelineManager:
         if result.get("person_count", 0) > 0 and self._is_within_restricted_window():
             if not alerts_db.recent_open_alert(camera_id, "intrusion", INTRUSION_ALERT_COOLDOWN_SECONDS):
                 alerts_db.log_alert(camera_id, "intrusion", "Person present during restricted hours")
-                alert_events.broadcast()
                 logger.warning("Camera %s: intrusion during restricted hours", camera_id)
 
     @staticmethod
@@ -1078,34 +1072,19 @@ class PipelineManager:
         contour = np.array(polygon_points, dtype=np.int32).reshape((-1, 1, 2))
         return cv2.pointPolygonTest(contour, point, False) >= 0
 
-    def _check_zone_violations(self, camera_id: int, faces: list[dict], jpeg: bytes | None) -> None:
+    def _check_zone_violations(self, camera_id: int, faces: list[dict]) -> None:
         """Restricted-zone allow-list check: anyone (a different enrolled
         person, or an unrecognized face) detected inside a zone's polygon
         who isn't on that zone's allowed_names list raises a zone_intrusion
-        alert, pushed to every connected client immediately (alert_events.
-        broadcast() below) — never a timer or a page refresh. Test point is
-        each face's bbox center — the only real-time, per-identity position
-        signal available (pose/body bbox only runs every
-        detection_worker.POSE_INTERVAL_SECONDS and carries no name). A zone
-        with both restricted_start/restricted_end set only enforces during
-        that window; leaving them blank means the allow-list applies at any
-        time.
-
-        Never waits on anything beyond this same cycle's already-completed
-        recognition: `name` here is whatever detection_worker's recognizer
-        already decided for THIS frame (confidently matched, or "Unknown")
-        — there's no separate slower identity step this blocks on. Two
-        follow-on behaviors close the gap that leaves, though: (1) entry/
-        exit tracking via self._zone_occupancy means someone continuously
-        present never re-fires, but leaving and returning fires again
-        immediately, not after a multi-minute cooldown; (2) if recognition
-        resolves "Unknown" -> a real name a cycle or two later (the same
-        physical entry, now identified), upgrade_unknown_zone_alert updates
-        that SAME alert row instead of logging a second, duplicate one."""
+        alert. Test point is each face's bbox center — the only real-time,
+        per-identity position signal available (pose/body bbox only runs
+        every detection_worker.POSE_INTERVAL_SECONDS and carries no name).
+        A zone with both restricted_start/restricted_end set only enforces
+        during that window; leaving them blank means the allow-list applies
+        at any time."""
         zones = zones_db.list_zones(camera_id=camera_id)
         if not zones:
             return
-        now = time.time()
         for zone in zones:
             if not zone["enabled"]:
                 continue
@@ -1121,63 +1100,19 @@ class PipelineManager:
                 if name in zone["allowed_names"]:
                     continue
                 face["zone_violation"] = True
-                # Per-cycle trace (fires every ~1s a violator stays put) —
-                # DEBUG only, or a busy zone would flood production logs;
-                # set LOG_LEVEL=DEBUG to see the full detection-to-dashboard
-                # path from your example.
-                logger.debug(
-                    "[%s] Camera %s: zone intrusion confirmed in '%s' - identity=%s, Allow List check: NOT ALLOWED",
-                    _ts_ms(), camera_id, zone["name"], name,
-                )
-
-                occ_key = (camera_id, zone["id"], name)
-                last_inside = self._zone_occupancy.get(occ_key)
-                self._zone_occupancy[occ_key] = now
-                if last_inside is not None and now - last_inside <= ZONE_EXIT_GRACE_SECONDS:
-                    continue  # same, already-alerted presence — not a fresh entry, no new event
-
-                who = name if name != "Unknown" else "Unknown Person"
-                message = f"{who} detected in restricted zone '{zone['name']}'"
-
-                if name != "Unknown" and alerts_db.upgrade_unknown_zone_alert(
-                    camera_id, zone["id"], name, message, within_seconds=UNKNOWN_UPGRADE_WINDOW_SECONDS
+                if alerts_db.recent_open_alert(
+                    camera_id, "zone_intrusion", ZONE_ALERT_COOLDOWN_SECONDS, zone_id=zone["id"], person_name=name
                 ):
-                    logger.info(
-                        "[%s] Camera %s: recognition resolved Unknown -> %s in '%s' - upgraded existing alert "
-                        "(no duplicate)", _ts_ms(), camera_id, name, zone["name"],
-                    )
-                    alert_events.broadcast()
                     continue
-
-                pipeline = self._pipelines.get(camera_id)
-                snapshot_path = self._save_alert_snapshot(
-                    camera_id, f"zone{zone['id']}", jpeg or (pipeline.get_latest_jpeg() if pipeline else None)
-                )
+                who = name if name != "Unknown" else "an unrecognized person"
                 alerts_db.log_alert(
                     camera_id,
                     "zone_intrusion",
-                    message,
+                    f"{who} detected in restricted zone '{zone['name']}'",
                     zone_id=zone["id"],
                     person_name=name,
-                    snapshot_path=snapshot_path,
                 )
-                logger.info("[%s] Camera %s: intrusion event created - %s", _ts_ms(), camera_id, message)
-                alert_events.broadcast()
                 logger.warning("Camera %s: zone violation in '%s' by %s", camera_id, zone["name"], name)
-
-    @staticmethod
-    def _save_alert_snapshot(camera_id: int, label: str, jpeg: bytes | None) -> str | None:
-        """Best-effort only, same as detection_worker._save_fire_smoke_debug_frame
-        — a failure here should never take down alerting over an evidence frame."""
-        if not jpeg:
-            return None
-        try:
-            ALERT_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
-            path = ALERT_SNAPSHOT_DIR / f"cam{camera_id}_{label}_{int(time.time() * 1000)}.jpg"
-            path.write_bytes(jpeg)
-            return str(path)
-        except Exception:
-            return None
 
     @staticmethod
     def _time_in_window(start_str: str | None, end_str: str | None) -> bool:
@@ -1232,12 +1167,76 @@ class PipelineManager:
         pipeline = self._pipelines.get(camera_id)
         return pipeline.get_latest_detections() if pipeline else []
 
+    def get_latest_detections_computed_at(self, camera_id: int) -> float:
+        pipeline = self._pipelines.get(camera_id)
+        return pipeline.get_latest_detections_computed_at() if pipeline else 0.0
+
+    def get_effective_identity_lost_timeout(self, camera_id: int) -> float:
+        pipeline = self._pipelines.get(camera_id)
+        return pipeline.get_effective_identity_lost_timeout() if pipeline else config.IDENTITY_LOST_TIMEOUT_SECONDS
+
     def get_latest_fire_smoke(self, camera_id: int) -> list[dict]:
         pipeline = self._pipelines.get(camera_id)
         return pipeline.get_latest_fire_smoke() if pipeline else []
 
     def is_live(self, camera_id: int) -> bool:
         return camera_id in self._pipelines
+
+    def _record_dropped_frame(self, camera_id: int) -> None:
+        with self._stats_lock:
+            self._dropped_frame_count[camera_id] = self._dropped_frame_count.get(camera_id, 0) + 1
+
+    def _record_recognition_result(self, camera_id: int, faces: list[dict]) -> None:
+        """Tallies where each displayed identity actually came from this
+        cycle (task section 14's recognition/cache-hit-rate metrics) — called
+        with the POST-override list from CameraPipeline.set_detections, so a
+        Honeywell-preferred face is counted as "honeywell", not "local"."""
+        with self._stats_lock:
+            stats = self._recognition_stats.setdefault(camera_id, {
+                "honeywell": 0, "local_fresh": 0, "local_cache": 0, "unknown": 0,
+                "score_sum": 0.0, "score_count": 0,
+            })
+            for face in faces:
+                if face["name"] == "Unknown":
+                    stats["unknown"] += 1
+                    continue
+                source = face.get("source", "local_fresh")
+                stats[source] = stats.get(source, 0) + 1
+                score = face.get("score")
+                if isinstance(score, (int, float)):
+                    stats["score_sum"] += score
+                    stats["score_count"] += 1
+
+    def get_observability_stats(self) -> dict:
+        """Per-camera queue/drop/recognition snapshot for main.py's
+        /api/stats — see task section 14. Deliberately separate from
+        honeywell_recognition_poller.get_health_status() (that one is per
+        physical HOST/API call; this one is per detection-worker/camera and
+        covers the local pipeline half of the picture)."""
+        with self._stats_lock:
+            result = {}
+            for camera_id in set(self._pipelines) | set(self._dropped_frame_count) | set(self._recognition_stats):
+                rec = dict(self._recognition_stats.get(camera_id, {}))
+                score_count = rec.pop("score_count", 0)
+                score_sum = rec.pop("score_sum", 0.0)
+                rec["average_score"] = round(score_sum / score_count, 3) if score_count else None
+                recognized_total = rec.get("honeywell", 0) + rec.get("local_fresh", 0) + rec.get("local_cache", 0)
+                cache_eligible = rec.get("local_fresh", 0) + rec.get("local_cache", 0)
+                rec["cache_hit_rate"] = round(rec.get("local_cache", 0) / cache_eligible, 3) if cache_eligible else None
+                input_queue = self._input_queues.get(camera_id)
+                queue_size = None
+                if input_queue is not None:
+                    try:
+                        queue_size = input_queue.qsize()
+                    except NotImplementedError:
+                        pass  # qsize() is unsupported on some platforms (e.g. macOS) — not fatal, just unavailable
+                result[camera_id] = {
+                    "queue_size": queue_size,
+                    "dropped_frame_count": self._dropped_frame_count.get(camera_id, 0),
+                    "recognition": rec,
+                    "recognized_total": recognized_total,
+                }
+            return result
 
     def get_active_clip_people(self) -> list[dict]:
         """Who's currently being recorded (session open, not yet finalized/

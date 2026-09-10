@@ -1,4 +1,4 @@
-﻿# Deco Vision EC2 Deployment - Quick Reference
+# Deco Vision EC2 Deployment - Quick Reference
 
 ## Your EC2 Instance
 - **IP Address**: 16.171.18.221

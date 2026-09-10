@@ -1,5 +1,5 @@
-import { useEffect, useRef } from 'react'
-import useLiveAlerts from '../hooks/useLiveAlerts'
+import { useEffect, useRef, useState } from 'react'
+import { api } from '../api'
 import '../pages/pages.css'
 
 // short two-tone alert beep, synthesized on the fly — no audio asset to ship
@@ -28,33 +28,39 @@ function playAlertBeep() {
   }
 }
 
-// Scope of this flashing banner, per explicit request: fire/smoke/intrusion/
-// zone_intrusion flash+beep here (a zone violation is exactly as time-
-// sensitive as smoke — someone unauthorized is in a restricted area right
-// now). fall stays visible in Dashboard's Live Alerts table only.
-const FLASH_ALERT_TYPES = new Set(['fire', 'smoke', 'intrusion', 'zone_intrusion'])
+// Scope of this flashing banner, per explicit request: fire/smoke/intrusion
+// only — zone_intrusion and fall stay visible in Dashboard's Live Alerts
+// table but don't trigger the flash+beep here.
+const FLASH_ALERT_TYPES = new Set(['fire', 'smoke', 'intrusion'])
 
-// Self-contained: subscribes to the live alert feed and beeps + shows a
-// pulsing red banner on any NEW unresolved alert. Drop it into any page —
-// it doesn't need the host page's own alerts state (Dashboard's alerts
-// table, e.g., stays independent so it can list/resolve without this
-// banner's involvement).
+// Self-contained: polls its own alert feed and beeps + shows a pulsing red
+// banner on any NEW unresolved alert. Drop it into any page — it doesn't
+// need the host page's own alerts state (Dashboard's alerts table, e.g.,
+// stays independent so it can list/resolve without this banner's involvement).
 export default function AlertBanner() {
-  const allAlerts = useLiveAlerts()
-  const alerts = allAlerts.filter((a) => FLASH_ALERT_TYPES.has(a.type))
-  const seenAlertIds = useRef(null) // null until first push, so existing alerts don't beep on page open
+  const [alerts, setAlerts] = useState([])
+  const seenAlertIds = useRef(null) // null until first load, so existing alerts don't beep on page open
 
   useEffect(() => {
-    if (seenAlertIds.current === null) {
-      seenAlertIds.current = new Set(alerts.map((a) => a.id))
-      return
+    const load = () => {
+      api
+        .listAlerts({ resolved: false })
+        .then((all) => {
+          const fresh = all.filter((a) => FLASH_ALERT_TYPES.has(a.type))
+          if (seenAlertIds.current === null) {
+            seenAlertIds.current = new Set(fresh.map((a) => a.id))
+          } else if (fresh.some((a) => !seenAlertIds.current.has(a.id))) {
+            playAlertBeep()
+            seenAlertIds.current = new Set(fresh.map((a) => a.id))
+          }
+          setAlerts(fresh)
+        })
+        .catch(() => {})
     }
-    if (alerts.some((a) => !seenAlertIds.current.has(a.id))) {
-      playAlertBeep()
-    }
-    seenAlertIds.current = new Set(alerts.map((a) => a.id))
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [alerts.map((a) => a.id).join(',')])
+    load()
+    const interval = setInterval(load, 15000)
+    return () => clearInterval(interval)
+  }, [])
 
   if (alerts.length === 0) return null
 

@@ -25,6 +25,21 @@ function drawZonesOverlay(ctx, zones) {
   }
 }
 
+// Ray casting, same algorithm as desk_tracker.py's DeskTracker._in_zone
+// (kept in sync deliberately — both decide "is this point inside this
+// shape" from the same kind of polygon, just one in the browser for a
+// click and one in the backend for a detected face).
+function pointInPolygon(px, py, polygon) {
+  let inside = false
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const [xi, yi] = polygon[i]
+    const [xj, yj] = polygon[j]
+    const intersects = yi > py !== yj > py && px < ((xj - xi) * (py - yi)) / (yj - yi) + xi
+    if (intersects) inside = !inside
+  }
+  return inside
+}
+
 function drawDraftPolygon(ctx, points) {
   if (!points || points.length === 0) return
   if (points.length > 1) {
@@ -52,6 +67,9 @@ export default function CameraTile({
   drawMode = false,
   draftPoints = [],
   onAddPoint,
+  onFrameSize,
+  onZoneClick,
+  zonePointSpace = 'pixel', // 'pixel' (restricted zones) or 'fraction' (desk zones — see desk_db.py)
 }) {
   const canvasRef = useRef(null)
   const overlayRef = useRef(null)
@@ -67,12 +85,25 @@ export default function CameraTile({
   }, [draftPoints])
 
   const handleCanvasClick = (e) => {
-    if (!drawMode || !onAddPoint) return
     const canvas = overlayRef.current
     const rect = canvas.getBoundingClientRect()
     const x = ((e.clientX - rect.left) / rect.width) * canvas.width
     const y = ((e.clientY - rect.top) / rect.height) * canvas.height
-    onAddPoint(x, y)
+
+    if (drawMode) {
+      onAddPoint?.(x, y)
+      return
+    }
+    if (!onZoneClick) return
+    // Zone polygons are stored either in native frame pixels (restricted
+    // zones) or as 0..1 fractions of frame size (desk zones — survives a
+    // camera resolution change, see desk_db.py) — convert the click point
+    // to whichever space this caller's zones use rather than converting
+    // every zone's polygon on every click.
+    const px = zonePointSpace === 'fraction' ? x / canvas.width : x
+    const py = zonePointSpace === 'fraction' ? y / canvas.height : y
+    const hit = zonesRef.current.find((zone) => zone.polygon?.length >= 3 && pointInPolygon(px, py, zone.polygon))
+    if (hit) onZoneClick(hit)
   }
 
   useEffect(() => {
@@ -104,15 +135,34 @@ export default function CameraTile({
         canvas.height = img.height
         overlay.width = img.width
         overlay.height = img.height
+        onFrameSize?.({ width: img.width, height: img.height })
       }
       ctx.drawImage(img, 0, 0)
     }
 
     let detectionsWs = null
+    // Fallback only for a payload from a backend that hasn't been restarted
+    // since this field was added — the real value always arrives once it has.
+    const DEFAULT_IDENTITY_LOST_TIMEOUT_SECONDS = 1.0
     if (showOverlay) {
       detectionsWs = new WebSocket(`${WS_PROTOCOL}://${WS_HOST}/ws/detections/${camera.id}`)
       detectionsWs.onmessage = (event) => {
-        const { faces, fire_smoke } = JSON.parse(event.data)
+        const { faces, fire_smoke, computed_at, identity_lost_timeout } = JSON.parse(event.data)
+        // /ws/detections polls the backend's last computed result on its own
+        // fixed schedule (every ~167ms) regardless of whether recognition
+        // has actually produced anything new since the last tick — a
+        // message arriving here is NOT evidence the data is fresh. A busy
+        // multi-person scene can take several seconds per real recognition
+        // cycle, so without this check the same stale name/box would keep
+        // redrawing every message long after the person actually left.
+        // computed_at is when the backend last ran set_detections() for
+        // this camera; if that's older than the configured timeout, treat
+        // it the same as "nothing known right now" rather than redrawing it.
+        const ageSeconds = computed_at ? Date.now() / 1000 - computed_at : 0
+        const timeoutSeconds = identity_lost_timeout ?? DEFAULT_IDENTITY_LOST_TIMEOUT_SECONDS
+        const dataIsStale = ageSeconds > timeoutSeconds
+        const freshFaces = dataIsStale ? [] : faces || []
+        const freshFireSmoke = dataIsStale ? [] : fire_smoke || []
         overlayCtx.clearRect(0, 0, overlay.width, overlay.height)
         drawZonesOverlay(overlayCtx, zonesRef.current)
         drawDraftPolygon(overlayCtx, draftPointsRef.current)
@@ -127,7 +177,7 @@ export default function CameraTile({
         // sort left-to-right so labels for adjacent faces are placed in a
         // stable order — otherwise which face "wins" the preferred spot
         // above its box flickers frame to frame as detection order changes
-        const sortedFaces = [...(faces || [])].sort((a, b) => a.bbox[0] - b.bbox[0])
+        const sortedFaces = [...freshFaces].sort((a, b) => a.bbox[0] - b.bbox[0])
 
         for (const face of sortedFaces) {
           const [x1, y1, x2, y2] = face.bbox
@@ -137,8 +187,6 @@ export default function CameraTile({
           // (rather than reusing the box's dark green) — white text on the
           // dark green read poorly; blue + white has much better contrast.
           const labelBg = known ? '#2f6fed' : color
-          overlayCtx.strokeStyle = color
-          overlayCtx.strokeRect(x1, y1, x2 - x1, y2 - y1)
 
           const label = known ? face.name : 'Unknown'
           const labelWidth = overlayCtx.measureText(label).width + 8
@@ -158,7 +206,7 @@ export default function CameraTile({
           overlayCtx.fillText(label, candidate.x + 3, candidate.y + LABEL_HEIGHT - 2)
         }
 
-        for (const item of fire_smoke || []) {
+        for (const item of freshFireSmoke) {
           // Smoke is alert-only (see AlertBanner) — no bounding box drawn, per
           // request: a hazy/uncertain region flagged with a box on live video
           // reads as a false-positive accusation more than a fire box does.
@@ -197,7 +245,13 @@ export default function CameraTile({
           ref={overlayRef}
           className="camera-tile-overlay"
           onClick={handleCanvasClick}
-          style={drawMode ? { cursor: 'crosshair', pointerEvents: 'auto' } : undefined}
+          style={
+            drawMode
+              ? { cursor: 'crosshair', pointerEvents: 'auto' }
+              : onZoneClick
+                ? { cursor: 'pointer', pointerEvents: 'auto' }
+                : undefined
+          }
         />
         {status !== 'live' && (
           <div className="camera-tile-offline">

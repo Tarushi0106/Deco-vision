@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from 'react'
-import { api, WS_HOST, WS_PROTOCOL } from '../api'
+import { useEffect, useState } from 'react'
+import { api } from '../api'
+import CameraTile from '../components/CameraTile'
 import './pages.css'
 import './deskAnalytics.css'
 
@@ -25,136 +26,14 @@ const ZONE_COLORS = ['#2f6fed', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#4a
 const STATUS_LABEL = { at_desk: 'At Desk', away: 'Away', unknown: 'Unknown' }
 const STATUS_PILL_CLASS = { at_desk: 'pill-success', away: 'pill-danger', unknown: 'pill-neutral' }
 
-// Live camera feed with existing desk zones drawn over it, plus click-drag
-// to define a new one. Deliberately reuses CameraTile's ws/live pattern
-// rather than a still snapshot — a live feed makes it obvious where each
-// desk boundary should go while drawing, and needs no separate "take a
-// snapshot" endpoint.
-function ZoneEditor({ camera, zones, onZoneDrawn }) {
-  const canvasRef = useRef(null)
-  const overlayRef = useRef(null)
-  const containerRef = useRef(null)
-  const [status, setStatus] = useState('connecting')
-  const [drag, setDrag] = useState(null) // {x1,y1,x2,y2} in fractions, while actively dragging
-
-  useEffect(() => {
-    if (!camera?.live) {
-      setStatus('offline')
-      return
-    }
-    const canvas = canvasRef.current
-    const overlay = overlayRef.current
-    const ctx = canvas.getContext('2d')
-    const img = new Image()
-    let objectUrl = null
-
-    const ws = new WebSocket(`${WS_PROTOCOL}://${WS_HOST}/ws/live/${camera.id}`)
-    ws.binaryType = 'blob'
-    ws.onopen = () => setStatus('live')
-    ws.onclose = () => setStatus('offline')
-    ws.onerror = () => setStatus('offline')
-    ws.onmessage = (event) => {
-      if (objectUrl) URL.revokeObjectURL(objectUrl)
-      objectUrl = URL.createObjectURL(event.data)
-      img.src = objectUrl
-    }
-    img.onload = () => {
-      if (canvas.width !== img.width || canvas.height !== img.height) {
-        canvas.width = img.width
-        canvas.height = img.height
-        overlay.width = img.width
-        overlay.height = img.height
-      }
-      ctx.drawImage(img, 0, 0)
-    }
-
-    return () => {
-      ws.close()
-      if (objectUrl) URL.revokeObjectURL(objectUrl)
-    }
-  }, [camera?.id, camera?.live])
-
-  // Redraw the zone overlay whenever zones, the in-progress drag rect, or
-  // the canvas size changes.
-  useEffect(() => {
-    const overlay = overlayRef.current
-    if (!overlay) return
-    const octx = overlay.getContext('2d')
-    octx.clearRect(0, 0, overlay.width, overlay.height)
-    octx.lineWidth = 3
-    octx.font = '16px sans-serif'
-    octx.textBaseline = 'bottom'
-
-    zones.forEach((zone, i) => {
-      const color = ZONE_COLORS[i % ZONE_COLORS.length]
-      const x = zone.x1 * overlay.width
-      const y = zone.y1 * overlay.height
-      const w = (zone.x2 - zone.x1) * overlay.width
-      const h = (zone.y2 - zone.y1) * overlay.height
-      octx.strokeStyle = color
-      octx.strokeRect(x, y, w, h)
-      const labelWidth = octx.measureText(zone.zone_label).width + 8
-      octx.fillStyle = color
-      octx.fillRect(x, y - 20, labelWidth, 20)
-      octx.fillStyle = 'white'
-      octx.fillText(zone.zone_label, x + 4, y - 4)
-    })
-
-    if (drag) {
-      const x = Math.min(drag.x1, drag.x2) * overlay.width
-      const y = Math.min(drag.y1, drag.y2) * overlay.height
-      const w = Math.abs(drag.x2 - drag.x1) * overlay.width
-      const h = Math.abs(drag.y2 - drag.y1) * overlay.height
-      octx.strokeStyle = '#c62828'
-      octx.setLineDash([6, 4])
-      octx.strokeRect(x, y, w, h)
-      octx.setLineDash([])
-    }
-  }, [zones, drag])
-
-  const fracFromEvent = (e) => {
-    const rect = containerRef.current.getBoundingClientRect()
-    return {
-      x: Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width)),
-      y: Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height)),
-    }
-  }
-
-  const handleMouseDown = (e) => {
-    const { x, y } = fracFromEvent(e)
-    setDrag({ x1: x, y1: y, x2: x, y2: y })
-  }
-  const handleMouseMove = (e) => {
-    if (!drag) return
-    const { x, y } = fracFromEvent(e)
-    setDrag((d) => ({ ...d, x2: x, y2: y }))
-  }
-  const handleMouseUp = () => {
-    if (!drag) return
-    const x1 = Math.min(drag.x1, drag.x2)
-    const y1 = Math.min(drag.y1, drag.y2)
-    const x2 = Math.max(drag.x1, drag.x2)
-    const y2 = Math.max(drag.y1, drag.y2)
-    if (x2 - x1 > 0.02 && y2 - y1 > 0.02) {
-      onZoneDrawn({ x1, y1, x2, y2 })
-    }
-    setDrag(null)
-  }
-
-  return (
-    <div
-      className="desk-zone-editor"
-      ref={containerRef}
-      onMouseDown={handleMouseDown}
-      onMouseMove={handleMouseMove}
-      onMouseUp={handleMouseUp}
-      onMouseLeave={() => setDrag(null)}
-    >
-      <canvas ref={canvasRef} className="desk-zone-video" />
-      <canvas ref={overlayRef} className="desk-zone-overlay" />
-      {status !== 'live' && <div className="camera-tile-offline">{status === 'offline' ? 'Camera offline' : 'Connecting…'}</div>}
-    </div>
-  )
+// zone_label -> name is the only reshaping CameraTile's overlay needs;
+// polygon already comes back from the API as a real point list (desk_db.py
+// fills one in for every zone, rectangle-only ones included), same shape
+// restricted zones already use — this is what gives desk zones the same
+// click-N-dots free-shape drawing as the Intrusion page instead of a fixed
+// drag-rectangle.
+function toOverlayZones(zones) {
+  return zones.map((z) => ({ ...z, name: z.zone_label }))
 }
 
 function ZoneManager() {
@@ -163,6 +42,9 @@ function ZoneManager() {
   const [zones, setZones] = useState([])
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState(null)
+  const [drawMode, setDrawMode] = useState(false)
+  const [draftPoints, setDraftPoints] = useState([]) // pixel coords, native frame resolution — see frameSize
+  const [frameSize, setFrameSize] = useState(null) // {width, height}, reported by CameraTile as frames arrive
 
   useEffect(() => {
     api.listCameras().then((cams) => {
@@ -182,15 +64,37 @@ function ZoneManager() {
 
   const camera = cameras.find((c) => c.id === cameraId)
 
-  // A zone is a plain "this rectangle is a desk" declaration — no employee
-  // to pick. It saves the moment it's drawn; who ends up occupying it is
+  const startDraw = () => {
+    setDrawMode(true)
+    setDraftPoints([])
+    setError(null)
+  }
+  const cancelDraw = () => {
+    setDrawMode(false)
+    setDraftPoints([])
+  }
+  const handleAddPoint = (x, y) => {
+    setDraftPoints((pts) => [...pts, [x, y]])
+  }
+
+  // A zone is a plain "this shape is a desk" declaration — no employee to
+  // pick. It saves the moment it's drawn; who ends up occupying it is
   // resolved automatically, every detection cycle, from face recognition
-  // (see desk_tracker.py) — never assigned here.
-  const handleZoneDrawn = async (rect) => {
+  // (see desk_tracker.py) — never assigned here. draftPoints are in native
+  // frame PIXEL coords (what CameraTile's click handler reports); desk
+  // zones are stored as 0..1 FRACTIONS of frame width/height instead (see
+  // desk_db.py) so a saved shape still lines up correctly if the camera's
+  // resolution ever changes — frameSize (reported by CameraTile as the
+  // live feed's actual decoded size) is what makes that conversion exact
+  // rather than guessed.
+  const handleFinishShape = async () => {
+    if (draftPoints.length < 3 || !frameSize) return
     setError(null)
     setSaving(true)
     try {
-      await api.createDeskZone({ camera_id: cameraId, ...rect })
+      const polygon = draftPoints.map(([x, y]) => [x / frameSize.width, y / frameSize.height])
+      await api.createDeskZone({ camera_id: cameraId, polygon })
+      cancelDraw()
       loadZones(cameraId)
     } catch (err) {
       setError(err.message)
@@ -204,28 +108,71 @@ function ZoneManager() {
     loadZones(cameraId)
   }
 
+  // Clicking directly on a drawn desk in the video is the same delete as
+  // the Remove button in the list below — just a faster path once you can
+  // see the shape on screen. Confirms first: a single misclick on the
+  // feed is much easier to trigger by accident than the deliberate act of
+  // finding and clicking a specific row's Remove button.
+  const handleZoneClick = (zone) => {
+    if (window.confirm(`Remove ${zone.zone_label}?`)) handleDeleteZone(zone.id)
+  }
+
   return (
     <div className="card panel desk-analytics-col">
       <div className="panel-header">
         <h3>Desk Zones</h3>
-        <select value={cameraId ?? ''} onChange={(e) => setCameraId(Number(e.target.value))}>
+        <select
+          value={cameraId ?? ''}
+          onChange={(e) => {
+            setCameraId(Number(e.target.value))
+            cancelDraw()
+          }}
+        >
           {cameras.map((c) => (
             <option key={c.id} value={c.id}>{c.name}</option>
           ))}
         </select>
       </div>
-      <div className="stat-tile-sub" style={{ marginBottom: '0.6rem' }}>
-        Click and drag on the feed below to mark a desk — it's auto-labeled ("Desk 1", "Desk 2", …) and saved
-        immediately. Who's sitting there is detected automatically, not assigned here.
-      </div>
+
+      {!drawMode ? (
+        <>
+          <div className="stat-tile-sub" style={{ marginBottom: '0.6rem' }}>
+            Click "Draw New Desk", then click points on the feed below to trace any shape (3 points for a
+            triangle, 4+ for any polygon) — it's auto-labeled ("Desk 1", "Desk 2", …). Who's sitting there is
+            detected automatically, not assigned here. Click an existing desk's outline to remove it.
+          </div>
+          <button className="btn btn-primary" onClick={startDraw} disabled={!camera} style={{ marginBottom: '0.6rem' }}>
+            + Draw New Desk
+          </button>
+        </>
+      ) : (
+        <div className="zone-draw-controls" style={{ marginBottom: '0.6rem' }}>
+          <span className="stat-tile-sub">{draftPoints.length} point(s) placed</span>
+          <button className="btn btn-outline" onClick={cancelDraw}>Cancel</button>
+          <button className="btn btn-primary" onClick={handleFinishShape} disabled={draftPoints.length < 3 || saving}>
+            Finish Shape
+          </button>
+        </div>
+      )}
 
       {camera ? (
-        <ZoneEditor camera={camera} zones={zones} onZoneDrawn={handleZoneDrawn} />
+        <CameraTile
+          camera={camera}
+          large
+          showOverlay
+          zones={toOverlayZones(zones)}
+          drawMode={drawMode}
+          draftPoints={draftPoints}
+          onAddPoint={handleAddPoint}
+          onFrameSize={setFrameSize}
+          onZoneClick={handleZoneClick}
+          zonePointSpace="fraction"
+        />
       ) : (
         <div className="empty-state">No cameras configured.</div>
       )}
 
-      {saving && <div className="stat-tile-sub" style={{ marginTop: '0.5rem' }}>Saving zone…</div>}
+      {saving && <div className="stat-tile-sub" style={{ marginTop: '0.5rem' }}>Saving desk…</div>}
       {error && <div className="form-message error">{error}</div>}
 
       {zones.length > 0 && (

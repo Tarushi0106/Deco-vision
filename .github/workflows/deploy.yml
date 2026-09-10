@@ -14,7 +14,7 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     env:
-      EC2_HOST: 56.228.1.6
+      EC2_HOST: 13.61.58.14
       EC2_USER: ubuntu
       APP_DIR: /home/ubuntu/Deco-vision
 

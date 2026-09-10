@@ -48,21 +48,51 @@ async function parseUploadResponse(res) {
   return data
 }
 
+// Shared by AddPersonModal and EditPersonModal's "add photos" field — both
+// upload to the same /api/people endpoint, which now accepts any number of
+// photos in one call (each becomes its own sample for that name).
+async function submitPhotos(name, files) {
+  const form = new FormData()
+  form.append('name', name)
+  for (const file of files) {
+    form.append('photos', await compressPhotoForUpload(file))
+  }
+  const res = await fetch(ADD_PERSON_URL, { method: 'POST', body: form })
+  return parseUploadResponse(res)
+}
+
+function EnrollResultMessage({ result }) {
+  if (!result) return null
+  return (
+    <div className="form-message success">
+      Enrolled {result.enrolled_count} photo{result.enrolled_count === 1 ? '' : 's'}.
+      {result.failed?.length > 0 && (
+        <div>
+          {result.failed.length} skipped: {result.failed.map((f) => `${f.filename} (${f.error})`).join(', ')}
+        </div>
+      )}
+      {(result.devices || []).flatMap((deviceResult, i) =>
+        Object.entries(deviceResult).map(([host, r]) => (
+          <div key={`${i}-${host}`}>
+            {host}: {r.synced ? 'synced to Allow List' : `sync failed (${r.error})`}
+          </div>
+        ))
+      )}
+    </div>
+  )
+}
+
 function AddPersonModal({ onClose, onAdded }) {
   const [name, setName] = useState('')
-  const [file, setFile] = useState(null)
+  const [files, setFiles] = useState([])
   const [status, setStatus] = useState(null)
 
   const handleSubmit = async (e) => {
     e.preventDefault()
-    if (!name || !file) return
+    if (!name || files.length === 0) return
     setStatus({ loading: true })
     try {
-      const form = new FormData()
-      form.append('name', name)
-      form.append('photo', await compressPhotoForUpload(file))
-      const res = await fetch(ADD_PERSON_URL, { method: 'POST', body: form })
-      const data = await parseUploadResponse(res)
+      const data = await submitPhotos(name, files)
       setStatus({ loading: false, result: data })
       onAdded()
     } catch (err) {
@@ -79,19 +109,19 @@ function AddPersonModal({ onClose, onAdded }) {
           <input value={name} onChange={(e) => setName(e.target.value)} required />
         </div>
         <div className="form-row">
-          <label>Photo</label>
-          <input type="file" accept="image/*" onChange={(e) => setFile(e.target.files[0])} required />
+          <label>Photo{files.length > 1 ? 's' : ''}</label>
+          <input
+            type="file"
+            accept="image/*"
+            multiple
+            onChange={(e) => setFiles(Array.from(e.target.files))}
+            required
+          />
         </div>
-        {status?.result && (
-          <div className="form-message success">
-            Enrolled locally.{' '}
-            {Object.entries(status.result.devices || {}).map(([host, r]) => (
-              <div key={host}>
-                {host}: {r.synced ? 'synced to Allow List' : `sync failed (${r.error})`}
-              </div>
-            ))}
-          </div>
+        {files.length > 1 && (
+          <div className="stat-tile-sub">{files.length} photos selected — each becomes a sample for {name || 'this person'}.</div>
         )}
+        <EnrollResultMessage result={status?.result} />
         {status?.error && <div className="form-message error">{status.error}</div>}
         <div className="modal-actions">
           <button type="button" className="btn btn-outline" onClick={onClose}>
@@ -109,7 +139,7 @@ function AddPersonModal({ onClose, onAdded }) {
 function EditPersonModal({ person, onClose, onSaved }) {
   const [name, setName] = useState(person.name)
   const [employeeId, setEmployeeId] = useState(person.employee_id || '')
-  const [file, setFile] = useState(null)
+  const [files, setFiles] = useState([])
   const [status, setStatus] = useState(null)
 
   const handleSubmit = async (e) => {
@@ -118,14 +148,10 @@ function EditPersonModal({ person, onClose, onSaved }) {
     if (!newName) return
     setStatus({ loading: true })
     try {
-      // rename first (if changed) so the added photo below lands under the new name
+      // rename first (if changed) so the added photo(s) below land under the new name
       await api.renamePerson(person.name, newName, employeeId.trim())
-      if (file) {
-        const form = new FormData()
-        form.append('name', newName)
-        form.append('photo', await compressPhotoForUpload(file))
-        const res = await fetch(ADD_PERSON_URL, { method: 'POST', body: form })
-        await parseUploadResponse(res)
+      if (files.length > 0) {
+        await submitPhotos(newName, files)
       }
       setStatus({ loading: false, done: true })
       onSaved()
@@ -151,11 +177,11 @@ function EditPersonModal({ person, onClose, onSaved }) {
           />
         </div>
         <div className="form-row">
-          <label>Add a photo</label>
-          <input type="file" accept="image/*" onChange={(e) => setFile(e.target.files[0])} />
+          <label>Add photo{files.length > 1 ? 's' : ''}</label>
+          <input type="file" accept="image/*" multiple onChange={(e) => setFiles(Array.from(e.target.files))} />
         </div>
         <div className="stat-tile-sub">
-          {person.sample_count} sample{person.sample_count === 1 ? '' : 's'} enrolled. Adding a photo keeps the
+          {person.sample_count} sample{person.sample_count === 1 ? '' : 's'} enrolled. Adding photos keeps the
           existing ones and improves match accuracy — it doesn't replace them.
         </div>
         {status?.done && <div className="form-message success">Saved.</div>}

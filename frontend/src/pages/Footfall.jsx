@@ -399,9 +399,18 @@ export default function Footfall() {
   const [error, setError] = useState(null)
 
   useEffect(() => {
-    setError(null)
-    api.getFootfallReport(date).then(setReport).catch((err) => setError(err.message))
-    api.getPeopleCountReport(date).then(setPeopleCount).catch(() => {})
+    const load = () => {
+      setError(null)
+      api.getFootfallReport(date).then(setReport).catch((err) => setError(err.message))
+      api.getPeopleCountReport(date).then(setPeopleCount).catch(() => {})
+    }
+    load()
+    // Matches the 15s poll already used for Attendance/Analytics/Dashboard —
+    // today's counts change continuously as people are recognized; without
+    // this, the stat tiles/charts only updated on a manual date-picker
+    // change or a full page reload.
+    const interval = setInterval(load, 15000)
+    return () => clearInterval(interval)
   }, [date])
 
   const busiestHour = useMemo(() => {

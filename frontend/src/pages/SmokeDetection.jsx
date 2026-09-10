@@ -2,7 +2,6 @@ import { useEffect, useMemo, useState } from 'react'
 import { api } from '../api'
 import AlertBanner from '../components/AlertBanner'
 import CameraTile from '../components/CameraTile'
-import useLiveAlerts from '../hooks/useLiveAlerts'
 import './pages.css'
 
 // Clips for a smoke event are logged under this fixed pseudo "person" name
@@ -22,10 +21,7 @@ function formatDuration(seconds) {
 }
 
 function timeAgo(ts) {
-  // Clamped at 0: a server clock running ahead of the viewer's browser
-  // otherwise makes Date.now()/1000 - ts negative, showing a nonsensical
-  // "-3713s ago" instead of just reading as "just now".
-  const seconds = Math.max(0, Math.floor(Date.now() / 1000 - ts))
+  const seconds = Math.floor(Date.now() / 1000 - ts)
   if (seconds < 60) return `${seconds}s ago`
   const mins = Math.floor(seconds / 60)
   if (mins < 60) return `${mins}m ago`
@@ -34,12 +30,17 @@ function timeAgo(ts) {
 
 export default function SmokeDetection() {
   const [cameras, setCameras] = useState([])
-  const allAlerts = useLiveAlerts()
-  const alerts = allAlerts.filter((a) => a.type === 'smoke')
+  const [alerts, setAlerts] = useState([])
   const [clips, setClips] = useState(null)
   const [clipsError, setClipsError] = useState(null)
   const [playingClip, setPlayingClip] = useState(null)
   const [playStatus, setPlayStatus] = useState(null) // 'loading' | 'error' | null
+
+  const loadAlerts = () => {
+    api.listAlerts({ resolved: false })
+      .then((all) => setAlerts(all.filter((a) => a.type === 'smoke')))
+      .catch(() => {})
+  }
 
   const loadClips = () => {
     api.getClips(SMOKE_CLIP_SUBJECT).then(setClips).catch((err) => setClipsError(err.message))
@@ -47,8 +48,12 @@ export default function SmokeDetection() {
 
   useEffect(() => {
     api.listCameras().then(setCameras).catch(() => {})
+    loadAlerts()
     loadClips()
-    const interval = setInterval(loadClips, 15000)
+    const interval = setInterval(() => {
+      loadAlerts()
+      loadClips()
+    }, 15000)
     return () => clearInterval(interval)
   }, [])
 
@@ -56,6 +61,7 @@ export default function SmokeDetection() {
 
   const handleResolve = async (id) => {
     await api.resolveAlert(id)
+    loadAlerts()
   }
 
   const handleSelectClip = (clip) => {
@@ -72,8 +78,7 @@ export default function SmokeDetection() {
           <div className="page-toolbar-sub">
             Cameras are watched for a genuinely growing haze (color + motion, not just a live model). No box is drawn
             on the video for a suspected smoke region — a flashing dashboard alert and a saved clip are the signal
-            instead, since a box on hazy/uncertain footage reads as an accusation more than a fire box does. Fire
-            alerts are shown on the Dashboard, not here — see Live Alerts.
+            instead, since a box on hazy/uncertain footage reads as an accusation more than a fire box does.
           </div>
         </div>
       </div>
@@ -106,13 +111,6 @@ export default function SmokeDetection() {
                     <span className="alerts-list-time">{timeAgo(alert.ts)}</span>
                   </div>
                   <div className="alerts-list-message">{alert.message}</div>
-                  {alert.snapshot_path && (
-                    <img
-                      className="alerts-list-snapshot"
-                      src={api.alertSnapshotUrl(alert.id)}
-                      alt={`Snapshot: ${alert.message}`}
-                    />
-                  )}
                   <button className="btn btn-outline" onClick={() => handleResolve(alert.id)}>
                     Resolve
                   </button>

@@ -256,6 +256,13 @@ export default function People() {
 
   useEffect(() => {
     load()
+    // Matches the 15s poll already used for Attendance/Analytics/Dashboard —
+    // the Allow List changes from camera-side syncs (and other users'
+    // actions), not just this tab's own edits, so a mount-only fetch could
+    // show a stale roster until the page was manually reloaded (reported
+    // directly this way: a just-synced person wasn't visible without one).
+    const interval = setInterval(load, 15000)
+    return () => clearInterval(interval)
   }, [])
 
   const handleDelete = async (name) => {
@@ -298,7 +305,8 @@ export default function People() {
 
       {syncResult && !syncResult.error && (
         <div className="form-message" style={{ marginBottom: '0.75rem' }}>
-          Synced {syncResult.synced}, already up to date {syncResult.skipped}
+          {syncResult.new} new, {syncResult.updated} updated, {syncResult.removed} removed,{' '}
+          {syncResult.duplicates_prevented} already up to date
           {syncResult.failed.length > 0 && `, ${syncResult.failed.length} failed`}.
           {syncResult.failed.length > 0 && (
             <ul>

@@ -109,9 +109,24 @@ export default function CameraTile({
     }
 
     let detectionsWs = null
+    let staleTimer = null
+    // Recognition can take several seconds per frame under load (observed
+    // up to ~8s in practice) — without this, a name/box from a stale result
+    // keeps showing on live video long after the person has moved or left,
+    // which reads as a wrong detection rather than a delayed one. If no
+    // fresher detection message arrives within this window, assume nothing
+    // current is known and clear rather than keep showing the old result.
+    const STALE_DETECTION_MS = 1000
+    const clearStaleDetections = () => {
+      overlayCtx.clearRect(0, 0, overlay.width, overlay.height)
+      drawZonesOverlay(overlayCtx, zonesRef.current)
+      drawDraftPolygon(overlayCtx, draftPointsRef.current)
+    }
     if (showOverlay) {
       detectionsWs = new WebSocket(`${WS_PROTOCOL}://${WS_HOST}/ws/detections/${camera.id}`)
       detectionsWs.onmessage = (event) => {
+        clearTimeout(staleTimer)
+        staleTimer = setTimeout(clearStaleDetections, STALE_DETECTION_MS)
         const { faces, fire_smoke } = JSON.parse(event.data)
         overlayCtx.clearRect(0, 0, overlay.width, overlay.height)
         drawZonesOverlay(overlayCtx, zonesRef.current)
@@ -137,8 +152,6 @@ export default function CameraTile({
           // (rather than reusing the box's dark green) — white text on the
           // dark green read poorly; blue + white has much better contrast.
           const labelBg = known ? '#2f6fed' : color
-          overlayCtx.strokeStyle = color
-          overlayCtx.strokeRect(x1, y1, x2 - x1, y2 - y1)
 
           const label = known ? face.name : 'Unknown'
           const labelWidth = overlayCtx.measureText(label).width + 8
@@ -182,6 +195,7 @@ export default function CameraTile({
     return () => {
       videoWs.close()
       detectionsWs?.close()
+      clearTimeout(staleTimer)
       if (objectUrl) URL.revokeObjectURL(objectUrl)
     }
   }, [camera.id, camera.live, showOverlay])

@@ -406,13 +406,6 @@ def run_worker(
                 # stored in; cheap (two ints) so always included rather than
                 # gated behind whether any camera currently has zones.
                 "frame_size": [frame.shape[1], frame.shape[0]],
-                # The EXACT frame that was just analyzed above (already-encoded
-                # bytes, no re-encode) — pipeline.py uses this for alert
-                # snapshots instead of "whatever's currently live", since by
-                # the time a result comes back and an alert fires, the live
-                # feed has already moved on to a newer frame that may no
-                # longer show the person/event that triggered the alert.
-                "jpeg": item["jpeg"],
             }
             if faces:
                 for f in faces:
@@ -429,21 +422,29 @@ def run_worker(
             # -detected face is excluded from consideration (see
             # fire_smoke_detector.FACE_EXCLUDE_*_PAD) — a person moving at
             # their desk otherwise reads as a "growing" smoke-colored blob.
-            fs_tracker = fire_smoke_trackers.setdefault(camera_id, FireSmokeTracker())
-            face_boxes = [f["bbox"] for f in result["faces"]]
-            frame_h, frame_w = frame.shape[:2]
-            ignore_boxes = [
-                [int(x1 * frame_w), int(y1 * frame_h), int(x2 * frame_w), int(y2 * frame_h)]
-                for x1, y1, x2, y2 in CAMERA_FIRE_SMOKE_IGNORE_REGIONS.get(camera_id, [])
-            ]
-            fire_smoke = fs_tracker.update(frame, exclude_boxes=face_boxes + ignore_boxes)
-            result["fire_smoke"] = fire_smoke["boxes"]
-            result["fire_smoke_events"] = fire_smoke["events"]
-            for event_type in fire_smoke["events"]:
-                debug_key = (camera_id, event_type)
-                if time.time() - last_debug_save_at.get(debug_key, 0) >= FIRE_SMOKE_DEBUG_SAVE_INTERVAL_SECONDS:
-                    last_debug_save_at[debug_key] = time.time()
-                    _save_fire_smoke_debug_frame(camera_id, frame, fire_smoke["boxes"])
+            #
+            # Disabled by default (config.FIRE_SMOKE_DETECTION_ENABLED) —
+            # this is a color/flicker heuristic, not a trained model, and
+            # confirmed live to false-positive on skin tone/warm clothing.
+            if config.FIRE_SMOKE_DETECTION_ENABLED:
+                fs_tracker = fire_smoke_trackers.setdefault(camera_id, FireSmokeTracker())
+                face_boxes = [f["bbox"] for f in result["faces"]]
+                frame_h, frame_w = frame.shape[:2]
+                ignore_boxes = [
+                    [int(x1 * frame_w), int(y1 * frame_h), int(x2 * frame_w), int(y2 * frame_h)]
+                    for x1, y1, x2, y2 in CAMERA_FIRE_SMOKE_IGNORE_REGIONS.get(camera_id, [])
+                ]
+                fire_smoke = fs_tracker.update(frame, exclude_boxes=face_boxes + ignore_boxes)
+                result["fire_smoke"] = fire_smoke["boxes"]
+                result["fire_smoke_events"] = fire_smoke["events"]
+                for event_type in fire_smoke["events"]:
+                    debug_key = (camera_id, event_type)
+                    if time.time() - last_debug_save_at.get(debug_key, 0) >= FIRE_SMOKE_DEBUG_SAVE_INTERVAL_SECONDS:
+                        last_debug_save_at[debug_key] = time.time()
+                        _save_fire_smoke_debug_frame(camera_id, frame, fire_smoke["boxes"])
+            else:
+                result["fire_smoke"] = []
+                result["fire_smoke_events"] = []
 
             now = time.time()
             if now - last_pose_at.get(camera_id, 0) >= POSE_INTERVAL_SECONDS:

@@ -161,7 +161,16 @@ export default function Attendance() {
       .catch((err) => setError(err.message))
   }
 
-  useEffect(load, [date])
+  useEffect(() => {
+    load()
+    // Recognition events now arrive from the Honeywell poller on its own
+    // schedule, not a page action — without this, a new sighting only
+    // appeared after a manual Refresh click. 15000ms matches the interval
+    // already used for alerts/stats elsewhere in the app (Dashboard.jsx,
+    // Sidebar.jsx), not a new value chosen in isolation.
+    const interval = setInterval(load, 15000)
+    return () => clearInterval(interval)
+  }, [date])
 
   useEffect(() => {
     api.listFaces().then((faces) => {

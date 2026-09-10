@@ -81,6 +81,30 @@ def init_db() -> None:
             # at the moment this sighting was logged — powers the Attendance
             # roster's "Best Match" column
             conn.execute("ALTER TABLE detection_events ADD COLUMN score REAL")
+        if "honeywell_person_id" not in existing_cols:
+            # the Honeywell Allow-List Id resolved at event time — kept even
+            # after a later rename/removal on the camera, so a row's identity
+            # provenance stays traceable independent of the display `name`
+            conn.execute("ALTER TABLE detection_events ADD COLUMN honeywell_person_id TEXT")
+        if "honeywell_event_ts" not in existing_cols:
+            # Honeywell's own recognition timestamp for this event (distinct
+            # from `ts`, which is when *we* wrote the row) — lets latency
+            # (ts - honeywell_event_ts) be queried later without re-parsing logs
+            conn.execute("ALTER TABLE detection_events ADD COLUMN honeywell_event_ts REAL")
+        if "event_key" not in existing_cols:
+            # deterministic dedup key for "which recognition occurrence is
+            # this" (see honeywell_recognition_poller.py) — distinct from
+            # honeywell_person_id, which answers "who is this"
+            conn.execute("ALTER TABLE detection_events ADD COLUMN event_key TEXT")
+        if "recognition_source" not in existing_cols:
+            conn.execute("ALTER TABLE detection_events ADD COLUMN recognition_source TEXT DEFAULT 'honeywell'")
+        # NULLs never collide in a SQLite unique index, so pre-migration rows
+        # (event_key IS NULL) are unaffected; only used going forward to stop
+        # the same Honeywell recognition occurrence being written twice.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_detection_events_event_key "
+            "ON detection_events(camera_id, event_key)"
+        )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS footfall_counts (
@@ -93,6 +117,17 @@ def init_db() -> None:
         existing_footfall_cols = {row[1] for row in conn.execute("PRAGMA table_info(footfall_counts)")}
         if "camera_id" not in existing_footfall_cols:
             conn.execute("ALTER TABLE footfall_counts ADD COLUMN camera_id INTEGER")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS honeywell_poll_checkpoints (
+                camera_id INTEGER PRIMARY KEY,
+                host TEXT NOT NULL,
+                last_processed_ts REAL,
+                last_event_key TEXT,
+                updated_at REAL
+            )
+            """
+        )
 
 
 def seed_enrolled_faces_if_empty() -> int:
@@ -143,6 +178,107 @@ def get_synced_camera_face_ids() -> set[str]:
             "SELECT camera_face_id FROM enrolled_faces WHERE camera_face_id IS NOT NULL"
         ).fetchall()
     return {r[0] for r in rows}
+
+
+def get_faces_by_camera_host(host: str) -> list[dict]:
+    """Every locally-enrolled row sourced from one physical device (by its
+    camera_face_id's "{host}:{camera's own Id}" prefix) - the primary-camera
+    sync reconciliation's view of "what we currently think this device's
+    Allow List contains", to diff against a fresh fetch."""
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT id, name, camera_face_id FROM enrolled_faces WHERE camera_face_id LIKE ?", (f"{host}:%",)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_name_by_camera_face_id(camera_face_id: str) -> str | None:
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT name FROM enrolled_faces WHERE camera_face_id = ? LIMIT 1", (camera_face_id,)
+        ).fetchone()
+    return row[0] if row else None
+
+
+def update_face_name_by_camera_id(camera_face_id: str, new_name: str) -> None:
+    """Renames the one row tied to this exact camera Allow List entry - unlike
+    rename_face(old_name, new_name), which would rename EVERY row sharing that
+    name, this only ever touches the single camera-sourced record being
+    reconciled. Cascades to detection_events for the same reason rename_face
+    does: those rows store name as a text snapshot, not a reference."""
+    with get_connection() as conn:
+        row = conn.execute("SELECT name FROM enrolled_faces WHERE camera_face_id = ?", (camera_face_id,)).fetchone()
+        if row is None:
+            return
+        old_name = row[0]
+        conn.execute("UPDATE enrolled_faces SET name = ? WHERE camera_face_id = ?", (new_name, camera_face_id))
+        if old_name != new_name:
+            conn.execute("UPDATE detection_events SET name = ? WHERE name = ?", (new_name, old_name))
+
+
+def delete_face_by_camera_id(camera_face_id: str) -> str | None:
+    """Removes the one row tied to this exact camera Allow List entry (unlike
+    delete_face(name), which would remove every row sharing that name) -
+    reconciliation's way of dropping a person no longer on the primary
+    camera's Allow List without touching anyone else who happens to share
+    their name. Returns the source_photo to unlink, or None if no such row
+    existed. Never touches detection_events - past attendance history for
+    someone no longer enrolled stays intact, same as delete_face's behavior."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT source_photo FROM enrolled_faces WHERE camera_face_id = ?", (camera_face_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        conn.execute("DELETE FROM enrolled_faces WHERE camera_face_id = ?", (camera_face_id,))
+    return row[0]
+
+
+def get_poll_checkpoint(camera_id: int) -> dict | None:
+    """Where honeywell_recognition_poller.py last left off reading this
+    camera row's SnapedFaces log — loaded on worker start so a restart
+    resumes instead of re-polling from a fixed lookback window."""
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT camera_id, host, last_processed_ts, last_event_key, updated_at "
+            "FROM honeywell_poll_checkpoints WHERE camera_id = ?",
+            (camera_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def save_poll_checkpoint(camera_id: int, host: str, last_processed_ts: float, last_event_key: str | None) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            "INSERT INTO honeywell_poll_checkpoints (camera_id, host, last_processed_ts, last_event_key, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(camera_id) DO UPDATE SET host=excluded.host, last_processed_ts=excluded.last_processed_ts, "
+            "last_event_key=excluded.last_event_key, updated_at=excluded.updated_at",
+            (camera_id, host, last_processed_ts, last_event_key, time.time()),
+        )
+
+
+def insert_detection_event_if_new(
+    camera_id: int, name: str | None, bbox: list[int], event_key: str,
+    score: float | None = None, honeywell_person_id: str | None = None,
+    honeywell_event_ts: float | None = None, recognition_source: str = "honeywell",
+) -> bool:
+    """Like log_detection_event, but relies on the (camera_id, event_key)
+    unique index to reject a recognition occurrence already written —
+    across restarts, not just within one process's lifetime (unlike the
+    in-memory de-dup sets this replaces in the poller). Returns True if a
+    row was actually inserted, False if it was already there."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO detection_events "
+            "(ts, camera_id, name, bbox, score, honeywell_person_id, honeywell_event_ts, event_key, recognition_source) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (time.time(), camera_id, name, str(bbox), score, honeywell_person_id,
+             honeywell_event_ts, event_key, recognition_source),
+        )
+    return cur.rowcount > 0
 
 
 def load_all_faces() -> list[tuple[str, np.ndarray]]:

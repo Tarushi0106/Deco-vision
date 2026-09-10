@@ -201,6 +201,40 @@ def get_name_by_camera_face_id(camera_face_id: str) -> str | None:
     return row[0] if row else None
 
 
+def get_names_unmapped_for_host(primary_host: str, target_host: str) -> list[dict]:
+    """Names sourced from the master identity host (primary_host — see
+    config.PRIMARY_PEOPLE_SOURCE_HOST) that don't yet have a camera_face_id
+    recorded for a secondary device (target_host). Used by
+    honeywell_recognition_poller's per-secondary-host backfill: Honeywell
+    assigns each physical device its own independent Person ID space, so a
+    person added/renamed on the master device has to be individually pushed
+    to every OTHER device and its device-local ID recorded here before that
+    device's own recognition events can resolve back to the same name — see
+    that module's _backfill_identity_mapping."""
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT DISTINCT name, source_photo FROM enrolled_faces
+            WHERE camera_face_id LIKE ?
+              AND name NOT IN (
+                  SELECT name FROM enrolled_faces WHERE camera_face_id LIKE ?
+              )
+            """,
+            (f"{primary_host}:%", f"{target_host}:%"),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_embedding_for_name(name: str) -> np.ndarray | None:
+    """Any one existing embedding for this name — reused when recording a
+    NEW camera_face_id mapping for a secondary device, since it's the same
+    person's face, not a fresh enrollment (see _backfill_identity_mapping)."""
+    with get_connection() as conn:
+        row = conn.execute("SELECT embedding FROM enrolled_faces WHERE name = ? LIMIT 1", (name,)).fetchone()
+    return np.frombuffer(row[0], dtype=np.float32) if row else None
+
+
 def update_face_name_by_camera_id(camera_face_id: str, new_name: str) -> None:
     """Renames the one row tied to this exact camera Allow List entry - unlike
     rename_face(old_name, new_name), which would rename EVERY row sharing that
@@ -265,11 +299,14 @@ def insert_detection_event_if_new(
     score: float | None = None, honeywell_person_id: str | None = None,
     honeywell_event_ts: float | None = None, recognition_source: str = "honeywell",
 ) -> bool:
-    """Like log_detection_event, but relies on the (camera_id, event_key)
+    """Writes a detection_events row, relying on the (camera_id, event_key)
     unique index to reject a recognition occurrence already written —
     across restarts, not just within one process's lifetime (unlike the
     in-memory de-dup sets this replaces in the poller). Returns True if a
-    row was actually inserted, False if it was already there."""
+    row was actually inserted, False if it was already there. The sole
+    writer to this table (see honeywell_recognition_poller.py) — local
+    recognition never logs here, only ever reads it (see
+    get_recent_camera_recognition) for the live-overlay display override."""
     with get_connection() as conn:
         cur = conn.execute(
             "INSERT OR IGNORE INTO detection_events "
@@ -279,6 +316,25 @@ def insert_detection_event_if_new(
              honeywell_event_ts, event_key, recognition_source),
         )
     return cur.rowcount > 0
+
+
+def get_recent_camera_recognition(camera_id: int, within_seconds: float) -> dict | None:
+    """Most recent Honeywell-sourced detection_events row for this camera
+    within the freshness window — read-only (never writes anything, never
+    touches honeywell_recognition_poller.py's own dedup/cooldown state).
+    Used by pipeline.py's CameraPipeline.set_detections to prefer
+    Honeywell's own identity over the local worker's match for the live
+    overlay, when unambiguous (exactly one face in frame — see that
+    method's docstring)."""
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT name, score, ts FROM detection_events "
+            "WHERE camera_id = ? AND recognition_source = 'honeywell' AND ts >= ? "
+            "ORDER BY ts DESC LIMIT 1",
+            (camera_id, time.time() - within_seconds),
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def load_all_faces() -> list[tuple[str, np.ndarray]]:
@@ -340,14 +396,6 @@ def load_faces_with_photos() -> list[dict]:
         {"name": name, "photos": g["photos"], "sample_count": len(g["photos"]), "employee_id": g["employee_id"]}
         for name, g in grouped.items()
     ]
-
-
-def log_detection_event(camera_id: int, name: str, bbox: list[int], score: float | None = None) -> None:
-    with get_connection() as conn:
-        conn.execute(
-            "INSERT INTO detection_events (ts, camera_id, name, bbox, score) VALUES (?, ?, ?, ?, ?)",
-            (time.time(), camera_id, name, str(bbox), score),
-        )
 
 
 def count_detections_today() -> int:

@@ -7,8 +7,6 @@ import sqlite3
 import time
 from pathlib import Path
 
-from . import camera_db
-
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "app.db"
 
 
@@ -64,8 +62,6 @@ def _migrate_zone_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE alerts ADD COLUMN zone_id INTEGER")
     if "person_name" not in columns:
         conn.execute("ALTER TABLE alerts ADD COLUMN person_name TEXT")
-    if "snapshot_path" not in columns:
-        conn.execute("ALTER TABLE alerts ADD COLUMN snapshot_path TEXT")
 
 
 def get_setting(key: str, default: str | None = None) -> str | None:
@@ -84,26 +80,13 @@ def set_setting(key: str, value: str) -> None:
 
 
 def log_alert(
-    camera_id: int,
-    alert_type: str,
-    message: str,
-    zone_id: int | None = None,
-    person_name: str | None = None,
-    snapshot_path: str | None = None,
+    camera_id: int, alert_type: str, message: str, zone_id: int | None = None, person_name: str | None = None
 ) -> None:
     with get_connection() as conn:
         conn.execute(
-            "INSERT INTO alerts (ts, camera_id, type, message, zone_id, person_name, snapshot_path) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (time.time(), camera_id, alert_type, message, zone_id, person_name, snapshot_path),
+            "INSERT INTO alerts (ts, camera_id, type, message, zone_id, person_name) VALUES (?, ?, ?, ?, ?, ?)",
+            (time.time(), camera_id, alert_type, message, zone_id, person_name),
         )
-
-
-def get_alert(alert_id: int) -> dict | None:
-    with get_connection() as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute("SELECT * FROM alerts WHERE id = ?", (alert_id,)).fetchone()
-    return dict(row) if row else None
 
 
 def recent_open_alert(
@@ -144,45 +127,6 @@ def list_alerts(resolved: bool | None = None, limit: int = 50) -> list[dict]:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(query, params).fetchall()
     return [dict(r) for r in rows]
-
-
-def list_alerts_with_camera_names(resolved: bool | None = None, limit: int = 50) -> list[dict]:
-    """list_alerts() plus each row's camera_name — the one shared shape both
-    GET /api/alerts and the /ws/alerts push socket send, so a REST fetch and
-    a live push are never subtly different from each other (see main.py)."""
-    cameras_by_id = {c["id"]: c["name"] for c in camera_db.list_cameras()}
-    alerts = list_alerts(resolved=resolved, limit=limit)
-    for alert in alerts:
-        alert["camera_name"] = cameras_by_id.get(alert["camera_id"], "Unknown camera")
-    return alerts
-
-
-def upgrade_unknown_zone_alert(
-    camera_id: int, zone_id: int, new_name: str, new_message: str, within_seconds: float = 15
-) -> bool:
-    """Recognition can resolve a face from "Unknown" to a real name a frame
-    or two after a zone violation first fires (detection_worker's full-res
-    recheck pass runs in the SAME cycle but can still land after the first
-    "Unknown" match) — this updates that alert in place instead of logging a
-    second, duplicate row for what is physically the same entry. Only
-    matches a genuinely recent (within_seconds) unresolved "Unknown" row for
-    this exact camera+zone; an older one is a separate, real prior visit and
-    is deliberately left alone. Returns whether an upgrade happened, so the
-    caller knows to skip creating a new alert."""
-    cutoff = time.time() - within_seconds
-    with get_connection() as conn:
-        row = conn.execute(
-            "SELECT id FROM alerts WHERE camera_id = ? AND zone_id = ? AND type = 'zone_intrusion' "
-            "AND person_name = 'Unknown' AND resolved = 0 AND ts >= ? ORDER BY ts DESC LIMIT 1",
-            (camera_id, zone_id, cutoff),
-        ).fetchone()
-        if row is None:
-            return False
-        conn.execute(
-            "UPDATE alerts SET person_name = ?, message = ? WHERE id = ?",
-            (new_name, new_message, row[0]),
-        )
-        return True
 
 
 def count_open_alerts() -> int:

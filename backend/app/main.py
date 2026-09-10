@@ -126,10 +126,7 @@ class SettingsIn(BaseModel):
 
 class DeskZoneIn(BaseModel):
     camera_id: int
-    x1: float
-    y1: float
-    x2: float
-    y2: float
+    polygon: list[list[float]]  # >=3 [x, y] points, traced by the drawing tool — see DeskAnalytics.jsx
 
 
 class DeskZoneUpdate(BaseModel):
@@ -275,7 +272,9 @@ def create_desk_zone(zone: DeskZoneIn):
     """Zones are anonymous — no employee is assigned at creation time. Who
     occupies a zone is resolved automatically, every detection cycle, by
     desk_tracker.py from face recognition (+ pose-based continuity)."""
-    zone_id = desk_db.create_zone(zone.camera_id, zone.x1, zone.y1, zone.x2, zone.y2)
+    if len(zone.polygon) < 3:
+        raise HTTPException(400, "A desk shape needs at least 3 points")
+    zone_id = desk_db.create_zone(zone.camera_id, zone.polygon)
     pipeline_manager.refresh_desk_zones()
     return {"id": zone_id}
 
@@ -402,7 +401,15 @@ def get_stats():
         # lets the dashboard tell "no one has been recognized" apart from
         # "the recognition pipeline itself is broken" (e.g. worker_running
         # false, or healthy false with a rising backoff_delay_seconds).
+        # Includes each host's camera_client stats (login/reset/timeout/
+        # reconnect counts) under "client_stats".
         "honeywell_recognition": honeywell_recognition_poller.get_health_status(),
+        # Per-camera local pipeline health: queue depth, dropped-frame count,
+        # and a recognition-source breakdown (honeywell/local_fresh/
+        # local_cache/unknown) with cache hit rate and average confidence —
+        # the local-pipeline half of the same CAMERA/API/QUEUE/INFERENCE
+        # triage the Honeywell block above covers for the camera-API half.
+        "pipeline": pipeline_manager.get_observability_stats(),
     }
 
 
@@ -1153,6 +1160,16 @@ async def detections_feed(websocket: WebSocket, camera_id: int):
             await websocket.send_json({
                 "faces": pipeline_manager.get_latest_detections(camera_id),
                 "fire_smoke": pipeline_manager.get_latest_fire_smoke(camera_id),
+                # When this result was actually computed, not when this
+                # message was sent — this poll fires every ~167ms regardless
+                # of whether the worker has produced anything new since the
+                # last tick. Lets the frontend detect "this is old data"
+                # itself instead of relying on message silence (which never
+                # happens at this poll rate) — see config.IDENTITY_LOST_TIMEOUT_SECONDS.
+                "computed_at": pipeline_manager.get_latest_detections_computed_at(camera_id),
+                # Adaptive per this camera's own real cycle time, not the flat
+                # config value directly — see get_effective_identity_lost_timeout.
+                "identity_lost_timeout": pipeline_manager.get_effective_identity_lost_timeout(camera_id),
             })
             await asyncio.sleep(DETECTIONS_INTERVAL)
     except (WebSocketDisconnect, ConnectionResetError, RuntimeError):

@@ -95,7 +95,26 @@ class DeskTracker:
 
     @staticmethod
     def _in_zone(cx: float, cy: float, zone: dict) -> bool:
-        return zone["x1"] <= cx <= zone["x2"] and zone["y1"] <= cy <= zone["y2"]
+        """Point-in-polygon (ray casting), not a rectangle bounds check —
+        desk_db.py always fills in `polygon` (a real shape, or a 4-corner
+        rectangle synthesized from x1..y2 for a zone drawn before free-shape
+        desks existed), so this one test covers both a plain rectangle and
+        a hand-traced triangle/pentagon/etc identically. Same algorithm as
+        pipeline.py's PipelineManager._point_in_zone (restricted zones);
+        kept as a small standalone check here rather than importing cv2 into
+        this otherwise cv2-free module just for one polygon test."""
+        polygon = zone["polygon"]
+        inside = False
+        n = len(polygon)
+        x1, y1 = polygon[0]
+        for i in range(1, n + 1):
+            x2, y2 = polygon[i % n]
+            if cy > min(y1, y2) and cy <= max(y1, y2) and cx <= max(x1, x2) and y1 != y2:
+                x_intersect = (cy - y1) * (x2 - x1) / (y2 - y1) + x1
+                if x1 == x2 or cx <= x_intersect:
+                    inside = not inside
+            x1, y1 = x2, y2
+        return inside
 
     def _occupant_of(self, zone_id: int) -> str | None:
         for name, state in self._person_state.items():

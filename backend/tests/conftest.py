@@ -38,6 +38,9 @@ def reset_poller_state(temp_db):
     poller._host_health.clear()
     poller._events_processed_today.clear()
     poller._events_processed_day = None
+    poller._last_successful_api_ts.clear()
+    poller._last_successful_recognition_ts.clear()
+    poller._last_identity_backfill_at.clear()
     poller._host_threads.clear()
     poller._host_stop_events.clear()
     poller._host_cameras.clear()

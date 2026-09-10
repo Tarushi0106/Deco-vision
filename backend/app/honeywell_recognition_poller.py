@@ -45,7 +45,8 @@ import threading
 import time
 from datetime import datetime, timedelta
 
-from . import camera_db, config, face_db
+from . import camera_client, camera_db, config, face_db
+from .camera_client import _classify_exception
 from .recognition_provider import HoneywellRecognitionProvider
 
 logger = logging.getLogger("dashboard.honeywell_recognition")
@@ -90,10 +91,31 @@ _person_cache_lock = threading.Lock()
 _person_cache_loaded_at = 0.0
 _unknown_id_seen: dict[str, int] = {}
 
+# Master-identity backfill (see _backfill_identity_mapping): Honeywell gives
+# every physical device its own independent Person ID space, so a person
+# enrolled via the master device (config.PRIMARY_PEOPLE_SOURCE_HOST) has to
+# be individually pushed to every OTHER device's own Allow List, and that
+# device's own assigned ID recorded locally, before ITS recognition events
+# can resolve back to the same name. Checked at most this often per
+# secondary host — cheap (one indexed DB query) even when nothing's
+# missing, so no need to run it on every single HONEYWELL_POLL_INTERVAL_SECONDS
+# cycle just to find zero work almost every time.
+_IDENTITY_BACKFILL_INTERVAL_SECONDS = 300
+_last_identity_backfill_at: dict[str, float] = {}
+# Same pacing as main.py's People List sync — this device's admin API is
+# fragile under rapid repeated calls.
+_IDENTITY_BACKFILL_CALL_DELAY_SECONDS = 0.4
+
 # Per-host health, read by main.py's stats endpoint (get_health_status()).
 _host_health: dict[str, dict] = {}
 _events_processed_today: dict[str, int] = {}
 _events_processed_day: str | None = None
+# Separate from _host_health's last_poll_at (every attempt, success or not):
+# these only move forward on a genuine API success / a real recognition
+# event actually written, so a stuck "last_poll_at keeps ticking" clock can't
+# be mistaken for a healthy pipeline — see get_health_status().
+_last_successful_api_ts: dict[str, float] = {}
+_last_successful_recognition_ts: dict[str, float] = {}
 
 
 def _channel_for(stream_path: str) -> str:
@@ -221,6 +243,9 @@ def _process_event(camera_id: int, host: str, channel: str, event, fetched_at: f
         logger.debug("camera=%s stage=duplicate_skipped event_key=%s", camera_id, event_key)
         return
 
+    if recognition_source == "honeywell":
+        _last_successful_recognition_ts[host] = written_at
+
     _last_logged_at[dedup_bucket] = now
     _bump_events_today(host)
 
@@ -260,6 +285,13 @@ def _poll_camera_row(cam: dict) -> None:
         host, cam["user"], cam["password"], cam.get("admin_port") or config.CAMERA_ADMIN_PORT,
         channel, since, now,
     )
+    # Reached only if fetch_new_events did NOT raise — camera_client already
+    # classifies/logs/counts the failure cases (REQUEST -> TIMEOUT/RESET/...);
+    # this is the "the API call itself genuinely succeeded" timestamp, kept
+    # separate from _host_health's last_poll_at (every attempt) so a
+    # persistently-failing host can't look "healthy" just because it keeps
+    # trying on schedule.
+    _last_successful_api_ts[host] = time.time()
     if events:
         logger.info("camera=%s stage=events_received received %d recognition event(s) from Honeywell Camera", camera_id, len(events))
     else:
@@ -272,33 +304,137 @@ def _poll_camera_row(cam: dict) -> None:
     face_db.save_poll_checkpoint(camera_id, host, now.timestamp(), None)
 
 
+def _backfill_identity_mapping(host: str, cam: dict) -> None:
+    """Keeps a SECONDARY device's Allow List — and our local ID mapping for
+    it — in sync with the MASTER identity source
+    (config.PRIMARY_PEOPLE_SOURCE_HOST): the Main Section Camera's own
+    Honeywell Person IDs are the master identity; this pushes any
+    master-enrolled person missing from `host`'s own Allow List, then reads
+    back the ID Honeywell assigned them on THIS device and records
+    "{host}:{that id}" locally so this device's own future recognition
+    events resolve straight back to the same name (see _lookup_person).
+
+    Called from _host_loop only right after a successful poll of this host
+    — i.e. only while it's reachable. A secondary camera that's offline
+    simply never reaches this call until it reconnects on its own, which is
+    what leaves a pending person's sync waiting rather than erroring: the
+    normal per-host reconnect/backoff loop already handles the "wait for it
+    to come back" part, this just rides on top of it."""
+    if host == config.PRIMARY_PEOPLE_SOURCE_HOST:
+        return  # the master device needs no backfill against itself
+
+    last = _last_identity_backfill_at.get(host, 0.0)
+    if time.time() - last < _IDENTITY_BACKFILL_INTERVAL_SECONDS:
+        return
+    _last_identity_backfill_at[host] = time.time()
+
+    missing = face_db.get_names_unmapped_for_host(config.PRIMARY_PEOPLE_SOURCE_HOST, host)
+    if not missing:
+        return
+    source_photo_by_name = {p["name"]: p["source_photo"] for p in missing}
+    logger.info("host=%s stage=identity_backfill_start missing=%d names=%s", host, len(missing), sorted(source_photo_by_name))
+
+    client = camera_client.get_camera_client(host, cam["user"], cam["password"], cam.get("admin_port") or config.CAMERA_ADMIN_PORT)
+    pushed_names = []
+    for person in missing:
+        photo_path = face_db.ENROLLMENT_PHOTOS_DIR / person["source_photo"]
+        if not photo_path.exists():
+            logger.warning("host=%s stage=identity_backfill_skip name=%r reason=photo_missing photo=%s", host, person["name"], person["source_photo"])
+            continue
+        try:
+            client.add_face(person["name"], photo_path.read_bytes())
+            pushed_names.append(person["name"])
+        except Exception as e:
+            logger.warning("host=%s stage=identity_backfill_push_failed name=%r error=%s", host, person["name"], e)
+        time.sleep(_IDENTITY_BACKFILL_CALL_DELAY_SECONDS)
+
+    if not pushed_names:
+        return
+
+    try:
+        allow_list = client.list_added_faces()
+    except Exception as e:
+        logger.warning("host=%s stage=identity_backfill_readback_failed error=%s — will retry next interval", host, e)
+        return
+
+    mapped = 0
+    for entry in allow_list:
+        name = entry.get("Name")
+        if name not in pushed_names:
+            continue
+        camera_face_id = f"{host}:{entry['Id']}"
+        if face_db.get_name_by_camera_face_id(camera_face_id) is not None:
+            continue  # already recorded (e.g. a previous partial run)
+        embedding = face_db.get_embedding_for_name(name)
+        if embedding is None:
+            continue
+        face_db.add_face(name, source_photo_by_name[name], embedding, camera_face_id=camera_face_id)
+        mapped += 1
+    logger.info("host=%s stage=identity_backfill_done pushed=%d mapped=%d", host, len(pushed_names), mapped)
+    if mapped:
+        _load_person_cache(force=True)
+
+
 def _host_loop(host: str, stop_evt: threading.Event) -> None:
     delay = config.HONEYWELL_RECONNECT_BASE_DELAY_SECONDS
     while not stop_evt.is_set() and not _stop_event.is_set():
         cameras = _host_cameras.get(host, [])
         success = True
+        last_failure_category = None
         for cam in cameras:
             try:
                 _poll_camera_row(cam)
-            except Exception:
-                logger.exception("camera=%s host=%s stage=poll_failed", cam.get("id"), host)
+            except Exception as e:
+                # camera_client already logged+counted the granular
+                # REQUEST/LOGIN/RECONNECT outcome (which endpoint, which
+                # category, which attempt) — this is deliberately a single
+                # terse category line, not a second full traceback, so a
+                # sustained outage doesn't flood the log with duplicate
+                # tracebacks every poll cycle. Full trace stays available at
+                # DEBUG for when it's actually needed.
+                last_failure_category = _classify_exception(e)
+                logger.warning("camera=%s host=%s stage=poll_failed category=%s error=%s", cam.get("id"), host, last_failure_category, e)
+                logger.debug("camera=%s host=%s stage=poll_failed_trace", cam.get("id"), host, exc_info=True)
                 success = False
-
-        _host_health[host] = {
-            "last_poll_at": time.time(),
-            "healthy": success,
-            "backoff_delay_seconds": 0 if success else delay,
-            "events_processed_today": _events_processed_today.get(host, 0),
-            "unresolved_ids": sum(v for k, v in _unknown_id_seen.items() if k.startswith(f"{host}:")),
-        }
 
         if success:
             delay = config.HONEYWELL_RECONNECT_BASE_DELAY_SECONDS
             wait = config.HONEYWELL_POLL_INTERVAL_SECONDS
+            if cameras:
+                try:
+                    _backfill_identity_mapping(host, cameras[0])
+                except Exception:
+                    # Never let a master-identity sync hiccup affect this
+                    # host's actual recognition polling/backoff above — it
+                    # just retries on its own next _IDENTITY_BACKFILL_INTERVAL_SECONDS.
+                    logger.exception("host=%s stage=identity_backfill_error", host)
         else:
             wait = delay
             delay = min(delay * 2, config.HONEYWELL_RECONNECT_MAX_DELAY_SECONDS)
-            logger.warning("host=%s stage=backoff next attempt in %ss", host, wait)
+
+        next_retry_at = time.time() + wait
+        client_stats = camera_client.get_all_client_stats()
+        # host alone isn't a stats key (clients are keyed "host:port") — match
+        # on host prefix since a host can only have one admin_port in practice.
+        host_client_stats = next((s for key, s in client_stats.items() if key.startswith(f"{host}:")), {})
+        _host_health[host] = {
+            "last_poll_at": time.time(),
+            "healthy": success,
+            "backoff_delay_seconds": 0 if success else delay,
+            "next_retry_at": next_retry_at,
+            "last_failure_category": last_failure_category,
+            "last_successful_api_ts": _last_successful_api_ts.get(host),
+            "last_successful_recognition_ts": _last_successful_recognition_ts.get(host),
+            "events_processed_today": _events_processed_today.get(host, 0),
+            "unresolved_ids": sum(v for k, v in _unknown_id_seen.items() if k.startswith(f"{host}:")),
+            "client_stats": host_client_stats,
+        }
+
+        if not success:
+            logger.warning(
+                "Honeywell: host=%s stage=backoff category=%s next_retry_at=%s (in %ss)",
+                host, last_failure_category, datetime.fromtimestamp(next_retry_at).isoformat(timespec="seconds"), wait,
+            )
         stop_evt.wait(wait)
 
 

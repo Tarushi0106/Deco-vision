@@ -893,32 +893,60 @@ def list_faces():
 
 
 @app.post("/api/people")
-async def add_person(name: str = Form(...), photo: UploadFile = File(...)):
-    photo_bytes = await photo.read()
-    frame = cv2.imdecode(np.frombuffer(photo_bytes, np.uint8), cv2.IMREAD_COLOR)
-    if frame is None:
-        raise HTTPException(400, "Could not read uploaded image")
-
-    embedding = await asyncio.to_thread(pipeline_manager.compute_embedding, frame)
-    if embedding is None:
-        raise HTTPException(400, "No face detected in photo")
-
+async def add_person(name: str = Form(...), photos: list[UploadFile] = File(...)):
+    """Enrolls one or more photos for `name` in a single call — every photo
+    that has a detectable face is saved as its own sample (same multi-photo-
+    per-person model as re-uploading one at a time, just batched); a photo
+    that fails (unreadable, no face) is reported per-file rather than
+    aborting the whole batch, so 5 good photos aren't lost because 1 was
+    bad. Used both for a brand-new person and for adding more samples to an
+    existing one (the frontend calls this endpoint either way)."""
     safe_name = re.sub(r"[^a-zA-Z0-9 ()_-]", "", name).strip().replace(" ", "_")
-    # preserve the real format (PNG upload stays a .png file, etc.) instead of
-    # always writing a .jpg name onto whatever bytes were actually uploaded
-    ext = mimetypes.guess_extension(photo.content_type or "") or ".jpg"
-    if ext == ".jpe":
-        ext = ".jpg"
-    saved_filename = f"{safe_name}_{uuid.uuid4().hex[:8]}{ext}"
-    (ENROLLMENT_PHOTOS_DIR / saved_filename).write_bytes(photo_bytes)
 
-    face_db.add_face(name, saved_filename, embedding)
+    enrolled = []
+    failed = []
+    for photo in photos:
+        photo_bytes = await photo.read()
+        frame = cv2.imdecode(np.frombuffer(photo_bytes, np.uint8), cv2.IMREAD_COLOR)
+        if frame is None:
+            failed.append({"filename": photo.filename, "error": "could not read uploaded image"})
+            continue
+
+        embedding = await asyncio.to_thread(pipeline_manager.compute_embedding, frame)
+        if embedding is None:
+            failed.append({"filename": photo.filename, "error": "no face detected in photo"})
+            continue
+
+        # preserve the real format (PNG upload stays a .png file, etc.) instead of
+        # always writing a .jpg name onto whatever bytes were actually uploaded
+        ext = mimetypes.guess_extension(photo.content_type or "") or ".jpg"
+        if ext == ".jpe":
+            ext = ".jpg"
+        saved_filename = f"{safe_name}_{uuid.uuid4().hex[:8]}{ext}"
+        (ENROLLMENT_PHOTOS_DIR / saved_filename).write_bytes(photo_bytes)
+
+        face_db.add_face(name, saved_filename, embedding)
+        enrolled.append(photo_bytes)
+
+    if not enrolled:
+        detail = "No photos provided" if not failed else "No usable photo — " + "; ".join(f["error"] for f in failed)
+        raise HTTPException(400, detail)
+
     pipeline_manager.reload_faces()
-    logger.info("Enrolled %s locally", name)
+    logger.info("Enrolled %s locally (%d photo(s), %d failed)", name, len(enrolled), len(failed))
 
-    device_results = await asyncio.to_thread(sync_face_to_all_devices, name, photo_bytes)
+    # One push per successfully-enrolled photo, same as re-uploading each one
+    # individually would do — every sample becomes its own Allow List entry
+    # on each device, matching how multiple photos already work locally.
+    device_results = []
+    for photo_bytes in enrolled:
+        device_results.append(await asyncio.to_thread(sync_face_to_all_devices, name, photo_bytes))
 
-    return {"name": name, "local_enrolled": True, "devices": device_results}
+    return {
+        "name": name, "local_enrolled": True,
+        "enrolled_count": len(enrolled), "failed": failed,
+        "devices": device_results,
+    }
 
 
 @app.put("/api/people/{name}")

@@ -30,6 +30,11 @@ server {
     listen [::]:80 default_server;
     server_name _;
 
+    # Allows a multi-photo enrollment upload (several compressed photos in
+    # one request) through — nginx's own default (1m) silently rejected
+    # anything past ~2-5 compressed photos before this was ever noticed.
+    client_max_body_size 25m;
+
     root /home/ubuntu/Deco-vision/frontend/dist;
     index index.html index.htm;
 

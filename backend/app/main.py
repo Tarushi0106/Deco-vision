@@ -30,8 +30,8 @@ from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
 from . import (
-    alerts_db, auth, camera_db, clips_db, config, desk_db, face_db, face_training_db, face_training_scheduler,
-    footfall_db, footfall_gate_db, footfall_report, license_db, license_qr, scheduler, user_db, zones_db,
+    alerts_db, auth, camera_db, clips_db, config, desk_db, face_db, footfall_db, footfall_gate_db, footfall_report,
+    license_db, license_qr, scheduler, user_db, zones_db,
 )
 from . import honeywell_recognition_poller, onvif_client, pipeline, replay_prefetch
 from .camera_client import get_camera_client, sync_face_to_all_devices
@@ -155,15 +155,6 @@ class ZoneIn(BaseModel):
     restricted_end: str | None = None
 
 
-class FaceTrainingLabelIn(BaseModel):
-    sample_id: int
-    name: str
-
-
-class FaceTrainingSkipIn(BaseModel):
-    sample_id: int
-
-
 class ZoneUpdate(BaseModel):
     name: str | None = None
     polygon: list[list[float]] | None = None
@@ -191,10 +182,8 @@ def startup():
     desk_db.init_db()
     license_db.init_db()
     zones_db.init_db()
-    face_training_db.init_db()
     pipeline_manager.start()
     scheduler.start_scheduler()
-    face_training_scheduler.start_scheduler()
     replay_prefetch.start()
     honeywell_recognition_poller.start()
 
@@ -204,7 +193,6 @@ def shutdown():
     honeywell_recognition_poller.stop()
     replay_prefetch.stop()
     scheduler.shutdown_scheduler()
-    face_training_scheduler.shutdown_scheduler()
     pipeline_manager.stop()
 
 
@@ -1200,10 +1188,6 @@ async def detections_feed(websocket: WebSocket, camera_id: int):
             await websocket.send_json({
                 "faces": pipeline_manager.get_latest_detections(camera_id),
                 "fire_smoke": pipeline_manager.get_latest_fire_smoke(camera_id),
-                # Generic person-body boxes (pose detection, not face-based) —
-                # see pipeline.py's CameraPipeline._latest_people docstring.
-                # Additive only: every existing field above is unchanged.
-                "persons": pipeline_manager.get_latest_people(camera_id),
                 # When this result was actually computed, not when this
                 # message was sent — this poll fires every ~167ms regardless
                 # of whether the worker has produced anything new since the
@@ -1218,98 +1202,6 @@ async def detections_feed(websocket: WebSocket, camera_id: int):
             await asyncio.sleep(DETECTIONS_INTERVAL)
     except (WebSocketDisconnect, ConnectionResetError, RuntimeError):
         logger.info("detections_feed client disconnected (camera %s)", camera_id)
-
-
-####################################################################
-# Continuous face collection / manual labeling / retraining
-#
-# Collection itself needs no route at all — it already runs inside the
-# existing per-camera detection workers (detection_worker.py) regardless of
-# whether this page is even open, exactly like every other detection
-# feature in this app. These endpoints are only the human-facing
-# label/status/history surface on top of that. No auth dependency, matching
-# every other dashboard endpoint above (this app's plain endpoints have
-# none — only the separate License module does).
-####################################################################
-
-@app.get("/api/face-training/status")
-def face_training_status():
-    by_status = face_training_db.count_by_status()
-    last_run = face_training_db.get_latest_training_run()
-    enrolled = face_db.load_all_faces()
-    live_camera_ids = [c["id"] for c in camera_db.list_cameras() if pipeline_manager.is_live(c["id"])]
-    return {
-        # Collection has no separate on/off switch of its own — it runs
-        # automatically inside any live camera's existing detection worker
-        # (see detection_worker.py), the same way face recognition does.
-        # "Active" here means "at least one camera pipeline is live".
-        "collection_active": len(live_camera_ids) > 0,
-        "live_camera_ids": live_camera_ids,
-        "pending_samples": by_status.get("pending", 0),
-        "labeled_awaiting_promotion": by_status.get("labeled", 0),
-        "promoted_samples": by_status.get("promoted", 0),
-        "skipped_samples": by_status.get("skipped", 0),
-        "samples_captured_today": face_training_db.count_captured_today(),
-        "samples_labeled_today": face_training_db.count_labeled_today(),
-        "total_enrolled_people": len({n for n, _ in enrolled}),
-        "total_enrolled_samples": len(enrolled),
-        "min_new_samples_threshold": config.FACE_TRAINING_MIN_NEW_SAMPLES,
-        "max_interval_seconds": config.FACE_TRAINING_MAX_INTERVAL_SECONDS,
-        "last_training_run": last_run,
-    }
-
-
-@app.get("/api/face-training/next")
-def face_training_next():
-    sample = face_training_db.get_next_pending()
-    return {"sample": sample, "pending_count": face_training_db.count_by_status().get("pending", 0)}
-
-
-@app.get("/api/face-training/image/{sample_id}")
-def face_training_image(sample_id: int):
-    sample = face_training_db.get_sample(sample_id)
-    if sample is None:
-        raise HTTPException(404, "Sample not found")
-    if not Path(sample["image_path"]).exists():
-        raise HTTPException(404, "Sample image file missing on disk")
-    return FileResponse(sample["image_path"], media_type="image/jpeg")
-
-
-@app.post("/api/face-training/label")
-def face_training_label(body: FaceTrainingLabelIn):
-    name = body.name.strip()
-    if not name:
-        raise HTTPException(422, "name is required")
-    ok = face_training_db.label_sample(body.sample_id, name)
-    if not ok:
-        raise HTTPException(409, "Sample not found, or already labeled/skipped/promoted")
-    return {"ok": True}
-
-
-@app.post("/api/face-training/skip")
-def face_training_skip(body: FaceTrainingSkipIn):
-    ok = face_training_db.skip_sample(body.sample_id)
-    if not ok:
-        raise HTTPException(409, "Sample not found, or already labeled/skipped/promoted")
-    return {"ok": True}
-
-
-@app.post("/api/face-training/train")
-def face_training_train():
-    """Manual trigger — runs the exact same promote-and-validate cycle the
-    background scheduler runs automatically (see face_training_scheduler.py),
-    just without waiting for the batch-size/interval policy. Synchronous:
-    a leave-one-out validation pass over the whole gallery is the slow part,
-    and it's O(enrolled_samples^2) cosine-similarity comparisons — fast in
-    practice at this app's real roster size (tens of people, low hundreds of
-    samples), but if the roster ever grows enough for this to matter, this
-    is the endpoint to move to a background task."""
-    return face_training_scheduler.run_promotion_cycle(min_samples=0)
-
-
-@app.get("/api/face-training/history")
-def face_training_history(limit: int = 20):
-    return face_training_db.list_training_runs(limit)
 
 
 ####################################################################

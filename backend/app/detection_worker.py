@@ -45,10 +45,12 @@ FIRE_SMOKE_DEBUG_DIR = Path(__file__).resolve().parent.parent / "data" / "fire_s
 # frame to disk roughly once a second forever.
 FIRE_SMOKE_DEBUG_SAVE_INTERVAL_SECONDS = 60
 
-# See config.PERSON_DETECTION_INTERVAL_SECONDS for the full history/reasoning
-# — pose (YOLOv8n-pose) is heavier than face rec and runs on its own slower
-# cadence so it can't back up the shared per-camera input queue.
-POSE_INTERVAL_SECONDS = config.PERSON_DETECTION_INTERVAL_SECONDS
+POSE_INTERVAL_SECONDS = 20.0  # pose is heavier than face rec; runs on its own slower cadence.
+# Raised from 5.0 -> 20.0: on CPU, pose (YOLOv8n-pose) + face rec both running
+# in this single worker process per "detect" call could take longer than the
+# 1s gap between frames, backing up the input queue (maxsize=10) and making
+# recognized names lag several seconds behind real time. Running pose less
+# often keeps the worker caught up so face-rec results stay near real-time.
 
 DEFAULT_DET_THRESH = config.RECOGNITION_DET_THRESH_DEFAULT
 # Per-camera detection-confidence floor, overriding DEFAULT_DET_THRESH. One
@@ -199,70 +201,7 @@ def _lean_get(recognizer, img, input_size: tuple[int, int] | None = None):
     return faces
 
 
-class _TrainingCropDedup:
-    """Per-camera recent-embedding cache used ONLY to decide whether an
-    Unknown face's crop is novel enough to bother saving as a future
-    training sample — a completely separate concern from
-    recognition_track_cache.py (that one decides whether to SPEND a
-    recognition recheck this cycle; this one decides whether to SAVE a
-    crop at all). A plain in-memory list, not a DB lookup: the real,
-    persistent record of what's already been collected is the
-    pending_face_samples table itself (written in the main process, see
-    pipeline.py) — this is just a cheap short-window filter to stop one
-    person standing still from generating a new row every single cycle."""
-
-    def __init__(self):
-        self._recent: list[tuple[float, np.ndarray]] = []
-
-    def is_novel(self, embedding: np.ndarray, now: float) -> bool:
-        self._recent = [
-            (t, e) for t, e in self._recent if now - t <= config.FACE_TRAINING_DEDUP_WINDOW_SECONDS
-        ]
-        for _t, e in self._recent:
-            sim = float(np.dot(embedding, e) / (np.linalg.norm(embedding) * np.linalg.norm(e) + 1e-8))
-            if sim >= config.FACE_TRAINING_DEDUP_SIMILARITY:
-                return False
-        return True
-
-    def record(self, embedding: np.ndarray, now: float) -> None:
-        self._recent.append((now, embedding))
-
-
-# Longer side of a saved training crop, px — deliberately small: this rides
-# along in the SAME result_queue message as everything else (faces, pose),
-# and only needs to be legible enough for a human labeler to recognize a
-# face, not full resolution. Keeps the IPC payload light even though a crop
-# is only attached occasionally (gated by _TrainingCropDedup above).
-TRAINING_CROP_MAX_DIM = 320
-
-
-def _encode_training_crop(frame, bbox: list[int]) -> bytes | None:
-    x1, y1, x2, y2 = bbox
-    bw, bh = x2 - x1, y2 - y1
-    if bw <= 0 or bh <= 0:
-        return None
-    # Padded the same way RECHECK_CROP_PADDING already pads a recognition
-    # recheck crop above — a bit of context around the tight face box makes
-    # the sample more useful for a human labeler AND for retraining (real
-    # camera framing, not an artificially tight crop).
-    pad_x, pad_y = int(bw * 0.3), int(bh * 0.3)
-    h, w = frame.shape[:2]
-    cx1, cy1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
-    cx2, cy2 = min(w, x2 + pad_x), min(h, y2 + pad_y)
-    crop = frame[cy1:cy2, cx1:cx2]
-    if crop.size == 0:
-        return None
-    ch, cw = crop.shape[:2]
-    scale = min(1.0, TRAINING_CROP_MAX_DIM / max(ch, cw))
-    if scale < 1.0:
-        crop = cv2.resize(crop, (int(cw * scale), int(ch * scale)), interpolation=cv2.INTER_AREA)
-    ok, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
-    return buf.tobytes() if ok else None
-
-
-def _detect_and_recognize(
-    recognizer, frame, det_thresh: float, detection_max_dim: int, track_cache, training_dedup=None,
-) -> list[dict]:
+def _detect_and_recognize(recognizer, frame, det_thresh: float, detection_max_dim: int, track_cache) -> list[dict]:
     h, w = frame.shape[:2]
     scale = min(1.0, detection_max_dim / max(h, w))
     small = cv2.resize(frame, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA) if scale < 1.0 else frame
@@ -322,25 +261,10 @@ def _detect_and_recognize(
         else:
             track_cache.record(track, name, score, now)
 
-        # Continuous face-training collection (face_training_db.py /
-        # pipeline.py) — only for a face that's STILL Unknown after any
-        # recheck/cache-fallback above (never a recognized person; they
-        # don't need labeling) and only if _TrainingCropDedup judges this
-        # embedding novel enough versus recent crops from this same camera.
-        # Reuses the embedding already computed above — no second detection
-        # or embedding pass. None (not attached) is the common case; a real
-        # crop rides along in this same result message only occasionally.
-        training_crop_jpeg = None
-        if name == "Unknown" and training_dedup is not None and training_dedup.is_novel(embedding, now):
-            training_crop_jpeg = _encode_training_crop(frame, [x1, y1, x2, y2])
-            if training_crop_jpeg is not None:
-                training_dedup.record(embedding, now)
-
         results.append({
             "bbox": [x1, y1, x2, y2], "name": name, "score": round(score, 3), "embedding": embedding,
             "source": "local_cache" if cache_skipped_recheck else "local_fresh",
             "cache_skipped_recheck": cache_skipped_recheck,
-            "training_crop_jpeg": training_crop_jpeg,
         })
     return results
 
@@ -427,7 +351,6 @@ def run_worker(
     trackers: dict[int, PersonTracker] = {}
     fire_smoke_trackers: dict[int, FireSmokeTracker] = {}
     recognition_caches: dict[int, RecognitionTrackCache] = {}
-    training_dedup_caches: dict[int, _TrainingCropDedup] = {}
     last_pose_at: dict[int, float] = {}
     # fire_smoke_detector's events now keep firing every cycle for as long as
     # a condition stays confirmed (see FireSmokeTracker's docstring) so a
@@ -499,11 +422,8 @@ def run_worker(
             det_thresh = CAMERA_DET_THRESH.get(camera_id, DEFAULT_DET_THRESH)
             detection_max_dim = CAMERA_DETECTION_MAX_DIM.get(camera_id, DETECTION_DOWNSCALE_MAX_DIM)
             track_cache = recognition_caches.setdefault(camera_id, RecognitionTrackCache())
-            training_dedup = training_dedup_caches.setdefault(camera_id, _TrainingCropDedup())
             recognize_start = time.time()
-            faces = _detect_and_recognize(
-                recognizer, frame, det_thresh, detection_max_dim, track_cache, training_dedup,
-            )
+            faces = _detect_and_recognize(recognizer, frame, det_thresh, detection_max_dim, track_cache)
             recognize_ms = round((time.time() - recognize_start) * 1000, 1)
             result = {
                 "camera_id": camera_id,

@@ -76,17 +76,6 @@ export const api = {
   setFootfallGate: (data) => req('/api/footfall-gate', { method: 'POST', body: JSON.stringify(data) }),
   flipFootfallGate: (cameraId) => req(`/api/footfall-gate/${cameraId}/flip`, { method: 'POST' }),
   deleteFootfallGate: (cameraId) => req(`/api/footfall-gate/${cameraId}`, { method: 'DELETE' }),
-
-  // Continuous face collection / manual labeling / retraining
-  getFaceTrainingStatus: () => req('/api/face-training/status'),
-  getNextFaceTrainingSample: () => req('/api/face-training/next'),
-  faceTrainingImageUrl: (sampleId) => `${API_BASE}/api/face-training/image/${sampleId}`,
-  labelFaceTrainingSample: (sampleId, name) =>
-    req('/api/face-training/label', { method: 'POST', body: JSON.stringify({ sample_id: sampleId, name }) }),
-  skipFaceTrainingSample: (sampleId) =>
-    req('/api/face-training/skip', { method: 'POST', body: JSON.stringify({ sample_id: sampleId }) }),
-  triggerFaceTraining: () => req('/api/face-training/train', { method: 'POST' }),
-  getFaceTrainingHistory: (limit = 20) => req(`/api/face-training/history?limit=${limit}`),
 }
 
 // --- License & Camera Access Management ------------------------------

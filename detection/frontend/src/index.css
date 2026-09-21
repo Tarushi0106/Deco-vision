@@ -1,0 +1,152 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: #0b0d12;
+  color: #e8eaed;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+a {
+  color: inherit;
+}
+
+.app-shell {
+  min-height: 100vh;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  padding: 1rem 1.5rem;
+  border-bottom: 1px solid #1f242e;
+}
+
+.app-header h1 {
+  font-size: 1.1rem;
+  margin: 0;
+}
+
+.app-nav a {
+  margin-right: 1rem;
+  text-decoration: none;
+  color: #9aa4b2;
+  font-size: 0.9rem;
+}
+
+.app-nav a.active {
+  color: #3b82f6;
+  font-weight: 600;
+}
+
+.app-main {
+  padding: 1.5rem;
+}
+
+.card {
+  background: #12151c;
+  border: 1px solid #1f242e;
+  border-radius: 10px;
+  padding: 1rem;
+}
+
+.camera-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  gap: 1rem;
+}
+
+.camera-tile-video {
+  position: relative;
+  background: #000;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.camera-tile-video canvas {
+  width: 100%;
+  display: block;
+}
+
+.camera-tile-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+}
+
+.camera-tile-label {
+  margin-top: 0.5rem;
+  font-size: 0.9rem;
+  color: #9aa4b2;
+}
+
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+}
+
+.stat-tile-label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #6b7280;
+  margin-bottom: 0.4rem;
+}
+
+.stat-tile-value {
+  font-size: 1.6rem;
+  font-weight: 700;
+}
+
+.btn {
+  background: #1f242e;
+  color: #e8eaed;
+  border: 1px solid #2a2f3a;
+  border-radius: 6px;
+  padding: 0.5rem 0.9rem;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.btn-primary {
+  background: #3b82f6;
+  border-color: #3b82f6;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+input[type="text"] {
+  background: #0b0d12;
+  border: 1px solid #2a2f3a;
+  border-radius: 6px;
+  color: #e8eaed;
+  padding: 0.5rem 0.7rem;
+  width: 100%;
+  font-size: 0.95rem;
+}
+
+.message {
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+
+.message.success {
+  color: #4ade80;
+}
+
+.message.error {
+  color: #f87171;
+}
+
+.muted {
+  color: #6b7280;
+  font-size: 0.85rem;
+}

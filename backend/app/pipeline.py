@@ -33,7 +33,7 @@ try:
 except ImportError:
     psutil = None
 
-from . import alerts_db, camera_db, clips_db, config, face_db, footfall_gate_db, zones_db
+from . import alerts_db, camera_db, clips_db, config, face_db, face_training_db, footfall_gate_db, zones_db
 from .desk_tracker import DeskTracker
 from .detection_worker import CAMERA_DETECTION_MAX_DIM, run_worker
 from .footfall_counter import FootfallCounter, resolve_footfall_camera_ids
@@ -172,6 +172,21 @@ class CameraPipeline:
         # in either direction.
         self._recent_cycle_gap: float = 0.0
         self._latest_fire_smoke: list[dict] = []
+        # Generic person-body boxes from detection_worker.py's pose pass
+        # (result["people"]) — already computed for footfall/desk tracking,
+        # previously never stored/exposed anywhere else. Same
+        # last-known-value-persists pattern as _latest_fire_smoke: only
+        # written every POSE_INTERVAL_SECONDS (~20s, see detection_worker.py
+        # — deliberately not sped up here, that cadence is what keeps face
+        # recognition from backing up on this same worker), so a box holds
+        # its last position for up to ~20s between updates rather than
+        # disappearing. No track_id: PoseDetector.detect() returns fresh,
+        # unlinked boxes each call — there is no existing continuity between
+        # one pose cycle's boxes and the next to expose, and none is added
+        # here (see main.py's /ws/detections change for how identity is
+        # matched to a box on the frontend instead, per-frame, without any
+        # new persistent tracking).
+        self._latest_people: list[dict] = []
         self._running = False
         self._thread: threading.Thread | None = None
         # None (the default) means stabilization is off, in which case
@@ -253,6 +268,14 @@ class CameraPipeline:
     def set_fire_smoke(self, boxes: list[dict]) -> None:
         with self._lock:
             self._latest_fire_smoke = boxes
+
+    def get_latest_people(self) -> list[dict]:
+        with self._lock:
+            return list(self._latest_people)
+
+    def set_people(self, people: list[dict]) -> None:
+        with self._lock:
+            self._latest_people = people
 
     def note_smoke_event(self) -> None:
         """Called once per detect cycle a "smoke" event fires (see
@@ -1006,6 +1029,12 @@ class PipelineManager:
                 # embedding array is neither JSON-serializable nor something
                 # that should leave the backend as a live-view payload.
                 embedding = face.pop("embedding", None)
+                # Same reasoning as embedding above — never leaves the
+                # backend as part of the live overlay JSON, and its only
+                # consumer is the training-sample write below.
+                training_crop_jpeg = face.pop("training_crop_jpeg", None)
+                if training_crop_jpeg is not None and embedding is not None:
+                    self._store_training_sample(camera_id, embedding, face.get("score"), training_crop_jpeg)
                 # Gated to configured entry/exit gate camera(s) only (see
                 # config.FOOTFALL_CAMERAS) — footfall counting does not run
                 # on every camera in the system by default. Whole-frame
@@ -1026,9 +1055,11 @@ class PipelineManager:
             final_detections = pipeline.set_detections(result["faces"])
             self._record_recognition_result(camera_id, final_detections)
 
-        if "people" in result and self._desk_tracker is not None:
-            frame_w, frame_h = result.get("frame_size", (0, 0))
-            self._desk_tracker.process_pose_frame(camera_id, result["people"], frame_w, frame_h)
+        if "people" in result:
+            pipeline.set_people(result["people"])
+            if self._desk_tracker is not None:
+                frame_w, frame_h = result.get("frame_size", (0, 0))
+                self._desk_tracker.process_pose_frame(camera_id, result["people"], frame_w, frame_h)
 
         # Skipped when a gate line is active for this camera -- gate_tracker
         # already logged both directions above from the same frame's faces,
@@ -1179,6 +1210,10 @@ class PipelineManager:
         pipeline = self._pipelines.get(camera_id)
         return pipeline.get_latest_fire_smoke() if pipeline else []
 
+    def get_latest_people(self, camera_id: int) -> list[dict]:
+        pipeline = self._pipelines.get(camera_id)
+        return pipeline.get_latest_people() if pipeline else []
+
     def is_live(self, camera_id: int) -> bool:
         return camera_id in self._pipelines
 
@@ -1206,6 +1241,28 @@ class PipelineManager:
                 if isinstance(score, (int, float)):
                     stats["score_sum"] += score
                     stats["score_count"] += 1
+
+    def _store_training_sample(
+        self, camera_id: int, embedding: np.ndarray, det_score: float | None, crop_jpeg: bytes,
+    ) -> None:
+        """Writes one continuous-face-collection sample: the JPEG crop to
+        disk (under face_training_db.SAMPLES_DIR, gitignored same as the
+        rest of backend/data/) and a pending_face_samples row referencing
+        it. Called from _dispatch_result for every Unknown face that
+        detection_worker.py's _TrainingCropDedup judged novel enough to
+        include a crop for — most cycles this is never called at all (see
+        that class). Best-effort: a failure here must never affect live
+        recognition, which has already fully completed by this point."""
+        try:
+            if face_training_db.count_pending_for_camera(camera_id) >= config.FACE_TRAINING_MAX_PENDING_PER_CAMERA:
+                return
+            camera_dir = face_training_db.SAMPLES_DIR / str(camera_id)
+            camera_dir.mkdir(parents=True, exist_ok=True)
+            image_path = camera_dir / f"{int(time.time())}_{uuid.uuid4().hex[:8]}.jpg"
+            image_path.write_bytes(crop_jpeg)
+            face_training_db.add_pending_sample(camera_id, str(image_path), embedding, det_score)
+        except Exception:
+            logger.exception("Camera %s: failed to store face-training sample", camera_id)
 
     def get_observability_stats(self) -> dict:
         """Per-camera queue/drop/recognition snapshot for main.py's

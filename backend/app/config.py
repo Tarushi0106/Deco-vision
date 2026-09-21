@@ -450,6 +450,68 @@ RECOGNITION_TRACK_TIMEOUT_SECONDS = float(os.getenv("RECOGNITION_TRACK_TIMEOUT_S
 # are retuned against real fire footage.
 FIRE_SMOKE_DETECTION_ENABLED = os.getenv("FIRE_SMOKE_DETECTION_ENABLED", "false").lower() == "true"
 
+# How often detection_worker.py's pose pass (PoseDetector, YOLOv8n-pose)
+# runs — drives the live person-box overlay's refresh rate (see pipeline.py/
+# main.py's /ws/detections "persons" field) in addition to its original
+# footfall/fall-detection use. Previously a hardcoded 20.0, raised from an
+# original 5.0 after live CPU measurement showed 5s backed up the per-camera
+# worker's input queue on THIS box (CPU-only, no CUDA — see detection_worker.py's
+# comment history for the exact regression). Halved back to 10.0 here as a
+# conservative, reversible step — still double the previously-measured-unsafe
+# 5s — rather than reverting the full distance blind: this dev environment has
+# no GPU to re-measure the real (onnxruntime-gpu-equipped) production cost
+# against, so this is deliberately cautious, not a re-verified "safe" number.
+# Override via this env var once real production hardware's own cost is
+# measured, in either direction, without a code change.
+PERSON_DETECTION_INTERVAL_SECONDS = float(os.getenv("PERSON_DETECTION_INTERVAL_SECONDS", "10"))
+
+# --- Continuous face collection / manual labeling / retraining ----------
+# See face_training_db.py and face_training_scheduler.py. Reuses the SAME
+# embeddings detection_worker.py's face recognition pass already computes
+# every cycle for Unknown faces (no second embedding-extraction pass, no
+# second detector) — this just decides which of those already-computed
+# results are worth keeping as future training data, and when to fold
+# newly labeled ones into enrolled_faces (the same gallery recognizer.py
+# already matches against — there is no separate model file).
+
+# A face crop is only ever saved for storage consideration when its cosine
+# distance from every other crop already saved for this camera within this
+# window is large enough (see face_training_db's dedup check) — stops one
+# person standing still from flooding storage with near-identical frames.
+# Mirrors FOOTFALL_SIMILARITY_THRESHOLD's reasoning/measurement above,
+# applied to the same kind of embedding comparison for a different purpose.
+FACE_TRAINING_DEDUP_SIMILARITY = float(os.getenv("FACE_TRAINING_DEDUP_SIMILARITY", "0.90"))
+FACE_TRAINING_DEDUP_WINDOW_SECONDS = float(os.getenv("FACE_TRAINING_DEDUP_WINDOW_SECONDS", "300"))
+
+# Hard ceiling on pending (not-yet-labeled) samples kept per camera —
+# protects disk space during a long unattended collection run; oldest
+# pending samples are simply not replaced once full (existing ones are
+# never deleted to make room, collection just pauses for that camera until
+# the operator labels some down).
+FACE_TRAINING_MAX_PENDING_PER_CAMERA = int(os.getenv("FACE_TRAINING_MAX_PENDING_PER_CAMERA", "500"))
+
+# Background retraining trigger (face_training_scheduler.py): promote newly
+# labeled samples into enrolled_faces once at least this many are waiting,
+# OR this much time has passed since the last promotion with at least one
+# labeled sample waiting — whichever comes first. Mirrors the same
+# min-batch-or-max-interval pattern already used for other periodic jobs in
+# this app (see scheduler.py), just on a much shorter interval since this
+# one isn't a once-a-day job.
+FACE_TRAINING_MIN_NEW_SAMPLES = int(os.getenv("FACE_TRAINING_MIN_NEW_SAMPLES", "10"))
+FACE_TRAINING_CHECK_INTERVAL_SECONDS = float(os.getenv("FACE_TRAINING_CHECK_INTERVAL_SECONDS", "300"))
+FACE_TRAINING_MAX_INTERVAL_SECONDS = float(os.getenv("FACE_TRAINING_MAX_INTERVAL_SECONDS", "21600"))  # 6h
+
+# A candidate labeled sample is rejected (kept labeled, NOT promoted into
+# enrolled_faces, flagged for operator review) if it matches a DIFFERENT
+# already-enrolled person above this similarity — most likely a mislabel,
+# and promoting it would actively degrade that other person's matching.
+# Deliberately close to RECOGNITION_SIMILARITY_THRESHOLD's own reasoning
+# above: if it's confusable with someone else at live-matching thresholds,
+# it isn't safe to add.
+FACE_TRAINING_VALIDATION_CONFLICT_THRESHOLD = float(
+    os.getenv("FACE_TRAINING_VALIDATION_CONFLICT_THRESHOLD", "0.40")
+)
+
 # How often the sender loop checks whether each camera's detection worker
 # process is still alive, and respawns it if not. Detection worker crashes
 # (confirmed live: a native-level crash with no Python exception, no OOM,

@@ -40,6 +40,56 @@ function pointInPolygon(px, py, polygon) {
   return inside
 }
 
+// One consistent color for every person box, whether or not a name could be
+// matched to it — the box answers "is a human here", which is the same
+// question either way; only the label text changes. Deliberately distinct
+// from the existing face-box palette (green=known, red=Unknown, orange=zone
+// violation) so a viewer never confuses a body box for a face-recognition
+// result.
+const PERSON_BOX_COLOR = '#3b82f6'
+
+// Stateless, per-frame only — NOT a tracker. Finds the (at most one) known
+// face whose center point falls inside this person's box, using whatever
+// `faces` this same render already has (already-fresh/stale-gated by the
+// caller). No id/state is kept between calls; if the face->person match
+// changes from one message to the next, the label just changes with it,
+// the same way a recognized face's own label already can. If no known
+// face's center falls inside the box, returns null and the caller shows
+// "Person".
+function matchPersonName(personBbox, faces) {
+  const [px1, py1, px2, py2] = personBbox
+  for (const face of faces) {
+    if (face.name === 'Unknown') continue
+    const [fx1, fy1, fx2, fy2] = face.bbox
+    const cx = (fx1 + fx2) / 2
+    const cy = (fy1 + fy2) / 2
+    if (cx >= px1 && cx <= px2 && cy >= py1 && cy <= py2) return face.name
+  }
+  return null
+}
+
+const PERSON_LABEL_HEIGHT = 12
+
+function drawPersonsOverlay(ctx, persons, faces) {
+  ctx.font = 'bold 9px sans-serif'
+  ctx.textBaseline = 'bottom'
+  for (const person of persons) {
+    const [x1, y1, x2, y2] = person.bbox
+    ctx.strokeStyle = PERSON_BOX_COLOR
+    ctx.lineWidth = 2
+    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1)
+
+    const name = matchPersonName(person.bbox, faces)
+    const label = name || 'Person'
+    const labelWidth = ctx.measureText(label).width + 8
+    const labelY = y1 - PERSON_LABEL_HEIGHT >= 0 ? y1 - PERSON_LABEL_HEIGHT : y1
+    ctx.fillStyle = PERSON_BOX_COLOR
+    ctx.fillRect(x1, labelY, labelWidth, PERSON_LABEL_HEIGHT)
+    ctx.fillStyle = 'white'
+    ctx.fillText(label, x1 + 3, labelY + PERSON_LABEL_HEIGHT - 2)
+  }
+}
+
 function drawDraftPolygon(ctx, points) {
   if (!points || points.length === 0) return
   if (points.length > 1) {
@@ -147,7 +197,7 @@ export default function CameraTile({
     if (showOverlay) {
       detectionsWs = new WebSocket(`${WS_PROTOCOL}://${WS_HOST}/ws/detections/${camera.id}`)
       detectionsWs.onmessage = (event) => {
-        const { faces, fire_smoke, computed_at, identity_lost_timeout } = JSON.parse(event.data)
+        const { faces, fire_smoke, persons, computed_at, identity_lost_timeout } = JSON.parse(event.data)
         // /ws/detections polls the backend's last computed result on its own
         // fixed schedule (every ~167ms) regardless of whether recognition
         // has actually produced anything new since the last tick — a
@@ -166,6 +216,16 @@ export default function CameraTile({
         overlayCtx.clearRect(0, 0, overlay.width, overlay.height)
         drawZonesOverlay(overlayCtx, zonesRef.current)
         drawDraftPolygon(overlayCtx, draftPointsRef.current)
+        // Drawn first (an outer body-box layer) so the existing face overlay
+        // below still renders on top of it unchanged, matching a visible
+        // face's own tighter box. persons intentionally is NOT gated by
+        // dataIsStale — that flag exists for face recognition's much faster
+        // (~1s) cadence; person boxes already only refresh every ~20s (see
+        // pipeline.py), so gating them the same way would make them
+        // disappear for stretches of a normal, healthy cycle. The identity
+        // matched onto a person's label below DOES use freshFaces, so a
+        // stale name is never shown even though the box position can be.
+        drawPersonsOverlay(overlayCtx, persons || [], freshFaces)
         overlayCtx.lineWidth = 2
         overlayCtx.font = 'bold 9px sans-serif'
         overlayCtx.textBaseline = 'bottom'

@@ -172,6 +172,21 @@ class CameraPipeline:
         # in either direction.
         self._recent_cycle_gap: float = 0.0
         self._latest_fire_smoke: list[dict] = []
+        # Generic person-body boxes from detection_worker.py's pose pass
+        # (result["people"]) — already computed for footfall/desk tracking,
+        # previously never stored/exposed anywhere else. Same
+        # last-known-value-persists pattern as _latest_fire_smoke: only
+        # written every POSE_INTERVAL_SECONDS (~20s, see detection_worker.py
+        # — deliberately not sped up here, that cadence is what keeps face
+        # recognition from backing up on this same worker), so a box holds
+        # its last position for up to ~20s between updates rather than
+        # disappearing. No track_id: PoseDetector.detect() returns fresh,
+        # unlinked boxes each call — there is no existing continuity between
+        # one pose cycle's boxes and the next to expose, and none is added
+        # here (see main.py's /ws/detections change for how identity is
+        # matched to a box on the frontend instead, per-frame, without any
+        # new persistent tracking).
+        self._latest_people: list[dict] = []
         self._running = False
         self._thread: threading.Thread | None = None
         # None (the default) means stabilization is off, in which case
@@ -253,6 +268,14 @@ class CameraPipeline:
     def set_fire_smoke(self, boxes: list[dict]) -> None:
         with self._lock:
             self._latest_fire_smoke = boxes
+
+    def get_latest_people(self) -> list[dict]:
+        with self._lock:
+            return list(self._latest_people)
+
+    def set_people(self, people: list[dict]) -> None:
+        with self._lock:
+            self._latest_people = people
 
     def note_smoke_event(self) -> None:
         """Called once per detect cycle a "smoke" event fires (see
@@ -1026,9 +1049,11 @@ class PipelineManager:
             final_detections = pipeline.set_detections(result["faces"])
             self._record_recognition_result(camera_id, final_detections)
 
-        if "people" in result and self._desk_tracker is not None:
-            frame_w, frame_h = result.get("frame_size", (0, 0))
-            self._desk_tracker.process_pose_frame(camera_id, result["people"], frame_w, frame_h)
+        if "people" in result:
+            pipeline.set_people(result["people"])
+            if self._desk_tracker is not None:
+                frame_w, frame_h = result.get("frame_size", (0, 0))
+                self._desk_tracker.process_pose_frame(camera_id, result["people"], frame_w, frame_h)
 
         # Skipped when a gate line is active for this camera -- gate_tracker
         # already logged both directions above from the same frame's faces,
@@ -1178,6 +1203,10 @@ class PipelineManager:
     def get_latest_fire_smoke(self, camera_id: int) -> list[dict]:
         pipeline = self._pipelines.get(camera_id)
         return pipeline.get_latest_fire_smoke() if pipeline else []
+
+    def get_latest_people(self, camera_id: int) -> list[dict]:
+        pipeline = self._pipelines.get(camera_id)
+        return pipeline.get_latest_people() if pipeline else []
 
     def is_live(self, camera_id: int) -> bool:
         return camera_id in self._pipelines

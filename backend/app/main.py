@@ -1188,6 +1188,10 @@ async def detections_feed(websocket: WebSocket, camera_id: int):
             await websocket.send_json({
                 "faces": pipeline_manager.get_latest_detections(camera_id),
                 "fire_smoke": pipeline_manager.get_latest_fire_smoke(camera_id),
+                # Generic person-body boxes (pose detection, not face-based) —
+                # see pipeline.py's CameraPipeline._latest_people docstring.
+                # Additive only: every existing field above is unchanged.
+                "persons": pipeline_manager.get_latest_people(camera_id),
                 # When this result was actually computed, not when this
                 # message was sent — this poll fires every ~167ms regardless
                 # of whether the worker has produced anything new since the

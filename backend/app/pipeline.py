@@ -33,7 +33,7 @@ try:
 except ImportError:
     psutil = None
 
-from . import alerts_db, camera_db, clips_db, config, face_db, footfall_gate_db, zones_db
+from . import alerts_db, camera_db, clips_db, config, face_db, face_training_db, footfall_gate_db, zones_db
 from .desk_tracker import DeskTracker
 from .detection_worker import CAMERA_DETECTION_MAX_DIM, run_worker
 from .footfall_counter import FootfallCounter, resolve_footfall_camera_ids
@@ -1029,6 +1029,12 @@ class PipelineManager:
                 # embedding array is neither JSON-serializable nor something
                 # that should leave the backend as a live-view payload.
                 embedding = face.pop("embedding", None)
+                # Same reasoning as embedding above — never leaves the
+                # backend as part of the live overlay JSON, and its only
+                # consumer is the training-sample write below.
+                training_crop_jpeg = face.pop("training_crop_jpeg", None)
+                if training_crop_jpeg is not None and embedding is not None:
+                    self._store_training_sample(camera_id, embedding, face.get("score"), training_crop_jpeg)
                 # Gated to configured entry/exit gate camera(s) only (see
                 # config.FOOTFALL_CAMERAS) — footfall counting does not run
                 # on every camera in the system by default. Whole-frame
@@ -1235,6 +1241,28 @@ class PipelineManager:
                 if isinstance(score, (int, float)):
                     stats["score_sum"] += score
                     stats["score_count"] += 1
+
+    def _store_training_sample(
+        self, camera_id: int, embedding: np.ndarray, det_score: float | None, crop_jpeg: bytes,
+    ) -> None:
+        """Writes one continuous-face-collection sample: the JPEG crop to
+        disk (under face_training_db.SAMPLES_DIR, gitignored same as the
+        rest of backend/data/) and a pending_face_samples row referencing
+        it. Called from _dispatch_result for every Unknown face that
+        detection_worker.py's _TrainingCropDedup judged novel enough to
+        include a crop for — most cycles this is never called at all (see
+        that class). Best-effort: a failure here must never affect live
+        recognition, which has already fully completed by this point."""
+        try:
+            if face_training_db.count_pending_for_camera(camera_id) >= config.FACE_TRAINING_MAX_PENDING_PER_CAMERA:
+                return
+            camera_dir = face_training_db.SAMPLES_DIR / str(camera_id)
+            camera_dir.mkdir(parents=True, exist_ok=True)
+            image_path = camera_dir / f"{int(time.time())}_{uuid.uuid4().hex[:8]}.jpg"
+            image_path.write_bytes(crop_jpeg)
+            face_training_db.add_pending_sample(camera_id, str(image_path), embedding, det_score)
+        except Exception:
+            logger.exception("Camera %s: failed to store face-training sample", camera_id)
 
     def get_observability_stats(self) -> dict:
         """Per-camera queue/drop/recognition snapshot for main.py's

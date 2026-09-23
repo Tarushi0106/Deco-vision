@@ -1,4 +1,4 @@
-# Deco Vision (Parachute)
+# Deco Vision 
 
 Multi-site camera intelligence platform: live RTSP/ONVIF camera feeds,
 face recognition and attendance, footfall counting, desk/zone analytics,

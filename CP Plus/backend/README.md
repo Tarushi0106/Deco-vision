@@ -31,7 +31,7 @@ every endpoint above already existed and was already public.
 ## Running
 
 ```bash
-cd detection/backend
+cd "CP Plus/backend"
 python -m venv venv
 venv/Scripts/activate  # or source venv/bin/activate on Linux/Mac
 pip install -r requirements.txt
@@ -56,7 +56,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8812
 
 ## Data
 
-Everything this service writes lives under `detection/backend/data/`
+Everything this service writes lives under `CP Plus/backend/data/`
 (gitignored): its own SQLite DB (`detection.db`), and collected face-crop
 images (`face_training_samples/`). Nothing here is ever committed, and
 nothing here is Parachute's data.
